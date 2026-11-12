@@ -79,11 +79,15 @@ Compose BOM 2024.01.00, Room 2.6.1.
    verification runs (exists, non-empty, basic HTML sanity) and shows
    "✓ Verified: …".
 4. **Providers + model picker** — a bundled `providers.json` written for
-   this app with 12 well-known providers (Anthropic, OpenAI, OpenRouter,
-   Google Gemini, Groq, DeepSeek, xAI, Mistral, Together, Ollama local,
-   LM Studio local, TokenHarbor), each with base URL and 2–4 example
-   models. Picker order: Top picks → Favourites (starred, in Room) →
-   fetched models → bundled models, with search. **Refresh** loads
+   this app with 152 providers (the 12 v1 starters plus direct labs,
+   inference hosts, gateways and 28 local servers — Anthropic, OpenAI,
+   OpenRouter, Google Gemini, Groq, DeepSeek, xAI, Mistral, Together,
+   Ollama local, LM Studio local, TokenHarbor, and 140 more), each with
+   base URL and example models (192 bundled model ids in total; 18
+   providers ship with an empty model list because their model ids
+   could not be verified — the app fetches them live or the user types
+   one in by hand). Picker order: Top picks → Favourites (starred, in
+   Room) → fetched models → bundled models, with search. **Refresh** loads
    `GET {baseUrl}/models` (Bearer, or `x-api-key` for Anthropic, no key
    for local providers), caches the list in Room, and on failure shows
    the cached list with the error; a model id can also be typed in by
@@ -144,9 +148,14 @@ Compose BOM 2024.01.00, Room 2.6.1.
   picker, remote-server mode, Git client, in-app terminal, editor tabs /
   live preview, `MANAGE_EXTERNAL_STORAGE`.
 - UI polish: syntax-highlighted diffs, folder tree browser.
-- The v1 catalog has 12 providers; growing it toward 200+ (from a public
-  catalog such as models.dev, not copied from another app's config) is
-  a content task, not a code change.
+- The provider catalog grew from 12 (v1) to 152 providers in Phase 2,
+  Step 2 (see `assets/providers.json`). The 200+ target is not yet
+  reached: the remaining long tail could not be verified from public
+  knowledge alone, and inventing entries was refused. Two entries need
+  a fix before first use — Azure OpenAI (replace `YOUR-RESOURCE` with
+  your resource name) and AWS Bedrock (needs SigV4 signing, not a plain
+  API key) — and a handful of smaller gateways still need their base
+  URL confirmed (listed in the catalog's `note` field).
 
 ## Acceptance tests (from the checklist)
 
@@ -162,7 +171,7 @@ Compose BOM 2024.01.00, Room 2.6.1.
 CodeSathi/  (36 files, ~4,600 lines total; 4,216 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
-  assets/providers.json          # 12-provider starter catalog (ours)
+  assets/providers.json          # 152-provider catalog (ours, Phase 2 Step 2)
   java/com/inyogeshwar/codesathi/
     MainActivity.kt              # NavHost (85)
     CodeSathiApp.kt              # Room / DataStore / KeyStore singletons (26)
