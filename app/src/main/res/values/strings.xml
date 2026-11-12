@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CodeSathi</string>
+    <string name="onboarding_title">CodeSathi — apna coding saathi</string>
+    <string name="onboarding_body">CodeSathi aapke project folder ki files ko padhta aur badalta hai. Shuru karne ke liye file access dein — aap khud folder chunenge, koi path type nahi karna hai.</string>
+    <string name="allow_file_access">Allow file access</string>
+    <string name="new_session">New session</string>
+    <string name="choose_folder">Choose folder</string>
+    <string name="folder_unavailable">Folder unavailable — tap to re-choose</string>
+    <string name="plan_mode_chip">Plan mode — read-only</string>
+    <string name="build_mode_chip">Build mode</string>
+    <string name="add_provider_key_first">Add a provider API key first</string>
+</resources>
