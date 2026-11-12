@@ -28,8 +28,11 @@ Compose BOM 2024.01.00, Room 2.6.1.
 
 > First Gradle sync in Android Studio is the verification step for this
 > migration — **no build has been run here** (no Android SDK on this
-> machine). If sync complains, the lines most likely to need adjusting
-> are the KSP version (`2.2.10-1.0.2`) and the Room version (`2.7.0`).
+> machine). The KSP version was corrected to `2.2.10-2.0.2` on 2026-11-12
+> after the first real build failed: `2.2.10-1.0.2` does not exist on
+> Maven Central. If sync still complains, the Room version (`2.7.0`) is
+> the next line to check. The Gradle files are named `.gradle.kts`
+> (Kotlin DSL) — a plain `.gradle` name will not compile them.
 
 ## Open in Android Studio
 
