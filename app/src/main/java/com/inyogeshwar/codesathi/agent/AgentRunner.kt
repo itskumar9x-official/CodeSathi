@@ -40,6 +40,17 @@ sealed class AgentEvent {
     data class ToolRan(val tool: String, val summary: String, val result: String = "") : AgentEvent()
     data class Verified(val message: String) : AgentEvent()
     data class Error(val message: String) : AgentEvent()
+    /**
+     * One model turn hit a limit and switched to another key or fallback
+     * model. [kind] is why the previous key stopped (quota vs rate limit).
+     */
+    data class FallbackSwitched(
+        val fromProviderId: String,
+        val fromModelId: String,
+        val toProviderId: String,
+        val toModelId: String,
+        val kind: LimitKind
+    ) : AgentEvent()
     object Done : AgentEvent()
 }
 
@@ -73,10 +84,20 @@ private data class ParsedToolCall(val name: String, val args: Map<String, String
  *
  * Light verification after a write: file exists, non-empty, and (for .html)
  * contains a matching <html> tag. Full diagnostics is Phase 2.
+ *
+ * Fallback (Phase 2, Step 1): when [fallback] is set, each model turn
+ * tries the engine's ordered attempts — other keys of the same
+ * provider + model first, then the user's fallback chain. A turn that
+ * fails with a limit error (HTTP 402 / quota / 429) marks that key
+ * exhausted and retries with the next attempt, emitting
+ * [AgentEvent.FallbackSwitched] so the chat can say what changed. A
+ * turn is only retried when nothing was emitted yet, so a reply is
+ * never shown twice. Non-limit errors fail the turn as before.
  */
 class AgentRunner(
     private val llm: LlmClient,
-    private val tools: List<Tool>
+    private val tools: List<Tool>,
+    private val fallback: FallbackEngine? = null
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -137,19 +158,50 @@ class AgentRunner(
             LlmMessage("system", planSystemPrompt),
             LlmMessage("user", "Project folder: $folderName. Existing files: $files\n\nGoal: $userGoal")
         )
-        val full = StringBuilder()
-        try {
-            llm.streamChat(provider, modelId, apiKey, messages).collect { chunk ->
-                full.append(chunk)
-                emit(AgentEvent.TextChunk(chunk))
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            emit(AgentEvent.Error("Plan failed: ${e.message}"))
+        val attempts = fallback?.attemptsFor(provider, modelId)
+            ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
+        if (attempts.isEmpty()) {
+            emit(AgentEvent.Error("All keys and fallback models are exhausted — limits reset at midnight. Add another key, or check the fallback order in Providers."))
             return@flow
         }
-        val plan = parsePlan(full.toString())
+        var fullText: String? = null
+        var lastLimitError: Exception? = null
+        for ((index, attempt) in attempts.withIndex()) {
+            val full = StringBuilder()
+            try {
+                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages).collect { chunk ->
+                    full.append(chunk)
+                    emit(AgentEvent.TextChunk(chunk))
+                }
+                fullText = full.toString()
+                break
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val kind = if (e is LlmException) classifyLimitError(e.httpCode, e.body) else null
+                if (kind != null && fallback != null && full.isEmpty()) {
+                    fallback.markExhausted(attempt, kind)
+                    lastLimitError = e
+                    attempts.getOrNull(index + 1)?.let { next ->
+                        emit(
+                            AgentEvent.FallbackSwitched(
+                                attempt.provider.id, attempt.modelId,
+                                next.provider.id, next.modelId, kind
+                            )
+                        )
+                    }
+                    continue
+                }
+                emit(AgentEvent.Error("Plan failed: ${e.message}"))
+                return@flow
+            }
+        }
+        val full = fullText
+        if (full == null) {
+            emit(AgentEvent.Error("Plan failed: ${lastLimitError?.message ?: "all keys and fallback models are exhausted."}"))
+            return@flow
+        }
+        val plan = parsePlan(full)
         if (plan != null) emit(AgentEvent.PlanReady(plan))
         else emit(AgentEvent.Error("The model did not return a plan in the expected format. Try again or rephrase the goal."))
         emit(AgentEvent.Done)
@@ -177,26 +229,57 @@ class AgentRunner(
         while (steps < MAX_STEPS) {
             steps++
             // --- One model turn: stream text, collect any native tool calls. ---
+            // On a limit error the turn retries with the next key / fallback
+            // model instead of failing — but only when nothing was emitted
+            // yet, so the chat never shows a duplicated reply.
+            val attempts = fallback?.attemptsFor(provider, modelId)
+                ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
             val turnText = StringBuilder()
             val nativeCalls = mutableListOf<ParsedToolCall>()
-            try {
-                llm.streamChatEvents(provider, modelId, apiKey, llmMessages).collect { event ->
-                    when (event) {
-                        is ChatStreamEvent.Text -> {
-                            turnText.append(event.chunk)
-                            emit(AgentEvent.TextChunk(event.chunk))
-                        }
-                        is ChatStreamEvent.ToolCall -> {
-                            parseToolArgs(event.call.argumentsJson)?.let { args ->
-                                nativeCalls += ParsedToolCall(event.call.name, args)
+            var turnOk = false
+            var lastLimitError: Exception? = null
+            for ((index, attempt) in attempts.withIndex()) {
+                turnText.clear()
+                nativeCalls.clear()
+                try {
+                    llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, llmMessages).collect { event ->
+                        when (event) {
+                            is ChatStreamEvent.Text -> {
+                                turnText.append(event.chunk)
+                                emit(AgentEvent.TextChunk(event.chunk))
+                            }
+                            is ChatStreamEvent.ToolCall -> {
+                                parseToolArgs(event.call.argumentsJson)?.let { args ->
+                                    nativeCalls += ParsedToolCall(event.call.name, args)
+                                }
                             }
                         }
                     }
+                    turnOk = true
+                    break
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val kind = if (e is LlmException) classifyLimitError(e.httpCode, e.body) else null
+                    if (kind != null && fallback != null && turnText.isEmpty() && nativeCalls.isEmpty()) {
+                        fallback.markExhausted(attempt, kind)
+                        lastLimitError = e
+                        attempts.getOrNull(index + 1)?.let { next ->
+                            emit(
+                                AgentEvent.FallbackSwitched(
+                                    attempt.provider.id, attempt.modelId,
+                                    next.provider.id, next.modelId, kind
+                                )
+                            )
+                        }
+                        continue
+                    }
+                    emit(AgentEvent.Error("Build failed: ${e.message}"))
+                    return@flow
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                emit(AgentEvent.Error("Build failed: ${e.message}"))
+            }
+            if (!turnOk) {
+                emit(AgentEvent.Error("Build failed: ${lastLimitError?.message ?: "all keys and fallback models are exhausted."}"))
                 return@flow
             }
             val text = turnText.toString()

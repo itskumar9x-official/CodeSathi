@@ -11,7 +11,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Button
@@ -39,13 +43,17 @@ import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.ui.AppViewModel
 
 /**
- * Providers + model picker (Step 4, v1 slice).
+ * Providers + model picker (Step 4, v1 slice; Phase 2 Step 1 adds
+ * multi-key management and the fallback order below).
  * Order: (1) Top picks, (2) Favourites (starred, in Room),
  * (3) the provider's fetched models (GET {baseUrl}/models, cached in Room),
  * (4) the provider's bundled models. Search filters by model / provider name.
- * API keys are entered here and stored ONLY in EncryptedSharedPreferences.
+ * API keys are entered here and stored ONLY in EncryptedSharedPreferences —
+ * several keys per provider, shown masked (first 3 + last 4 chars).
  * When a fetch fails, the cached list is shown with the error, and a model
  * id can be typed in by hand instead.
+ * Fallback order: when a model's limit is reached, CodeSathi first tries
+ * another key of the same model, then walks this list top to bottom.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -55,6 +63,12 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     var keyInput by remember { mutableStateOf("") }
     var keySavedNote by remember { mutableStateOf<String?>(null) }
     val favourites by viewModel.favourites.collectAsState()
+    val fallbackChain by viewModel.fallbackChain.collectAsState()
+    val exhaustedModelKeys = viewModel.exhaustedModelKeys
+    // Read for subscription only: KeyStore is not a Flow, so the key lists
+    // below are re-read whenever this version bumps (add / delete key).
+    @Suppress("UNUSED_VARIABLE")
+    val keysVersion = viewModel.keysVersion
 
     val providers = viewModel.providerRepository.providers
     val filtered = providers.filter { p ->
@@ -85,6 +99,58 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                 )
             }
             item {
+                Text("Fallback order", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "When a model's limit is reached, CodeSathi first tries another key of the same model, then walks this list top to bottom. A model whose every key is exhausted shows “Limit reached” until midnight.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (fallbackChain.isEmpty()) {
+                    Text(
+                        "No fallback set yet — tap + on any model below to add it.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                fallbackChain.forEachIndexed { index, entry ->
+                    val entryProvider = viewModel.provider(entry.providerId) ?: return@forEachIndexed
+                    val exhausted = "${entry.providerId}/${entry.modelId}" in exhaustedModelKeys
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "${index + 1}. ${entryProvider.name} / ${entry.modelId}",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                            if (exhausted) {
+                                Text(
+                                    "Limit reached — resets at midnight",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = { viewModel.moveFallbackEntryUp(index) },
+                            enabled = index > 0
+                        ) {
+                            Icon(Icons.Filled.ArrowUpward, contentDescription = "Move up")
+                        }
+                        IconButton(
+                            onClick = { viewModel.moveFallbackEntryDown(index) },
+                            enabled = index < fallbackChain.size - 1
+                        ) {
+                            Icon(Icons.Filled.ArrowDownward, contentDescription = "Move down")
+                        }
+                        IconButton(
+                            onClick = { viewModel.removeFallbackEntry(entry.providerId, entry.modelId) }
+                        ) {
+                            Icon(Icons.Filled.Delete, contentDescription = "Remove from fallback")
+                        }
+                    }
+                }
+            }
+            item {
                 Text("Top picks", style = MaterialTheme.typography.titleMedium)
                 viewModel.providerRepository.topPicks().forEach { (provider, model) ->
                     ModelRow(
@@ -99,6 +165,10 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                             } else {
                                 "Default model set: ${provider.name} / $model"
                             }
+                        },
+                        onAddFallback = {
+                            viewModel.addFallbackEntry(provider.id, model)
+                            keySavedNote = "Added ${provider.name} / $model to the fallback order."
                         }
                     )
                 }
@@ -120,6 +190,10 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                                 } else {
                                     "Default model set: ${provider.name} / ${fav.modelId}"
                                 }
+                            },
+                            onAddFallback = {
+                                viewModel.addFallbackEntry(fav.providerId, fav.modelId)
+                                keySavedNote = "Added ${provider.name} / ${fav.modelId} to the fallback order."
                             }
                         )
                     }
@@ -129,21 +203,26 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                 ProviderCard(
                     provider = provider,
                     expanded = selectedProviderId == provider.id,
-                    hasKey = viewModel.hasApiKey(provider.id),
+                    keyCount = viewModel.apiKeys(provider.id).size,
                     onExpand = { selectedProviderId = if (selectedProviderId == provider.id) null else provider.id },
                     keyInput = keyInput,
                     onKeyInput = { keyInput = it },
                     onSaveKey = {
-                        viewModel.saveApiKey(provider.id, keyInput)
+                        viewModel.addApiKey(provider.id, keyInput)
                         keyInput = ""
-                        keySavedNote = "Key saved securely for ${provider.name} (encrypted on this device)."
+                        keySavedNote = "Key added for ${provider.name} (encrypted on this device)."
                     },
-                    onRemoveKey = {
-                        viewModel.removeApiKey(provider.id)
+                    onRemoveKey = { keyId ->
+                        viewModel.removeApiKey(provider.id, keyId)
                         keySavedNote = "Key removed for ${provider.name}."
                     },
+                    apiKeys = viewModel.apiKeys(provider.id),
                     favourites = favourites,
                     onStar = { model -> viewModel.toggleFavourite(provider.id, model) },
+                    onAddFallback = { model ->
+                        viewModel.addFallbackEntry(provider.id, model)
+                        keySavedNote = "Added ${provider.name} / $model to the fallback order."
+                    },
                     onSelectModel = { model ->
                         val switched = viewModel.useModel(provider.id, model)
                         keySavedNote = if (switched) {
@@ -185,7 +264,8 @@ private fun ModelRow(
     modelId: String,
     starred: Boolean,
     onStar: () -> Unit,
-    onSelect: () -> Unit
+    onSelect: () -> Unit,
+    onAddFallback: () -> Unit
 ) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Column(modifier = Modifier.weight(1f)) {
@@ -198,6 +278,9 @@ private fun ModelRow(
                 contentDescription = if (starred) "Unstar" else "Star as favourite"
             )
         }
+        IconButton(onClick = onAddFallback) {
+            Icon(Icons.Filled.Add, contentDescription = "Add to fallback order")
+        }
         OutlinedButton(onClick = onSelect) { Text("Use") }
     }
 }
@@ -206,14 +289,16 @@ private fun ModelRow(
 private fun ProviderCard(
     provider: Provider,
     expanded: Boolean,
-    hasKey: Boolean,
+    keyCount: Int,
     onExpand: () -> Unit,
     keyInput: String,
     onKeyInput: (String) -> Unit,
     onSaveKey: () -> Unit,
-    onRemoveKey: () -> Unit,
+    onRemoveKey: (String) -> Unit,
+    apiKeys: List<com.inyogeshwar.codesathi.data.KeyStore.KeyDisplay>,
     favourites: List<com.inyogeshwar.codesathi.data.FavouriteModel>,
     onStar: (String) -> Unit,
+    onAddFallback: (String) -> Unit,
     onSelectModel: (String) -> Unit,
     fetchedModels: List<String>,
     isFetching: Boolean,
@@ -234,7 +319,9 @@ private fun ProviderCard(
                     Text(provider.name, style = MaterialTheme.typography.titleMedium)
                     Text(provider.baseUrl, style = MaterialTheme.typography.bodySmall)
                     Text(
-                        if (provider.local) "Local — no API key needed" else if (hasKey) "API key saved ✓" else "No API key yet",
+                        if (provider.local) "Local — no API key needed"
+                        else if (keyCount > 0) "$keyCount API key${if (keyCount == 1) "" else "s"} saved ✓"
+                        else "No API key yet",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
@@ -271,7 +358,8 @@ private fun ProviderCard(
                         modelId = model,
                         starred = favourites.any { it.modelKey == provider.modelKey(model) },
                         onStar = { onStar(model) },
-                        onSelect = { onSelectModel(model) }
+                        onSelect = { onSelectModel(model) },
+                        onAddFallback = { onAddFallback(model) }
                     )
                 }
                 // Manual model id — for providers whose list cannot be fetched.
@@ -298,21 +386,34 @@ private fun ProviderCard(
                         modelId = model,
                         starred = favourites.any { it.modelKey == provider.modelKey(model) },
                         onStar = { onStar(model) },
-                        onSelect = { onSelectModel(model) }
+                        onSelect = { onSelectModel(model) },
+                        onAddFallback = { onAddFallback(model) }
                     )
                 }
                 if (!provider.local) {
                     Spacer(Modifier.height(8.dp))
+                    Text("API keys", style = MaterialTheme.typography.labelMedium)
+                    if (apiKeys.isEmpty()) {
+                        Text("No key saved yet.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    apiKeys.forEach { stored ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(stored.masked, modifier = Modifier.weight(1f))
+                            OutlinedButton(onClick = { onRemoveKey(stored.id) }) { Text("Delete") }
+                        }
+                    }
                     OutlinedTextField(
                         value = keyInput,
                         onValueChange = onKeyInput,
-                        label = { Text("API key for ${provider.name}") },
+                        label = { Text("Add another API key") },
                         visualTransformation = PasswordVisualTransformation(),
                         modifier = Modifier.fillMaxWidth()
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = onSaveKey, enabled = keyInput.isNotBlank()) { Text("Save key") }
-                        if (hasKey) OutlinedButton(onClick = onRemoveKey) { Text("Remove key") }
+                        Button(onClick = onSaveKey, enabled = keyInput.isNotBlank()) { Text("Add key") }
                     }
                 }
             }

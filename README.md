@@ -103,10 +103,43 @@ Compose BOM 2024.01.00, Room 2.6.1.
    banner (tap to read) and a manual "Summarise chat" menu item.
    Nothing is ever silently dropped.
 
-## What is TODO / Phase 2 (explicitly NOT in v1)
+## Phase 2, Step 1 — multi-key fallback / auto-switch
 
-- Multi-key fallback / auto-switch on limit (incl. same-provider
-  paid → free switching, fallback chain, next-midnight reset).
+- **Several API keys per provider** — add, list and delete keys in
+  Providers. Keys live only in EncryptedSharedPreferences (one encrypted
+  JSON list per provider); they are shown masked (first 3 + last 4
+  characters) and are never logged or stored in Room. A key saved in v1
+  still works: it is read as a one-key list.
+- **Fallback order** — an ordered list of (provider, model) steps, 1st →
+  2nd → 3rd …, edited in Providers: add any model with the + button,
+  move steps up/down, remove them. The chain is stored in DataStore
+  (no Room change, no migration).
+- **Auto-switch in the chat** — when a model turn fails with a limit
+  error, the turn retries automatically: first every other
+  non-exhausted key of the same provider + model, then the fallback
+  chain in order. Because a chain step may name another model of the
+  *same* provider, this is also single-provider fallback (e.g. a paid
+  model hits its limit → the free model of the same provider takes
+  over). A turn is only retried when nothing was shown yet, so a reply
+  is never duplicated.
+- **Limit kinds** — quota / long limit is HTTP 402 or a response body
+  that mentions quota; a plain HTTP 429 is a short rate limit. The kind
+  is shown in the switch notice; both mark the key exhausted.
+- **Exhaustion resets at midnight** — a key marked exhausted is skipped
+  until the start of the next local day. Exhaustion is tracked by key
+  id (a SHA-256 prefix, never the key value) in DataStore, and expired
+  flags are pruned on read. A fallback entry whose every key is
+  exhausted shows a "Limit reached — resets at midnight" badge in
+  Providers.
+- **Switch notice** — when a turn switches, the chat shows a small
+  banner ("Switched to … — quota reached on …") and keeps the same text
+  as a tool message in the history. The session's own model is not
+  changed: the fallback applies per turn, and the next message starts
+  from the session model again.
+
+## What is TODO / Phase 2 (explicitly NOT in v1)
+- Phase 2, Step 1 (multi-key fallback / auto-switch) is done — see the
+  section above. Still to do:
 - MCP servers, custom skills, custom commands, voice, reasoning-effort
   picker, remote-server mode, Git client, in-app terminal, editor tabs /
   live preview, `MANAGE_EXTERNAL_STORAGE`.
@@ -126,7 +159,7 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (35 files, ~3,900 lines total; 3,583 lines of Kotlin)
+CodeSathi/  (36 files, ~4,600 lines total; 4,216 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
   assets/providers.json          # 12-provider starter catalog (ours)
@@ -134,20 +167,21 @@ app/src/main/
     MainActivity.kt              # NavHost (85)
     CodeSathiApp.kt              # Room / DataStore / KeyStore singletons (26)
     data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel (177)
-    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules (91)
-    data/KeyStore.kt             # EncryptedSharedPreferences for API keys (39)
+    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion (176)
+    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, masked display (146)
     data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache (181)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
     agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree (163)
     agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
-    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events (238)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification (410)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules (657)
+    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException (252)
+    agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset (143)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries (493)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback (740)
     ui/Markdown.kt               # Self-contained Markdown renderer for chat (275)
     ui/Nav.kt                    # Routes (12)
     ui/theme/Theme.kt            # (37)
     ui/screens/OnboardingScreen.kt   # (93)
     ui/screens/HomeScreen.kt         # Home + New Session (204)
-    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog (425)
-    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id (321)
+    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice (442)
+    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order (422)
 ```

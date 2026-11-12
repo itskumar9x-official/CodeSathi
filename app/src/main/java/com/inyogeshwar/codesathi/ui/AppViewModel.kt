@@ -14,6 +14,8 @@ import com.inyogeshwar.codesathi.CodeSathiApp
 import com.inyogeshwar.codesathi.agent.AgentEvent
 import com.inyogeshwar.codesathi.agent.AgentRunner
 import com.inyogeshwar.codesathi.agent.Compaction
+import com.inyogeshwar.codesathi.agent.FallbackEngine
+import com.inyogeshwar.codesathi.agent.LimitKind
 import com.inyogeshwar.codesathi.agent.LlmClient
 import com.inyogeshwar.codesathi.agent.LlmMessage
 import com.inyogeshwar.codesathi.agent.PlannedFile
@@ -21,7 +23,9 @@ import com.inyogeshwar.codesathi.agent.Plan
 import com.inyogeshwar.codesathi.agent.SafProject
 import com.inyogeshwar.codesathi.agent.ToolContext
 import com.inyogeshwar.codesathi.agent.v1Tools
+import com.inyogeshwar.codesathi.data.FallbackEntry
 import com.inyogeshwar.codesathi.data.FavouriteModel
+import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.Provider
@@ -48,6 +52,9 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     private val prefs = app.preferencesStore
     private val keys = app.keyStore
     val providerRepository = app.providerRepository
+
+    /** Multi-key + single-provider fallback engine (Phase 2, Step 1). */
+    val fallbackEngine = FallbackEngine(providerRepository, keys, prefs)
 
     var onboarded by mutableStateOf(false)
         private set
@@ -85,6 +92,24 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     var lastSummary by mutableStateOf<SessionSummary?>(null)
         private set
 
+    /** The user's ordered fallback list (1st, 2nd, 3rd …). */
+    val fallbackChain: StateFlow<List<FallbackEntry>> =
+        prefs.fallbackChain.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
+        )
+
+    /** "providerId/modelId" values whose every key is exhausted right now. */
+    var exhaustedModelKeys by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** Bumped whenever keys change, so the provider screen re-reads them. */
+    var keysVersion by mutableStateOf(0)
+        private set
+
+    /** One-line notice after a fallback switch ("Switched to … — quota reached"). */
+    var fallbackNotice by mutableStateOf<String?>(null)
+        private set
+
     /** Fetched model lists, keyed by provider id (fresh or cached). */
     var fetchedModels by mutableStateOf<Map<String, List<String>>>(emptyMap())
         private set
@@ -113,6 +138,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         viewModelScope.launch {
             prefs.onboarded.collect { onboarded = it }
         }
+        refreshExhausted()
     }
 
     // ---- Onboarding / folder picking (Step 1) ----
@@ -215,9 +241,51 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     fun hasApiKey(providerId: String): Boolean = keys.hasKey(providerId)
 
-    fun saveApiKey(providerId: String, apiKey: String) = keys.saveKey(providerId, apiKey)
+    /** Masked keys for one provider, for the provider screen. */
+    fun apiKeys(providerId: String): List<KeyStore.KeyDisplay> = keys.listKeys(providerId)
 
-    fun removeApiKey(providerId: String) = keys.removeKey(providerId)
+    /** Add another key for a provider (stored encrypted, never logged). */
+    fun addApiKey(providerId: String, apiKey: String) {
+        if (keys.addKey(providerId, apiKey) != null) {
+            keysVersion++
+            refreshExhausted()
+        }
+    }
+
+    /** Delete one key (by its stable id) from a provider. */
+    fun removeApiKey(providerId: String, keyId: String) {
+        keys.removeKey(providerId, keyId)
+        keysVersion++
+        refreshExhausted()
+    }
+
+    // ---- Fallback chain (Phase 2, Step 1) ----
+
+    fun addFallbackEntry(providerId: String, modelId: String) {
+        viewModelScope.launch { prefs.addFallbackEntry(FallbackEntry(providerId, modelId)) }
+    }
+
+    fun removeFallbackEntry(providerId: String, modelId: String) {
+        viewModelScope.launch { prefs.removeFallbackEntry(providerId, modelId) }
+    }
+
+    fun moveFallbackEntryUp(index: Int) {
+        viewModelScope.launch { prefs.moveFallbackEntry(index, index - 1) }
+    }
+
+    fun moveFallbackEntryDown(index: Int) {
+        viewModelScope.launch { prefs.moveFallbackEntry(index, index + 1) }
+    }
+
+    fun refreshExhausted() {
+        viewModelScope.launch {
+            exhaustedModelKeys = fallbackEngine.exhaustedModelKeys()
+        }
+    }
+
+    fun dismissFallbackNotice() {
+        fallbackNotice = null
+    }
 
     fun toggleFavourite(providerId: String, modelId: String) {
         val key = "$providerId/$modelId"
@@ -409,6 +477,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         }
         isRunning = true
         lastError = null
+        fallbackNotice = null
         runJob = viewModelScope.launch {
             try {
                 // Insert the user message first, in this coroutine, so the
@@ -442,7 +511,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         context: Context
     ) {
         val project = SafProject(context, Uri.parse(session.projectUri))
-        val runner = AgentRunner(llm, v1Tools(project))
+        val runner = AgentRunner(llm, v1Tools(project), fallbackEngine)
         val toolContext = ToolContext(
             readOnly = session.agentMode == "plan",
             projectUri = Uri.parse(session.projectUri),
@@ -468,6 +537,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             )
         }
         collectRunEvents(session, flow, assistantText)
+        refreshExhausted()
         if (assistantText.isNotBlank()) {
             db.messageDao().insert(
                 Message(sessionId = session.id, role = "assistant", text = assistantText.toString(), createdAt = System.currentTimeMillis())
@@ -522,6 +592,19 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                     )
                 }
                 is AgentEvent.Error -> lastError = event.message
+                is AgentEvent.FallbackSwitched -> {
+                    val toName = provider(event.toProviderId)?.name ?: event.toProviderId
+                    val reason = when (event.kind) {
+                        LimitKind.QUOTA -> "quota reached on ${event.fromProviderId} / ${event.fromModelId}"
+                        LimitKind.RATE -> "rate limit on ${event.fromProviderId} / ${event.fromModelId}"
+                    }
+                    val text = "Switched to $toName / ${event.toModelId} — $reason."
+                    fallbackNotice = text
+                    db.messageDao().insert(
+                        Message(sessionId = session.id, role = "tool", text = text, createdAt = System.currentTimeMillis())
+                    )
+                    refreshExhausted()
+                }
                 is AgentEvent.Verified -> {
                     db.messageDao().insert(
                         Message(sessionId = session.id, role = "tool", text = event.message, createdAt = System.currentTimeMillis())

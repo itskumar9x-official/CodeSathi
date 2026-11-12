@@ -96,7 +96,11 @@ class LlmClient {
             val code = conn.responseCode
             if (code !in 200..299) {
                 val err = conn.errorStream?.bufferedReader()?.readText().orEmpty()
-                throw LlmException("Provider error HTTP $code: ${err.take(300)}")
+                throw LlmException(
+                    "Provider error HTTP $code: ${err.take(300)}",
+                    httpCode = code,
+                    body = err
+                )
             }
             emitAllEvents(conn, this)
         } finally {
@@ -235,4 +239,14 @@ class LlmClient {
             .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
 
-class LlmException(message: String) : Exception(message)
+/**
+ * An HTTP failure from the provider. [httpCode] and [body] are kept so the
+ * fallback engine can tell a limit error (402 / quota / 429) from any other
+ * failure — the message alone is not enough. The body is the provider's
+ * error text (never an API key: keys are only ever sent, never returned).
+ */
+class LlmException(
+    message: String,
+    val httpCode: Int? = null,
+    val body: String? = null
+) : Exception(message)

@@ -181,6 +181,23 @@ fun ChatScreen(
                     )
                 }
             }
+            // Fallback switch notice (Phase 2, Step 1): which model the turn
+            // moved to and why. The same text is also kept as a tool message
+            // in the chat history.
+            viewModel.fallbackNotice?.let { notice ->
+                Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(notice, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { viewModel.dismissFallbackNotice() }) {
+                            Text("Dismiss")
+                        }
+                    }
+                }
+            }
             if (showSummary) {
                 val summary = viewModel.lastSummary
                 Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
