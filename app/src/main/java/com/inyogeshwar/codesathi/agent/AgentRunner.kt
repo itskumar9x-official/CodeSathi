@@ -3,6 +3,7 @@ package com.inyogeshwar.codesathi.agent
 import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.Provider
+import com.inyogeshwar.codesathi.data.TokenCounter
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -51,6 +52,21 @@ sealed class AgentEvent {
         val toProviderId: String,
         val toModelId: String,
         val kind: LimitKind
+    ) : AgentEvent()
+    /**
+     * One model turn's token usage (Phase 5, Step 2). [usage] is the
+     * provider's real reported counts when it sent any; [estimated] is
+     * true when it did not and the counts are the chars÷4 estimate —
+     * the dashboard shows estimated rows as estimates, never as real.
+     * One event per model turn (a Build message with several tool steps
+     * emits one per step), tagged with the provider + model that
+     * actually answered that turn (after any fallback switch).
+     */
+    data class TurnUsage(
+        val usage: LlmUsage,
+        val providerId: String,
+        val modelId: String,
+        val estimated: Boolean
     ) : AgentEvent()
     object Done : AgentEvent()
 }
@@ -107,6 +123,13 @@ private data class ParsedToolCall(
  * for its OWN provider + model, so a fallback switch sends the new
  * model's effort (or nothing, when that model is at "default") —
  * the first attempt's effort is never reused for another model.
+ *
+ * Usage (Phase 5, Step 2): every successful model turn emits one
+ * [AgentEvent.TurnUsage] — the provider's real reported counts when it
+ * sent any ([ChatStreamEvent.Usage]), otherwise the chars÷4 estimate
+ * over the prompt sent and the text received, flagged estimated. The
+ * ViewModel persists each one, so totals are always derivable from
+ * stored rows and never only in memory.
  *
  * MCP tools (Phase 2, Step 3): tools whose names start with "mcp:" are
  * listed in the Build system prompt and dispatched through the same
@@ -243,8 +266,15 @@ class AgentRunner(
         }
         var fullText: String? = null
         var lastLimitError: Exception? = null
+        // The turn that answered, and the usage it reported (Phase 5,
+        // Step 2): set only by the successful attempt, so a failed
+        // attempt's partial stream can never be recorded.
+        var usedProviderId = provider.id
+        var usedModelId = modelId
+        var reportedUsage: LlmUsage? = null
         for ((index, attempt) in attempts.withIndex()) {
             val full = StringBuilder()
+            reportedUsage = null
             try {
                 // Effort is looked up for THIS attempt's model, so a
                 // fallback switch sends the new model's effort (or none).
@@ -259,11 +289,19 @@ class AgentRunner(
                 val awsCreds = if (attempt.provider.kind == "bedrock") {
                     awsCredentialsFor?.invoke()
                 } else null
-                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages, effort, azureResource, awsCreds).collect { chunk ->
-                    full.append(chunk)
-                    emit(AgentEvent.TextChunk(chunk))
+                llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, messages, effort, azureResource, awsCreds).collect { event ->
+                    when (event) {
+                        is ChatStreamEvent.Text -> {
+                            full.append(event.chunk)
+                            emit(AgentEvent.TextChunk(event.chunk))
+                        }
+                        is ChatStreamEvent.Usage -> reportedUsage = event.usage
+                        is ChatStreamEvent.ToolCall -> Unit // Plans make no tool calls.
+                    }
                 }
                 fullText = full.toString()
+                usedProviderId = attempt.provider.id
+                usedModelId = attempt.modelId
                 break
             } catch (e: CancellationException) {
                 throw e
@@ -291,6 +329,17 @@ class AgentRunner(
             emit(AgentEvent.Error("Plan failed: ${lastLimitError?.message ?: "all keys and fallback models are exhausted."}"))
             return@flow
         }
+        // Usage for this turn (Phase 5, Step 2): the provider's real
+        // counts when it sent any, otherwise the chars÷4 estimate over
+        // the prompt sent and the reply received. Recorded even when
+        // the reply is not a valid plan — the tokens were still spent.
+        val realUsage = reportedUsage
+        emit(
+            AgentEvent.TurnUsage(
+                realUsage ?: estimateUsage(messages, full),
+                usedProviderId, usedModelId, realUsage == null
+            )
+        )
         val plan = parsePlan(full)
         if (plan != null) emit(AgentEvent.PlanReady(plan))
         else emit(AgentEvent.Error("The model did not return a plan in the expected format. Try again or rephrase the goal."))
@@ -334,10 +383,17 @@ class AgentRunner(
             val nativeToolCalls = mutableListOf<LlmToolCall>()
             var turnOk = false
             var lastLimitError: Exception? = null
+            // The attempt that answered this step, and the usage it
+            // reported (Phase 5, Step 2). Cleared per attempt, set only
+            // on success, so a failed attempt can never be recorded.
+            var usedProviderId = provider.id
+            var usedModelId = modelId
+            var stepUsage: LlmUsage? = null
             for ((index, attempt) in attempts.withIndex()) {
                 turnText.clear()
                 nativeCalls.clear()
                 nativeToolCalls.clear()
+                stepUsage = null
                 try {
                     // Effort is looked up for THIS attempt's model, so a
                     // fallback switch sends the new model's effort (or none).
@@ -364,8 +420,11 @@ class AgentRunner(
                                     nativeToolCalls += event.call
                                 }
                             }
+                            is ChatStreamEvent.Usage -> stepUsage = event.usage
                         }
                     }
+                    usedProviderId = attempt.provider.id
+                    usedModelId = attempt.modelId
                     turnOk = true
                     break
                 } catch (e: CancellationException) {
@@ -394,6 +453,21 @@ class AgentRunner(
                 return@flow
             }
             val text = turnText.toString()
+
+            // Usage for this step (Phase 5, Step 2): the provider's real
+            // counts when it sent any, otherwise the chars÷4 estimate
+            // over the prompt sent for this step and the text received.
+            // The prompt is the whole llmMessages list as it stood for
+            // this step — a later step's longer prompt is its own row,
+            // exactly as the provider bills it. Recorded even when the
+            // step pauses for a file approval — the tokens were spent.
+            val realUsage = stepUsage
+            emit(
+                AgentEvent.TurnUsage(
+                    realUsage ?: estimateUsage(llmMessages, text),
+                    usedProviderId, usedModelId, realUsage == null
+                )
+            )
 
             // --- Gather tool calls: native ones first, then fenced ```tool blocks. ---
             val calls = mutableListOf<ParsedToolCall>()
@@ -603,6 +677,17 @@ class AgentRunner(
             }
         }
         return found
+    }
+
+    /**
+     * Usage fallback (Phase 5, Step 2): when a provider sends no usage
+     * for a turn, the counts are the chars÷4 estimate over the prompt
+     * actually sent and the text actually received. The caller marks
+     * the row estimated, so the dashboard never shows it as real.
+     */
+    private fun estimateUsage(promptMessages: List<LlmMessage>, completionText: String): LlmUsage {
+        val prompt = promptMessages.sumOf { TokenCounter.estimateTokens(it.content) }
+        return LlmUsage(prompt, TokenCounter.estimateTokens(completionText))
     }
 
     private fun parsePlan(text: String): Plan? {

@@ -29,6 +29,7 @@ import com.inyogeshwar.codesathi.ui.screens.ProviderPickerScreen
 import com.inyogeshwar.codesathi.ui.screens.RemoteScreen
 import com.inyogeshwar.codesathi.ui.screens.SkillsScreen
 import com.inyogeshwar.codesathi.ui.screens.TerminalScreen
+import com.inyogeshwar.codesathi.ui.screens.UsageScreen
 import com.inyogeshwar.codesathi.ui.theme.CodeSathiTheme
 
 class MainActivity : ComponentActivity() {
@@ -68,7 +69,8 @@ class MainActivity : ComponentActivity() {
                                 onTerminal = { nav.navigate(Screen.Terminal.route) },
                                 onRemote = { nav.navigate(Screen.Remote.route) },
                                 onGit = { nav.navigate(Screen.Git.route) },
-                                onEditor = { nav.navigate(Screen.Editor.route) }
+                                onEditor = { nav.navigate(Screen.Editor.route) },
+                                onUsage = { nav.navigate(Screen.Usage.route) }
                             )
                         }
                         composable(Screen.NewSession.route) {
@@ -147,6 +149,12 @@ class MainActivity : ComponentActivity() {
                                 appViewModel = vm,
                                 onBack = { nav.popBackStack() },
                                 onOpenSession = { id -> nav.navigate(Screen.Chat.route(id)) }
+                            )
+                        }
+                        composable(Screen.Usage.route) {
+                            UsageScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
                             )
                         }
                     }

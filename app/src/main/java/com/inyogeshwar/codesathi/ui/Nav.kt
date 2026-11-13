@@ -16,4 +16,5 @@ sealed class Screen(val route: String) {
     object Remote : Screen("remote")
     object Git : Screen("git")
     object Editor : Screen("editor")
+    object Usage : Screen("usage")
 }

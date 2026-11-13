@@ -57,10 +57,24 @@ data class ToolResultFeedback(
     val content: String
 )
 
+/** Real token usage a provider reported for one turn. */
+data class LlmUsage(val promptTokens: Int, val completionTokens: Int) {
+    val totalTokens: Int get() = promptTokens + completionTokens
+}
+
 /** Events from one streamed chat turn. Tool calls arrive after the text. */
 sealed interface ChatStreamEvent {
     data class Text(val chunk: String) : ChatStreamEvent
     data class ToolCall(val call: LlmToolCall) : ChatStreamEvent
+    /**
+     * Real token usage the provider reported for this turn (OpenAI SSE
+     * `usage` object, Anthropic message_start / message_delta usage,
+     * Bedrock Converse `usage`, or the `usage` object of a plain-JSON
+     * reply). Emitted once, at the end of the turn, when the provider
+     * sent one. Absent when the provider sent no usage — the caller
+     * then falls back to the chars÷4 estimate and labels it estimated.
+     */
+    data class Usage(val usage: LlmUsage) : ChatStreamEvent
 }
 
 /**
@@ -95,6 +109,13 @@ sealed interface ChatStreamEvent {
  * Streaming is best-effort: if the provider answers with plain JSON
  * instead of SSE, the single response is returned as one chunk, and any
  * `tool_calls` in it are surfaced as [ChatStreamEvent.ToolCall] events.
+ * - Real token usage (Phase 5, Step 2): when the provider reports it,
+ *   the turn ends with a [ChatStreamEvent.Usage] — the OpenAI SSE
+ *   `usage` object in the final chunk (requested with
+ *   `stream_options.include_usage`), Anthropic's message_start /
+ *   message_delta usage, Bedrock Converse `usage`, or the `usage`
+ *   object of a plain-JSON reply. A provider that sends no usage
+ *   simply yields no Usage event, and the caller estimates instead.
  */
 class LlmClient {
 
@@ -245,8 +266,13 @@ class LlmClient {
                 }
                 val raw = conn.inputStream.bufferedReader().readText()
                 val parsed = parseBedrockConverse(raw)
-                parsed.first?.let { collector.emit(ChatStreamEvent.Text(it)) }
-                parsed.second.forEach { collector.emit(ChatStreamEvent.ToolCall(it)) }
+                parsed.text?.let { collector.emit(ChatStreamEvent.Text(it)) }
+                parsed.calls.forEach { collector.emit(ChatStreamEvent.ToolCall(it)) }
+                // Bedrock Converse DOES report usage (usage.inputTokens /
+                // outputTokens) — use it when present, exactly like the
+                // streaming providers. A response without it falls back
+                // to the estimate in the runner, like any other provider.
+                parsed.usage?.let { collector.emit(ChatStreamEvent.Usage(it)) }
             } finally {
                 conn.disconnect()
             }
@@ -291,14 +317,21 @@ class LlmClient {
         return """{"messages":[$rest],"inferenceConfig":{"maxTokens":4096}$systemPart}"""
     }
 
-    /** Parse a Converse response: (text, tool calls). */
-    private fun parseBedrockConverse(body: String): Pair<String?, List<LlmToolCall>> {
+    /** One parsed Converse reply: text, tool calls, and reported usage (when present). */
+    private data class BedrockReply(
+        val text: String?,
+        val calls: List<LlmToolCall>,
+        val usage: LlmUsage?
+    )
+
+    /** Parse a Converse response: (text, tool calls, usage). */
+    private fun parseBedrockConverse(body: String): BedrockReply {
         return try {
             val el = json.parseToJsonElement(body).jsonObject
             val content = el["output"]?.jsonObject
                 ?.get("message")?.jsonObject
                 ?.get("content")?.jsonArray
-                ?: return null to emptyList()
+                ?: return BedrockReply(null, emptyList(), null)
             var text: String? = null
             val calls = mutableListOf<LlmToolCall>()
             for (block in content) {
@@ -313,9 +346,16 @@ class LlmClient {
                     calls += LlmToolCall(name, input?.toString() ?: "{}", id)
                 }
             }
-            text to calls
+            // Converse usage: {"inputTokens":…,"outputTokens":…,"totalTokens":…}.
+            val usageObj = el["usage"]?.jsonObject
+            val usage = usageObj?.let {
+                val prompt = it["inputTokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                val completion = it["outputTokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                if (prompt != null && completion != null) LlmUsage(prompt, completion) else null
+            }
+            BedrockReply(text, calls, usage)
         } catch (_: Exception) {
-            null to emptyList()
+            BedrockReply(null, emptyList(), null)
         }
     }
 
@@ -378,7 +418,13 @@ class LlmClient {
             val effortPart = if (reasoningEffort in VALID_REASONING_EFFORTS) {
                 ",\"reasoning_effort\":\"$reasoningEffort\""
             } else ""
-            """{"model":"${escape(modelId)}","stream":true$effortPart,"messages":[$msgs]}"""
+            // stream_options.include_usage asks the provider to send its
+            // real token counts in the final SSE chunk (OpenAI's documented
+            // way — without it, /chat/completions never reports usage).
+            // Most OpenAI-compatible servers accept the field; a provider
+            // that 400s on unknown fields surfaces its error through the
+            // normal LlmException path instead of silently losing usage.
+            """{"model":"${escape(modelId)}","stream":true,"stream_options":{"include_usage":true}$effortPart,"messages":[$msgs]}"""
         }
     }
 
@@ -391,6 +437,10 @@ class LlmClient {
      * Reads the response body. SSE `data:` lines yield text deltas (and
      * accumulate `tool_calls` fragments, emitted at the end). If the body
      * is plain JSON instead of SSE, it is parsed as one complete response.
+     * Real token usage is collected along the way — the OpenAI `usage`
+     * object in the final chunk, Anthropic's message_start (input) and
+     * message_delta (output) usage — and emitted once as
+     * [ChatStreamEvent.Usage] at the end, when the provider sent any.
      */
     private suspend fun emitAllEvents(
         conn: HttpURLConnection,
@@ -400,6 +450,10 @@ class LlmClient {
             val toolCalls = linkedMapOf<Int, ToolCallBuilder>()
             var sawSse = false
             val rawBody = StringBuilder()
+            // Real usage reported by this turn, when the provider sends it.
+            var openAiUsage: LlmUsage? = null
+            var anthropicInput: Int? = null
+            var anthropicOutput: Int? = null
             BufferedReader(InputStreamReader(conn.inputStream)).use { reader ->
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
@@ -410,6 +464,11 @@ class LlmClient {
                         if (data == "[DONE]") break
                         extractDelta(data)?.let { collector.emit(ChatStreamEvent.Text(it)) }
                         accumulateToolCalls(data, toolCalls)
+                        extractOpenAiUsage(data)?.let { openAiUsage = it }
+                        extractAnthropicUsage(data)?.let { (input, output) ->
+                            if (input != null) anthropicInput = input
+                            if (output != null) anthropicOutput = output
+                        }
                     } else if (raw.isNotEmpty()) {
                         rawBody.append(raw)
                     }
@@ -420,9 +479,18 @@ class LlmClient {
                 val parsed = parseCompleteResponse(rawBody.toString())
                 parsed.first?.let { collector.emit(ChatStreamEvent.Text(it)) }
                 parsed.second.forEach { collector.emit(ChatStreamEvent.ToolCall(it)) }
+                parsed.third?.let { collector.emit(ChatStreamEvent.Usage(it)) }
             } else {
                 toolCalls.values.mapNotNull { it.build() }
                     .forEach { collector.emit(ChatStreamEvent.ToolCall(it)) }
+                // The usage object, when the provider sent one: OpenAI's
+                // final chunk carries both counts; Anthropic splits them
+                // across message_start (input) and message_delta (output).
+                val usage = openAiUsage
+                    ?: if (anthropicInput != null || anthropicOutput != null) {
+                        LlmUsage(anthropicInput ?: 0, anthropicOutput ?: 0)
+                    } else null
+                usage?.let { collector.emit(ChatStreamEvent.Usage(it)) }
             }
         }
     }
@@ -456,8 +524,8 @@ class LlmClient {
         }
     }
 
-    /** Parse a complete (non-SSE) chat response: (text, tool calls). */
-    private fun parseCompleteResponse(body: String): Pair<String?, List<LlmToolCall>> {
+    /** Parse a complete (non-SSE) chat response: (text, tool calls, usage). */
+    private fun parseCompleteResponse(body: String): Triple<String?, List<LlmToolCall>, LlmUsage?> {
         return try {
             val el = json.parseToJsonElement(body).jsonObject
             val message = el["choices"]?.jsonArray?.firstOrNull()
@@ -471,9 +539,64 @@ class LlmClient {
                 val name = fn["name"]?.jsonPrimitive?.contentOrNull ?: return@mapNotNull null
                 LlmToolCall(name, fn["arguments"]?.jsonPrimitive?.contentOrNull ?: "{}")
             }.orEmpty()
-            text to calls
+            // Usage in a complete reply: OpenAI's prompt/completion
+            // tokens, or Anthropic's input/output tokens — whichever the
+            // provider sent. Null when it sent none.
+            val usageObj = el["usage"]?.jsonObject
+            val usage = usageObj?.let {
+                val prompt = it["prompt_tokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                    ?: it["input_tokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                val completion = it["completion_tokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                    ?: it["output_tokens"]?.jsonPrimitive?.content?.toIntOrNull()
+                if (prompt != null && completion != null) LlmUsage(prompt, completion) else null
+            }
+            Triple(text, calls, usage)
         } catch (_: Exception) {
-            null to emptyList()
+            Triple(null, emptyList(), null)
+        }
+    }
+
+    /**
+     * The OpenAI `usage` object of one SSE chunk (the final chunk, when
+     * `stream_options.include_usage` was requested): prompt_tokens and
+     * completion_tokens. Null for every other chunk.
+     */
+    private fun extractOpenAiUsage(data: String): LlmUsage? {
+        return try {
+            val usage = json.parseToJsonElement(data).jsonObject["usage"]?.jsonObject ?: return null
+            val prompt = usage["prompt_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: return null
+            val completion = usage["completion_tokens"]?.jsonPrimitive?.content?.toIntOrNull() ?: return null
+            LlmUsage(prompt, completion)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Anthropic usage in one SSE event: message_start carries
+     * message.usage.input_tokens, message_delta carries
+     * usage.output_tokens. Returns (input, output) with nulls for the
+     * half this event does not carry, or null when the event is not a
+     * usage event at all.
+     */
+    private fun extractAnthropicUsage(data: String): Pair<Int?, Int?>? {
+        return try {
+            val el = json.parseToJsonElement(data).jsonObject
+            when (el["type"]?.jsonPrimitive?.contentOrNull) {
+                "message_start" -> {
+                    val input = el["message"]?.jsonObject?.get("usage")?.jsonObject
+                        ?.get("input_tokens")?.jsonPrimitive?.content?.toIntOrNull()
+                    if (input != null) input to null else null
+                }
+                "message_delta" -> {
+                    val output = el["usage"]?.jsonObject
+                        ?.get("output_tokens")?.jsonPrimitive?.content?.toIntOrNull()
+                    if (output != null) null to output else null
+                }
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 

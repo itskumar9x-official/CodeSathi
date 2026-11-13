@@ -66,7 +66,7 @@ class GitViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     /** The session Git runs in, or null when there is none yet. */
     val session: StateFlow<Session?> = combine(
-        db.sessionDao().observeSessions(),
+        db.sessionDao().observeSessionsByRecency(),
         prefs.lastSessionId
     ) { sessions, lastId ->
         sessions.firstOrNull { it.id == lastId } ?: sessions.firstOrNull()

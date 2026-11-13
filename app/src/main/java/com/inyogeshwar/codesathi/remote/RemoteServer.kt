@@ -33,7 +33,7 @@ import kotlinx.serialization.json.Json
  * remote file browsing, no remote terminal, no remote approve.
  *
  * Fixed port [PORT] (8080), also shown on the Remote screen.
- * Auth: every /api/* call needs `Authorization: Bearer <password>`,
+ * Auth: every call under /api/ needs `Authorization: Bearer <password>`,
  * compared in constant time against the password in KeyStore
  * (EncryptedSharedPreferences). Wrong / missing password → 401.
  * The password is never logged and never appears in a URL.

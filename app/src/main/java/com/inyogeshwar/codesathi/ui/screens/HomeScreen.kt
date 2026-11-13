@@ -17,14 +17,21 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.BarChart
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -37,6 +44,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -57,7 +65,9 @@ import com.inyogeshwar.codesathi.agent.openAllFilesAccessSettings
 import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.ui.AppViewModel
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,11 +82,33 @@ fun HomeScreen(
     onTerminal: () -> Unit,
     onRemote: () -> Unit,
     onGit: () -> Unit,
-    onEditor: () -> Unit
+    onEditor: () -> Unit,
+    onUsage: () -> Unit
 ) {
-    val sessions by viewModel.sessions.collectAsState()
+    // Phase 5, Step 4 — session organisation: the Home list reads the
+    // filtered list (search query in the ViewModel), not the full list,
+    // so typing in the search field filters live and clearing it
+    // restores every session.
+    val sessions by viewModel.filteredSessions.collectAsState()
+    val searchQuery = viewModel.sessionSearchQuery
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
+    // Phase 5, Step 4 — which session the rename / delete dialog is
+    // open for, if any. One dialog at a time; both live at this level
+    // (not inside the LazyColumn) so they survive list recomposition.
+    var renameTarget by remember { mutableStateOf<Session?>(null) }
+    var deleteTarget by remember { mutableStateOf<Session?>(null) }
+
+    // Phase 5, Step 3 — session backup & restore. Both use the system
+    // file picker (SAF) only: CreateDocument lets the user choose
+    // where the backup goes, OpenDocument lets them pick a backup to
+    // restore. No new permission, no path text field.
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? -> if (uri != null) viewModel.exportSessions(context, uri) }
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? -> if (uri != null) viewModel.importSessions(context, uri) }
 
     Scaffold(
         topBar = {
@@ -128,6 +160,29 @@ fun HomeScreen(
                             leadingIcon = { Icon(Icons.Filled.Extension, contentDescription = null) },
                             onClick = { menuOpen = false; onMcp() }
                         )
+                        DropdownMenuItem(
+                            text = { Text("Usage & cost") },
+                            leadingIcon = { Icon(Icons.Filled.BarChart, contentDescription = null) },
+                            onClick = { menuOpen = false; onUsage() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Backup sessions") },
+                            leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US)
+                                    .format(Date())
+                                exportLauncher.launch("codesathi-backup-$stamp.json")
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Restore sessions") },
+                            leadingIcon = { Icon(Icons.Filled.Upload, contentDescription = null) },
+                            onClick = {
+                                menuOpen = false
+                                importLauncher.launch(arrayOf("application/json"))
+                            }
+                        )
                     }
                 }
             )
@@ -141,13 +196,49 @@ fun HomeScreen(
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
             Text("Sessions", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(12.dp))
+            // Phase 5, Step 4 — search by title. Filters live as the
+            // user types (Room LIKE query in the ViewModel); the ×
+            // clears it and the full list comes back.
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { viewModel.setSessionSearchQuery(it) },
+                label = { Text("Search sessions") },
+                singleLine = true,
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { viewModel.setSessionSearchQuery("") }) {
+                            Icon(Icons.Filled.Clear, contentDescription = "Clear search")
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(12.dp))
             StorageAccessCard()
             Spacer(Modifier.height(12.dp))
+            // Phase 5, Step 3 — plain result of the last backup/restore.
+            viewModel.backupNote?.let { note ->
+                Text(note, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+            }
+            viewModel.backupError?.let { error ->
+                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+            }
             if (sessions.isEmpty()) {
-                Text(
-                    "Abhi koi session nahi hai. Neeche + dabakar pehla session banayein — folder chunenge, path type nahi karna.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                // Phase 5, Step 4 — a search with no matches says so
+                // plainly, instead of a blank screen with no explanation.
+                if (searchQuery.isBlank()) {
+                    Text(
+                        "Abhi koi session nahi hai. Neeche + dabakar pehla session banayein — folder chunenge, path type nahi karna.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    Text(
+                        "No sessions match “$searchQuery”.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
             }
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(sessions, key = { it.id }) { session ->
@@ -156,11 +247,52 @@ fun HomeScreen(
                         available = viewModel.isFolderAvailable(context, session),
                         modelLabel = "${session.providerId} / ${session.modelId}",
                         onOpen = { onOpenSession(session.id) },
-                        onRechoose = { uri -> viewModel.rechooseFolder(context, session, uri) }
+                        onRechoose = { uri -> viewModel.rechooseFolder(context, session, uri) },
+                        onTogglePin = { viewModel.setSessionPinned(session.id, !session.pinned) },
+                        onRename = { renameTarget = session },
+                        onDelete = { deleteTarget = session }
                     )
                 }
             }
         }
+    }
+    // Phase 5, Step 4 — rename and delete dialogs.
+    renameTarget?.let { session ->
+        RenameSessionDialog(
+            session = session,
+            onDismiss = { renameTarget = null },
+            onRename = { title ->
+                if (viewModel.renameSession(session.id, title)) {
+                    renameTarget = null
+                    true
+                } else {
+                    false
+                }
+            }
+        )
+    }
+    deleteTarget?.let { session ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete this session?") },
+            text = {
+                Text(
+                    "“${session.title}” and its messages will be deleted. " +
+                        "This cannot be undone."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.deleteSession(session.id)
+                        deleteTarget = null
+                    }
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -246,7 +378,10 @@ private fun SessionRow(
     available: Boolean,
     modelLabel: String,
     onOpen: () -> Unit,
-    onRechoose: (Uri) -> Unit
+    onRechoose: (Uri) -> Unit,
+    onTogglePin: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val context = LocalContext.current
     val picker = rememberLauncherForActivityResult(
@@ -259,10 +394,34 @@ private fun SessionRow(
         }
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Row {
+            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 // Status dot: green = folder reachable, amber = unavailable.
                 Text(if (available) "● " else "● ", color = if (available) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-                Text(session.title, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    session.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                // Phase 5, Step 4 — pin, rename, delete. These are
+                // IconButtons, so tapping one does not open the session
+                // (the button consumes the tap; the card never sees it).
+                // The pin is tinted when pinned, so its state is visible
+                // at a glance; pinning is stored in Room and survives
+                // a restart.
+                IconButton(onClick = onTogglePin) {
+                    Icon(
+                        Icons.Filled.PushPin,
+                        contentDescription = if (session.pinned) "Unpin session" else "Pin session",
+                        tint = if (session.pinned) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                IconButton(onClick = onRename) {
+                    Icon(Icons.Filled.Edit, contentDescription = "Rename session")
+                }
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Filled.Delete, contentDescription = "Delete session")
+                }
             }
             Text("Folder: ${session.folderName}", style = MaterialTheme.typography.bodyMedium)
             Text("Model: $modelLabel", style = MaterialTheme.typography.bodyMedium)
@@ -280,6 +439,54 @@ private fun SessionRow(
             }
         }
     }
+}
+
+/**
+ * Phase 5, Step 4 — rename dialog. The field starts with the current
+ * title; an empty title is refused with a plain message and the old
+ * title stays (the dialog stays open, nothing is written).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RenameSessionDialog(
+    session: Session,
+    onDismiss: () -> Unit,
+    onRename: (String) -> Boolean
+) {
+    var title by remember { mutableStateOf(session.title) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename session") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Session name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (!onRename(title)) {
+                        error = "Title cannot be empty — the old title stays."
+                    }
+                }
+            ) { Text("Rename") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 /**

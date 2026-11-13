@@ -680,6 +680,191 @@ Compose BOM 2024.01.00, Room 2.6.1.
   only a device run shows which one happens); and the tree on a
   real large folder (the caps are untested under load).
 
+## Phase 5, Step 2 — Usage & cost dashboard
+
+- **Real usage when the provider sends it** — the LLM client now
+  parses the provider's own token counts and reports them as a
+  `ChatStreamEvent.Usage` at the end of each turn: the OpenAI SSE
+  `usage` object in the final chunk (the request now asks for it with
+  `stream_options: {"include_usage": true}` — without that flag
+  `/chat/completions` never reports usage), Anthropic's `message_start`
+  (input_tokens) and `message_delta` (output_tokens) events, the
+  `usage` object of a plain-JSON (non-streaming) reply, and Bedrock
+  Converse `usage` (`inputTokens` / `outputTokens` — Converse does
+  report usage, so Bedrock turns are real, not estimated, when the
+  field is present). When a provider sends nothing, the turn falls
+  back to the existing chars÷4 estimate over the prompt actually sent
+  and the text actually received, and the row is flagged estimated.
+- **One row per turn in Room** — `usage_records` (session + provider +
+  model + prompt/completion tokens + estimated flag + time), one row
+  per successful model turn (Plan: one row; Build: one row per tool
+  step, tagged with the provider + model that actually answered after
+  any fallback switch). Failed turns write no row. Every total the
+  dashboard shows is a SUM over stored rows — nothing lives only in
+  memory. Room version is now **3**, with a real `Migration(2, 3)`
+  that creates the table and its two indexes; no existing table is
+  touched, so no user data moves or is lost.
+- **Small bundled price table** — `data/ModelPrices.kt`, 18 entries:
+  the top-pick flagships (Anthropic Sonnet 4.5 $3/$15, Haiku 4.5
+  $1/$5, Opus 4.1 $15/$75; OpenAI GPT-5 $1.25/$10, GPT-5 mini
+  $0.25/$2, GPT-4o $2.50/$10; Google Gemini 2.5 Flash $0.30/$2.50,
+  2.5 Pro $1.25/$10; DeepSeek deepseek-chat $0.28/$0.42), the same
+  models via OpenRouter at the direct list prices (OpenRouter passes
+  them through with no per-token markup), and seven free routes at
+  $0 (openrouter/free, TokenHarbor deepseek-v4-flash:free, three
+  unorouter `:free` models, orcarouter/free, clinepass
+  ernie-5.5-flash-preview:free). Every price was verified against a
+  public pricing page on **2026-11-13** (sources in the file's KDoc);
+  models whose price could not be verified — TokenHarbor's paid
+  models, Groq, xAI, Mistral, Together, DeepSeek Reasoner — are left
+  out and show "cost unknown" instead of an invented price. Rupees
+  use a fixed approximate rate of ~₹94 per $1 (the 13 Nov 2026
+  close). Every cost figure is shown as approximate ("~₹"), never as
+  an exact bill.
+- **Dashboard screen** — Home → "⋮" menu → "Usage & cost"
+  (`usage` route): grand totals (prompt / completion / total tokens,
+  turns, how many estimated), approx. total cost with the tokens
+  whose cost is unknown called out separately (never silently counted
+  as free), a per-model breakdown and a per-session breakdown (tokens
+  + approx. cost or "cost unknown", "estimated" / "partly estimated"
+  labels). Empty state until the first turn is recorded. The screen
+  states the price date, the conversion rate, and that costs are
+  estimates.
+- **Verification fix found by the balance check (pre-existing,
+  compile-blocking)** — Kotlin block comments nest, so a `/*`
+  inside a KDoc comment opens a nested comment that its closing `*/`
+  never closes: `AppViewModel.kt` (`getFilesDir()/skills/*.md`),
+  `Skills.kt` (`assets/skills/*.md`, `getFilesDir()/skills/*.md`)
+  and `RemoteServer.kt` (`/api/*`) each had one, leaving the rest of
+  the file inside an unterminated comment — the project could not
+  have compiled with those lines. All four spots are reworded to
+  drop the `/*` sequence (wording only, no code changed). This is
+  worth knowing for the first build: the nesting-aware balance check
+  now passes all 44 Kotlin files.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). First-build risks: the Room 2→3 migration (first
+  launch on an existing v2 database is the real test); the
+  `stream_options` field (a provider that 400s on unknown fields
+  would fail the turn through the normal error path instead of
+  silently losing usage — if a provider does that, the flag needs a
+  per-provider opt-out); `Icons.Filled.BarChart`
+  (material-icons-extended, already a dependency); the aggregate
+  `Flow<UsageTotals>` query. Honest limits: compaction summary calls
+  are model calls too but are not recorded (only user turns are);
+  DeepSeek's peak/off-peak rates mean its estimate uses the higher
+  peak rate; OpenRouter's 5.5% credit-purchase fee is not in the
+  per-token numbers, so real OpenRouter spend runs ~5.5% higher;
+  Google reroutes gemini-2.5-pro/flash to Gemini 3.8/3.5 Flash-Lite
+  from 1 Dec 2026 at those models' rates, so the 2.5 prices go stale
+  then; a fallback switch mid-turn records usage under the model
+  that answered, not the session's model.
+
+## Phase 5, Step 3 — Session backup & export
+
+- **Sessions only, in a versioned JSON file** — the backup holds Room
+  sessions only: each session, its messages (role / text / tool JSON /
+  time) and its compaction summary. It never holds API keys, provider
+  credentials, MCP tokens, the remote password, the Git credential, the
+  AWS credential or usage / cost records — the export screen's result
+  message says so, and usage is re-derived from new turns after a
+  restore. The file is versioned: top-level `formatVersion` (1) and
+  `"app": "CodeSathi"`, so future format changes stay importable;
+  unknown fields in a version-1 file are ignored.
+- **Home → "⋮" menu → "Backup sessions" / "Restore sessions"** — both
+  use the system file picker (SAF) only, no new permission, no path
+  text field: `CreateDocument("application/json")` lets the user
+  choose where the backup goes (suggested name
+  `codesathi-backup-YYYYMMDD-HHmm.json`); `OpenDocument()` lets them
+  pick a backup file to restore. Tap → picker → a plain result
+  message on Home. No new navigation route was needed.
+- **Import rules** — all-or-nothing per FILE for structural problems:
+  malformed JSON, a missing / wrong `app` marker or a wrong
+  `formatVersion` imports nothing, with a plain message. Per SESSION
+  after that: a session whose id already exists is SKIPPED, never
+  overwritten (the insert itself is also `OnConflictStrategy.ABORT`,
+  a second layer); an invalid session (missing id / title / folder /
+  provider / model, or an unknown mode) is skipped with its reason;
+  the rest are imported with fresh message ids, and a write that
+  still fails mid-session is cleaned up (messages + session deleted),
+  so no half-imported session is left behind. The result is a plain
+  summary, e.g. "3 imported, 1 skipped — “My project” — already
+  exists." (first 5 reasons shown, then "and N more").
+- **Folder grants do not travel with the file** — the backup stores
+  the session's project-folder URI string, so an imported session
+  still points at its folder, but a SAF persistable grant is per
+  device and per install and is NOT in the file. On the same device
+  and install the grant usually still holds and the session just
+  works; on a new device, after reinstalling, or after the grant was
+  revoked, the imported session shows "Folder unavailable" and the
+  user re-chooses the folder from Home, exactly like any session
+  whose folder was lost. The summary covers up to the last imported
+  message (old message ids are gone — messages get fresh ids on
+  import). Files over 10 MB are refused. Room is untouched: version
+  stays 3, no migration, no schema change — only two new DAO methods
+  (`SessionDao.insert` with ABORT, `deleteById`;
+  `MessageDao.deleteForSession` for import cleanup). No new
+  dependency (kotlinx-serialization was already in the project).
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). First-build risks: `Icons.Filled.Download` /
+  `Upload` (material-icons-extended, already a dependency);
+  `ActivityResultContracts.CreateDocument` / `OpenDocument` launch
+  signatures; the `entry.summaryMarkdown` smart cast in the import;
+  and the real SAF grant behaviour for an imported session on a
+  second device (only a device run shows it — the message covers
+  both outcomes).
+
+## Phase 5, Step 4 — Session organisation
+
+- **Search sessions by title** — a "Search sessions" field on Home,
+  with a × to clear it. Typing filters the list live through a Room
+  query (`title LIKE '%query%'`, case-insensitive for ASCII — SQLite
+  LIKE); `%` and `_` typed in the box are escaped (`ESCAPE '\'`,
+  escaped in the ViewModel) so they match those literal characters
+  in a title instead of acting as wildcards. Clearing the field
+  restores the full list. A search with no matches says
+  "No sessions match “query”." instead of a blank screen with no
+  explanation.
+- **Pin / favourite sessions** — a pin button on every session row
+  (tinted when pinned, grey when not). Pinned sessions sort first on
+  Home (`pinned DESC, updatedAt DESC` — the unpinned order is exactly
+  as before), stored in a new `pinned` column on `sessions`. Room
+  version is now **4**, with a real `Migration(3, 4)`:
+  `ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`
+  — existing sessions get 0 (not pinned), so no session moves or is
+  lost and no other table is touched. Pinning survives a restart
+  because it lives in Room, not in memory. Pinning does not touch
+  `updatedAt`, so it never reorders by activity. The terminal, Git
+  and editor screens keep their own "most recent session" fallback
+  through a separate recency-only query (`observeSessionsByRecency`),
+  so pinning an old session never hijacks which folder they open.
+- **Rename** — a pencil button on every row opens a dialog with the
+  current title pre-filled. An empty title is refused with a plain
+  message ("Title cannot be empty — the old title stays.") and
+  nothing is written. Renaming does not touch `updatedAt` ("Last
+  activity" stays about the chat, not the rename).
+- **Delete** — a trash button on every row asks "Delete this session?"
+  first ("…and its messages will be deleted. This cannot be
+  undone."). Confirming deletes the session and — in one Room
+  transaction — its messages, its compaction summary and its usage
+  rows, so the dashboard never shows orphan rows for a session that
+  no longer exists. Deleting the open or last session never crashes:
+  the active-session pointer and the last-session preference are
+  cleared, the terminal / Git / editor fall back to the most recent
+  remaining session (or "no session yet" when none is left), and a
+  chat screen left open on the deleted session already shows
+  "Session not found." with a Back button.
+- **Backup** — the pinned state travels in the backup file (format
+  version still 1; `pinned` defaults to false, so backups written
+  before pinning existed still import) and a restored pinned session
+  stays pinned.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). First-build risks: the Room 3→4 migration (first
+  launch on an existing v3 database is the real test);
+  `Icons.Filled.PushPin` (material-icons-extended, already a
+  dependency); the `flatMapLatest` search flow in the ViewModel; the
+  `@Transaction` delete (same pattern as the existing
+  `replaceForProvider` in `CachedModelDao`).
+
 ## What is TODO / Phase 2 (explicitly NOT in v1)
 - Phase 2 is complete — Steps 1–8 are all done, see the sections
   above. Phase 3, Steps 1–5 (custom commands, reasoning-effort picker,
@@ -720,22 +905,24 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (61 files, ~15,505 lines total; 12,522 lines of Kotlin)
+CodeSathi/  (64 files; 13,769 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
   assets/providers.json          # 206-provider catalog (ours, Phase 2 Step 2 + live-check + Phase 4 fixes)
   assets/skills/                 # Built-in skills (Step 4): code-review.md, write-tests.md, explain-code.md
   java/com/inyogeshwar/codesathi/
-    MainActivity.kt              # NavHost (156)
-    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (35)
-    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel (177)
+    MainActivity.kt              # NavHost (165)
+    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (36)
+    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel, UsageRecord (290)
+    data/SessionBackup.kt        # Versioned session backup format (v1): encode / parse / validate, sessions only, no secrets (212)
+    data/ModelPrices.kt          # Bundled price table for cost estimates, 18 entries, price date 2026-11-13 (144)
     data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name (515)
     data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, AWS Bedrock credentials, masked display (308)
     data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache, Azure deployments list, Bedrock note (233)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
     agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries (183)
     agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
-    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming) (509)
+    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming), real usage parsing (632)
     agent/BedrockSigner.kt       # Hand-rolled AWS SigV4 signing for Bedrock Converse, model-id percent-encoding (130)
     agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset, Bedrock single keyless attempt (157)
     agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call (230)
@@ -746,17 +933,17 @@ app/src/main/
     agent/Git.kt                 # JGit wrapper: status / stage / commit / push / pull / branches / clone (262)
     remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080 (474)
     remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (192)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing (644)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials (1479)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing, per-turn usage events (729)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials, usage recording, session backup/restore (1695)
     ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (202)
     ui/GitViewModel.kt           # Git state: folder, status, one op at a time (306)
     ui/EditorViewModel.kt        # Editor state: tabs, in-memory edits, binary checks, save proposals, folder tree (576)
     ui/Markdown.kt               # Self-contained Markdown renderer for chat (282)
     ui/SyntaxHighlight.kt        # Hand-rolled syntax highlighter for diffs + code blocks (368)
-    ui/Nav.kt                    # Routes (19)
+    ui/Nav.kt                    # Routes (20)
     ui/theme/Theme.kt            # (37)
     ui/screens/OnboardingScreen.kt   # (93)
-    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu (350)
+    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu, backup/restore pickers (399)
     ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice, mic + voice output, command suggestions, effort label (542)
     ui/screens/DiffCard.kt           # Shared Approve/Reject diff card (Chat + Editor), syntax-highlighted (75)
     ui/screens/FolderTree.kt         # Folder tree browser for the Editor (243)
@@ -768,4 +955,5 @@ app/src/main/
     ui/screens/RemoteScreen.kt       # Remote mode: toggle, password, Wi-Fi URL, session count (238)
     ui/screens/GitScreen.kt          # Git: status, stage/commit/push/pull, branches, clone, credential (465)
     ui/screens/EditorScreen.kt       # Editor: folder tree, tabs, diff card, .html WebView preview (351)
+    ui/screens/UsageScreen.kt        # Usage & cost dashboard: totals, per-model and per-session breakdowns (296)
 ```

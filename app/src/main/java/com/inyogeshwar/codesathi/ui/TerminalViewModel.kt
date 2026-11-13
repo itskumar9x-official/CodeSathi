@@ -71,7 +71,7 @@ class TerminalViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     /** The session the terminal runs in, or null when there is none yet. */
     val session: StateFlow<Session?> = combine(
-        db.sessionDao().observeSessions(),
+        db.sessionDao().observeSessionsByRecency(),
         prefs.lastSessionId
     ) { sessions, lastId ->
         sessions.firstOrNull { it.id == lastId } ?: sessions.firstOrNull()

@@ -44,7 +44,7 @@ data class Skill(
     val fileName: String
 )
 
-/** The ids of the skills that ship with the app (assets/skills/*.md). */
+/** The ids of the skills that ship with the app (assets/skills/ — one .md file each). */
 val BUILTIN_SKILL_IDS = setOf("code-review", "write-tests", "explain-code")
 
 /** URL-safe id from a name: "Code Review" → "code-review". */
@@ -97,7 +97,7 @@ fun parseSkillMarkdown(fileName: String, text: String): Skill {
 }
 
 /**
- * Skills on disk: getFilesDir()/skills/*.md. All file work runs on
+ * Skills on disk: getFilesDir()/skills/ (one .md file per skill). All file work runs on
  * Dispatchers.IO — the ViewModel never touches these files directly.
  */
 class SkillStore(private val context: Context) {

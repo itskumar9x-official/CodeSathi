@@ -35,18 +35,31 @@ import com.inyogeshwar.codesathi.data.FallbackEntry
 import com.inyogeshwar.codesathi.data.FavouriteModel
 import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.McpServer
+import com.inyogeshwar.codesathi.data.BackupImportResult
+import com.inyogeshwar.codesathi.data.BackupParseResult
+import com.inyogeshwar.codesathi.data.MAX_BACKUP_BYTES
 import com.inyogeshwar.codesathi.data.Message
+import com.inyogeshwar.codesathi.data.SessionBackupData
+import com.inyogeshwar.codesathi.data.encodeBackup
+import com.inyogeshwar.codesathi.data.parseBackup
+import com.inyogeshwar.codesathi.data.toSession
+import com.inyogeshwar.codesathi.data.validateBackupSession
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.data.SessionSummary
 import com.inyogeshwar.codesathi.data.TokenCounter
+import com.inyogeshwar.codesathi.data.UsageBySessionModel
+import com.inyogeshwar.codesathi.data.UsageRecord
+import com.inyogeshwar.codesathi.data.UsageTotals
 import com.inyogeshwar.codesathi.remote.RemoteTurnResult
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -76,6 +89,268 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     val favourites: StateFlow<List<FavouriteModel>> =
         db.favouriteDao().observeFavourites()
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    // ---- Session organisation (Phase 5, Step 4) ----
+
+    /**
+     * Search text typed on Home. The Home list reads [filteredSessions],
+     * not [sessions]: a blank query shows every session (the same
+     * pinned-first order), a typed query switches the Room query to the
+     * case-insensitive title LIKE search. Clearing the field restores
+     * the full list. The query lives here (not in the screen) so the
+     * list survives a recomposition and the DAO call is the single
+     * source of the filtered list.
+     */
+    var sessionSearchQuery by mutableStateOf("")
+        private set
+    private val sessionSearchQueryFlow = MutableStateFlow("")
+
+    val filteredSessions: StateFlow<List<Session>> = sessionSearchQueryFlow
+        .flatMapLatest { query ->
+            val trimmed = query.trim()
+            if (trimmed.isEmpty()) db.sessionDao().observeSessions()
+            else db.sessionDao().searchSessions(escapeLike(trimmed))
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun setSessionSearchQuery(query: String) {
+        sessionSearchQuery = query
+        sessionSearchQueryFlow.value = query
+    }
+
+    /**
+     * Escape the LIKE wildcards in a search query, so "%" and "_" typed
+     * by the user match those literal characters in a title instead of
+     * matching anything. The backslash is escaped first, and the DAO
+     * query declares ESCAPE '\'.
+     */
+    private fun escapeLike(text: String): String =
+        text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    /** Pin or unpin a session. Stored in Room, so it survives a restart. */
+    fun setSessionPinned(sessionId: String, pinned: Boolean) {
+        viewModelScope.launch { db.sessionDao().setPinned(sessionId, pinned) }
+    }
+
+    /**
+     * Rename a session. Returns false when the title is blank after
+     * trimming — nothing is written and the old title stays. The
+     * dialog shows a plain message in that case.
+     */
+    fun renameSession(sessionId: String, title: String): Boolean {
+        val clean = title.trim()
+        if (clean.isEmpty()) return false
+        viewModelScope.launch { db.sessionDao().setTitle(sessionId, clean) }
+        return true
+    }
+
+    /**
+     * Delete a session and everything that belongs to it — messages,
+     * compaction summary and usage rows, in one Room transaction
+     * ([SessionDao.deleteSessionAndData]). Deleting the session that
+     * is open, or the last session, never crashes: the active-session
+     * pointer and the last-session preference are cleared, and the
+     * terminal / Git / editor screens fall back to the most recent
+     * remaining session (or show "no session yet" when none is left).
+     * A chat screen left open on the deleted session already shows
+     * "Session not found." with a Back button.
+     */
+    fun deleteSession(sessionId: String) {
+        viewModelScope.launch {
+            db.sessionDao().deleteSessionAndData(sessionId)
+            if (activeSessionId == sessionId) activeSessionId = null
+            if (prefs.lastSessionId.first() == sessionId) prefs.setLastSession(null)
+        }
+    }
+
+    // ---- Usage & cost (Phase 5, Step 2) ----
+
+    /** Grand totals over every recorded turn (prompt + completion). */
+    val usageTotals: StateFlow<UsageTotals> =
+        db.usageDao().observeTotals()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UsageTotals())
+
+    /**
+     * Usage summed per (session, provider, model). The dashboard groups
+     * these rows by model and by session, and prices them with
+     * [com.inyogeshwar.codesathi.data.ModelPrices] — totals are always
+     * derived from stored rows, never kept only in memory.
+     */
+    val usageBySessionModel: StateFlow<List<UsageBySessionModel>> =
+        db.usageDao().observeBySessionModel()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    // ---- Session backup & restore (Phase 5, Step 3) ----
+
+    /** One-line note from the last backup / restore, for Home. */
+    var backupNote by mutableStateOf<String?>(null)
+        private set
+    /** One-line error from the last backup / restore, for Home. */
+    var backupError by mutableStateOf<String?>(null)
+        private set
+
+    fun dismissBackupMessage() {
+        backupNote = null
+        backupError = null
+    }
+
+    /**
+     * Write every session (with its messages and compaction summary)
+     * to the file the user picked with the system file picker.
+     * Sessions only — no API keys, credentials, MCP tokens or usage
+     * records are ever in the file (see SessionBackup.kt).
+     */
+    fun exportSessions(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            backupNote = null
+            backupError = null
+            try {
+                val sessions = db.sessionDao().observeSessions().first()
+                val data = sessions.map { session ->
+                    SessionBackupData(
+                        session = session,
+                        messages = db.messageDao().getMessages(session.id),
+                        summary = db.summaryDao().get(session.id)
+                    )
+                }
+                val text = encodeBackup(data)
+                val written = context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(text.toByteArray(Charsets.UTF_8))
+                    true
+                } ?: false
+                if (!written) {
+                    backupError = "Could not write the backup file — try another location."
+                } else {
+                    backupNote = "Backup saved — ${sessions.size} session" +
+                        (if (sessions.size == 1) "" else "s") +
+                        ". It holds sessions only: no API keys, no usage records."
+                }
+            } catch (e: Exception) {
+                backupError = "Backup failed: ${e.message ?: "could not write the file."}"
+            }
+        }
+    }
+
+    /**
+     * Restore sessions from a backup file the user picked with the
+     * system file picker.
+     *
+     * All-or-nothing per FILE for structural problems: malformed JSON
+     * or a wrong format version imports nothing. Per SESSION after
+     * that: a session whose id already exists is skipped (never
+     * overwritten), an invalid session is skipped with its reason,
+     * and the rest are imported with fresh message ids. A write that
+     * still fails mid-session is cleaned up, so no half-imported
+     * session is left behind. The result is a plain summary on Home.
+     *
+     * An imported session keeps its folder URI string, but the SAF
+     * grant does not travel with the file — on a new device or after
+     * a reinstall the session shows "Folder unavailable" until the
+     * folder is re-chosen from Home.
+     */
+    fun importSessions(context: Context, uri: Uri) {
+        viewModelScope.launch {
+            backupNote = null
+            backupError = null
+            try {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes == null) {
+                    backupError = "Could not open that file — nothing was imported."
+                    return@launch
+                }
+                if (bytes.size > MAX_BACKUP_BYTES) {
+                    backupError = "That backup file is too large (over 10 MB) — nothing was imported."
+                    return@launch
+                }
+                val text = String(bytes, Charsets.UTF_8)
+                val backup = when (val parsed = parseBackup(text)) {
+                    is BackupParseResult.Error -> {
+                        backupError = parsed.message
+                        return@launch
+                    }
+                    is BackupParseResult.Ok -> parsed.backup
+                }
+                val result = importBackupSessions(backup.sessions)
+                backupNote = buildString {
+                    append("${result.imported} imported, ${result.skipped} skipped")
+                    if (result.skippedReasons.isNotEmpty()) {
+                        append(" — ")
+                        append(result.skippedReasons.take(5).joinToString("; "))
+                        if (result.skippedReasons.size > 5) {
+                            append("; and ${result.skippedReasons.size - 5} more")
+                        }
+                    }
+                    append(".")
+                    if (result.imported > 0) {
+                        append(" Restored sessions keep their folder, but the folder " +
+                            "permission may need re-choosing on a new device.")
+                    }
+                }
+            } catch (e: Exception) {
+                backupError = "Restore failed: ${e.message ?: "could not read the file."}"
+            }
+        }
+    }
+
+    /**
+     * The import itself, separated from the file reading so the rules
+     * are testable in one place: validate first, skip duplicates and
+     * invalid sessions, insert the rest, clean up on a failed write.
+     */
+    private suspend fun importBackupSessions(
+        entries: List<com.inyogeshwar.codesathi.data.BackupSession>
+    ): BackupImportResult {
+        var imported = 0
+        val skipped = mutableListOf<String>()
+        val seenIds = mutableSetOf<String>()
+        for (entry in entries) {
+            val invalid = validateBackupSession(entry)
+            if (invalid != null) {
+                skipped += "“${entry.title.ifBlank { entry.id.ifBlank { "unnamed" } }}” — $invalid"
+                continue
+            }
+            if (entry.id in seenIds || db.sessionDao().getSession(entry.id) != null) {
+                skipped += "“${entry.title}” — already exists"
+                continue
+            }
+            seenIds += entry.id
+            try {
+                db.sessionDao().insert(entry.toSession())
+                val insertedIds = entry.messages.map { message ->
+                    db.messageDao().insert(
+                        Message(
+                            sessionId = entry.id,
+                            role = message.role,
+                            text = message.text,
+                            toolJson = message.toolJson,
+                            createdAt = message.createdAt
+                        )
+                    )
+                }
+                if (entry.summaryMarkdown != null) {
+                    db.summaryDao().save(
+                        SessionSummary(
+                            sessionId = entry.id,
+                            summaryMarkdown = entry.summaryMarkdown,
+                            // Old message ids are gone (fresh ids above),
+                            // so the summary covers up to the last
+                            // imported message instead.
+                            coversUpToMessageId = insertedIds.lastOrNull() ?: 0L,
+                            modelId = entry.summaryModelId.orEmpty(),
+                            createdAt = entry.summaryCreatedAt ?: System.currentTimeMillis()
+                        )
+                    )
+                }
+                imported++
+            } catch (e: Exception) {
+                // Never leave a half-imported session behind.
+                db.messageDao().deleteForSession(entry.id)
+                db.sessionDao().deleteById(entry.id)
+                skipped += "“${entry.title}” — could not be saved (${e.message ?: "write failed"})"
+            }
+        }
+        return BackupImportResult(imported, skipped.size, skipped)
+    }
 
     /** Folder picked in the New Session flow (or re-choose flow). */
     var pickedFolderUri by mutableStateOf<Uri?>(null)
@@ -288,7 +563,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     // ---- Skills (Phase 2, Step 4) ----
 
-    /** Skills on disk: getFilesDir()/skills/*.md (built-ins + user-added). */
+    /** Skills on disk: getFilesDir()/skills/ — one .md file per skill (built-ins + user-added). */
     val skillStore = SkillStore(app)
 
     /** All skills, built-ins first. Refreshed after every add / edit / delete. */
@@ -1338,6 +1613,22 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 is AgentEvent.Verified -> {
                     db.messageDao().insert(
                         Message(sessionId = session.id, role = "tool", text = event.message, createdAt = System.currentTimeMillis())
+                    )
+                }
+                is AgentEvent.TurnUsage -> {
+                    // One row per model turn (Phase 5, Step 2). Real
+                    // counts when the provider reported them, the
+                    // chars÷4 estimate (flagged) when it did not.
+                    db.usageDao().insert(
+                        UsageRecord(
+                            sessionId = session.id,
+                            providerId = event.providerId,
+                            modelId = event.modelId,
+                            promptTokens = event.usage.promptTokens.toLong(),
+                            completionTokens = event.usage.completionTokens.toLong(),
+                            estimated = event.estimated,
+                            createdAt = System.currentTimeMillis()
+                        )
                     )
                 }
                 is AgentEvent.Done -> finishedCleanly = !hadError && !hadProposal
