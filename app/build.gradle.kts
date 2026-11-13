@@ -40,6 +40,11 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // Desugaring (Phase 2, Step 8 fix): JGit 7.x uses java.nio.file,
+        // which only exists on Android API 26+. The NIO desugar flavour
+        // backports java.nio.file so Git works on minSdk 24 (Android 7.0/7.1)
+        // instead of crashing with NoClassDefFoundError at runtime.
+        isCoreLibraryDesugaringEnabled = true
     }
     buildFeatures {
         compose = true
@@ -49,6 +54,15 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            // JGit 7.8.1 (Phase 2, Step 8): the JGit jar is signed and its
+            // jars ship LICENSE/NOTICE files — exclude the signature files
+            // and the duplicate license files so packaging does not fail
+            // on duplicate META-INF entries.
+            excludes += "META-INF/*.SF"
+            excludes += "META-INF/*.DSA"
+            excludes += "META-INF/*.RSA"
+            excludes += "META-INF/LICENSE*"
+            excludes += "META-INF/NOTICE*"
         }
     }
 }
@@ -86,6 +100,23 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
+    // JGit (Phase 2, Step 8) — pure-Java Git: status / stage / commit /
+    // push / pull / branches / clone over HTTPS. 7.8.1.202611041320-r is
+    // the latest stable on Maven Central (released 5 Nov 2026). Its only
+    // transitive dependencies are JavaEWAH and slf4j-api — no BouncyCastle
+    // in core (that is the separate gpg.bc artifact, for commit signing,
+    // which we do not use), no SSH transport (separate artifact; SSH
+    // remotes are not supported, HTTPS only), no native code and no git
+    // binary needed. JGit 7.x is compiled for Java 11, which D8 dexes;
+    // slf4j has no binding here, so it logs nothing (one first-run
+    // warning in logcat). See agent/Git.kt for the wrapper.
+    implementation("org.eclipse.jgit:org.eclipse.jgit:7.8.1.202611041320-r")
+
+    // NIO desugar library (Phase 2, Step 8 fix) — backports java.nio.file
+    // for JGit on API 24/25. 2.0.1 is the version cited in Android's docs
+    // table; the artifact lives on Google Maven, not Maven Central.
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

@@ -112,6 +112,97 @@ class KeyStore(context: Context) {
         prefs.edit().remove(listKeyFor(providerId)).remove(keyFor(providerId)).apply()
     }
 
+    // ---- Remote-mode password (Phase 2, Step 7) ----
+
+    /**
+     * The password another device must send as `Authorization: Bearer …`
+     * to use the remote server. Stored encrypted here only, never in
+     * DataStore / Room / logs / a URL. At least 4 characters.
+     */
+    fun saveRemotePassword(password: String): Boolean {
+        val value = password.trim()
+        if (value.length < 4) return false
+        prefs.edit().putString(REMOTE_PASSWORD_KEY, value).apply()
+        return true
+    }
+
+    fun getRemotePassword(): String? =
+        prefs.getString(REMOTE_PASSWORD_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun hasRemotePassword(): Boolean = getRemotePassword() != null
+
+    fun removeRemotePassword() {
+        prefs.edit().remove(REMOTE_PASSWORD_KEY).apply()
+    }
+
+    /** Masked password for the UI — the value never leaves this class. */
+    fun remotePasswordMasked(): String? =
+        getRemotePassword()?.let { maskKey(it) }
+
+    private companion object {
+        const val REMOTE_PASSWORD_KEY = "remote_password"
+        const val GIT_USERNAME_KEY = "git_username"
+        const val GIT_TOKEN_KEY = "git_token"
+    }
+
+    // ---- Git remote credential (Phase 2, Step 8) ----
+
+    /**
+     * Username + token/password for Git push / pull / private clones over
+     * HTTPS. Stored encrypted here only, never in DataStore / Room / logs
+     * / a URL. Used as HTTP Basic auth (GitHub: username + personal
+     * access token). No SSH keys — SSH remotes are not supported.
+     */
+    fun saveGitCredential(username: String, token: String): Boolean {
+        val user = username.trim()
+        val value = token.trim()
+        if (user.isEmpty() || value.isEmpty()) return false
+        prefs.edit().putString(GIT_USERNAME_KEY, user).putString(GIT_TOKEN_KEY, value).apply()
+        return true
+    }
+
+    fun getGitUsername(): String? =
+        prefs.getString(GIT_USERNAME_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun getGitToken(): String? =
+        prefs.getString(GIT_TOKEN_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun hasGitCredential(): Boolean = getGitToken() != null
+
+    fun removeGitCredential() {
+        prefs.edit().remove(GIT_USERNAME_KEY).remove(GIT_TOKEN_KEY).apply()
+    }
+
+    /** Masked token for the UI — the value never leaves this class. */
+    fun gitTokenMasked(): String? =
+        getGitToken()?.let { maskKey(it) }
+
+    // ---- MCP server auth tokens (Phase 2, Step 3) ----
+
+    /** One token per server, under "mcp_token.<serverId>". Same rule as
+     *  provider keys: encrypted here only, never in DataStore / Room / logs. */
+    fun saveMcpToken(serverId: String, token: String): Boolean {
+        val value = token.trim()
+        if (value.isEmpty()) return false
+        prefs.edit().putString(mcpTokenKeyFor(serverId), value).apply()
+        return true
+    }
+
+    fun getMcpToken(serverId: String): String? =
+        prefs.getString(mcpTokenKeyFor(serverId), null)?.takeIf { it.isNotBlank() }
+
+    fun hasMcpToken(serverId: String): Boolean = getMcpToken(serverId) != null
+
+    fun removeMcpToken(serverId: String) {
+        prefs.edit().remove(mcpTokenKeyFor(serverId)).apply()
+    }
+
+    /** Masked token for the UI — the value never leaves this class. */
+    fun mcpTokenMasked(serverId: String): String? =
+        getMcpToken(serverId)?.let { maskKey(it) }
+
+    private fun mcpTokenKeyFor(serverId: String) = "mcp_token.$serverId"
+
     private fun readList(providerId: String): List<String> {
         val raw = prefs.getString(listKeyFor(providerId), null) ?: return emptyList()
         return try {

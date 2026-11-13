@@ -15,8 +15,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -48,7 +53,12 @@ fun HomeScreen(
     viewModel: AppViewModel,
     onOpenSession: (String) -> Unit,
     onNewSession: () -> Unit,
-    onProviders: () -> Unit
+    onProviders: () -> Unit,
+    onMcp: () -> Unit,
+    onSkills: () -> Unit,
+    onTerminal: () -> Unit,
+    onRemote: () -> Unit,
+    onGit: () -> Unit
 ) {
     val sessions by viewModel.sessions.collectAsState()
     val context = LocalContext.current
@@ -58,6 +68,21 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("CodeSathi") },
                 actions = {
+                    IconButton(onClick = onGit) {
+                        Icon(Icons.Filled.AccountTree, contentDescription = "Git")
+                    }
+                    IconButton(onClick = onRemote) {
+                        Icon(Icons.Filled.Wifi, contentDescription = "Remote mode")
+                    }
+                    IconButton(onClick = onTerminal) {
+                        Icon(Icons.Filled.Terminal, contentDescription = "Terminal")
+                    }
+                    IconButton(onClick = onSkills) {
+                        Icon(Icons.Filled.Build, contentDescription = "Skills")
+                    }
+                    IconButton(onClick = onMcp) {
+                        Icon(Icons.Filled.Extension, contentDescription = "MCP servers")
+                    }
                     IconButton(onClick = onProviders) {
                         Icon(Icons.Filled.Settings, contentDescription = "Providers")
                     }

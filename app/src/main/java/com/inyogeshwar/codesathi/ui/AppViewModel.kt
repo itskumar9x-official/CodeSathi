@@ -18,20 +18,29 @@ import com.inyogeshwar.codesathi.agent.FallbackEngine
 import com.inyogeshwar.codesathi.agent.LimitKind
 import com.inyogeshwar.codesathi.agent.LlmClient
 import com.inyogeshwar.codesathi.agent.LlmMessage
+import com.inyogeshwar.codesathi.agent.McpClient
+import com.inyogeshwar.codesathi.agent.McpToolInfo
 import com.inyogeshwar.codesathi.agent.PlannedFile
 import com.inyogeshwar.codesathi.agent.Plan
 import com.inyogeshwar.codesathi.agent.SafProject
+import com.inyogeshwar.codesathi.agent.Skill
+import com.inyogeshwar.codesathi.agent.SkillStore
+import com.inyogeshwar.codesathi.agent.VoiceSpeaker
+import com.inyogeshwar.codesathi.agent.Tool
 import com.inyogeshwar.codesathi.agent.ToolContext
+import com.inyogeshwar.codesathi.agent.mcpToolsFor
 import com.inyogeshwar.codesathi.agent.v1Tools
 import com.inyogeshwar.codesathi.data.FallbackEntry
 import com.inyogeshwar.codesathi.data.FavouriteModel
 import com.inyogeshwar.codesathi.data.KeyStore
+import com.inyogeshwar.codesathi.data.McpServer
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.data.SessionSummary
 import com.inyogeshwar.codesathi.data.TokenCounter
+import com.inyogeshwar.codesathi.remote.RemoteTurnResult
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
@@ -127,6 +136,175 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             PreferencesStore.DEFAULT_TOOL_RULES
         )
 
+    /** MCP servers (Phase 2, Step 3), from DataStore. */
+    val mcpServers: StateFlow<List<McpServer>> =
+        prefs.mcpServers.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
+        )
+
+    /** Last fetched tools/list per server id — the MCP screen reads this. */
+    var mcpServerTools by mutableStateOf<Map<String, List<McpToolInfo>>>(emptyMap())
+        private set
+    /** Server ids whose tool list is being fetched right now. */
+    var mcpLoadingServers by mutableStateOf<Set<String>>(emptySet())
+        private set
+    /** Last fetch error per server id — shown next to that server. */
+    var mcpErrors by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
+    /** Voice output (Phase 2, Step 5): one TextToSpeech instance for the app. */
+    val voiceSpeaker = VoiceSpeaker(app)
+
+    /** Voice-output toggle, from DataStore. Off by default — never speaks unless on. */
+    val voiceOutputEnabled: StateFlow<Boolean> =
+        prefs.voiceOutputEnabled.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), false
+        )
+
+    /** Flip the voice-output toggle; turning it off stops any speech. */
+    fun setVoiceOutputEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            prefs.setVoiceOutputEnabled(enabled)
+            if (!enabled) voiceSpeaker.stop()
+        }
+    }
+
+    // ---- Remote mode (Phase 2, Step 7) ----
+
+    /** Remote server on/off, from DataStore. Off by default. */
+    val remoteEnabled: StateFlow<Boolean> =
+        prefs.remoteEnabled.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), false
+        )
+
+    fun setRemoteEnabled(enabled: Boolean) {
+        viewModelScope.launch { prefs.setRemoteEnabled(enabled) }
+    }
+
+    /** True when a remote password is saved (EncryptedSharedPreferences). */
+    fun hasRemotePassword(): Boolean = keys.hasRemotePassword()
+
+    /**
+     * Save (or change) the remote password. Returns false when it is
+     * shorter than 4 characters. The value is stored encrypted only —
+     * it is never logged and never shown in full.
+     */
+    fun setRemotePassword(password: String): Boolean = keys.saveRemotePassword(password)
+
+    /** Messages of one session for the remote server, or null if unknown. */
+    suspend fun remoteSessionMessages(sessionId: String): List<Message>? {
+        if (db.sessionDao().getSession(sessionId) == null) return null
+        return db.messageDao().getMessages(sessionId)
+    }
+
+    /**
+     * One agent turn driven by a remote device. This is the same turn the
+     * chat screen runs — [runAgentTurn] with the session's own provider,
+     * model, project, tool rules, MCP tools, skills and fallback — so a
+     * remote turn behaves exactly like an in-app turn, including
+     * compaction and fallback switches.
+     *
+     * Differences from [sendMessage]: it is a suspend function that
+     * returns the reply (the HTTP server has no UI to watch), and it
+     * refuses to start while another turn is running or while a file
+     * change is waiting for approval on the phone.
+     *
+     * A turn that proposes a file change does NOT apply it: the proposal
+     * is left in [pendingProposal] for the phone's diff card, and is
+     * returned in the result so the remote page can say "waiting for
+     * approval on the phone". Approve / Reject still happen on the phone
+     * only — there is no remote approve.
+     */
+    suspend fun runRemoteTurn(sessionId: String, message: String, context: Context): RemoteTurnResult {
+        val trimmed = message.trim()
+        if (trimmed.isEmpty()) {
+            return RemoteTurnResult(reply = "", error = "Message is empty.")
+        }
+        if (isRunning) {
+            return RemoteTurnResult(
+                reply = "",
+                error = "Another turn is already running — wait for it to finish, then try again."
+            )
+        }
+        if (pendingProposal != null) {
+            return RemoteTurnResult(
+                reply = "",
+                error = "A file change is waiting for approval on the phone — approve or reject it first."
+            )
+        }
+        val session = db.sessionDao().getSession(sessionId)
+            ?: return RemoteTurnResult(reply = "", error = "Unknown session.")
+        val provider = provider(session.providerId)
+            ?: return RemoteTurnResult(reply = "", error = "Unknown provider ${session.providerId}.")
+        val apiKey = keys.getKey(session.providerId)
+        if (!provider.local && apiKey.isNullOrBlank()) {
+            return RemoteTurnResult(
+                reply = "",
+                error = "Add a provider API key first (Providers → ${provider.name})."
+            )
+        }
+        isRunning = true
+        lastError = null
+        fallbackNotice = null
+        currentPlan = null
+        val beforeIds = db.messageDao().getMessages(sessionId).map { it.id }.toSet()
+        try {
+            db.messageDao().insert(
+                Message(sessionId = session.id, role = "user", text = trimmed, createdAt = System.currentTimeMillis())
+            )
+            db.sessionDao().touch(session.id, System.currentTimeMillis())
+            val history = db.messageDao().getMessages(session.id)
+            runAgentTurn(session, provider, apiKey, history, trimmed, context)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            lastError = e.message ?: "Agent run failed."
+        } finally {
+            isRunning = false
+        }
+        // What the turn produced: new tool messages, the assistant reply
+        // (runAgentTurn stores it as one message), and any plan/proposal.
+        val after = db.messageDao().getMessages(sessionId)
+        val tools = after
+            .filter { it.id !in beforeIds && it.role == "tool" }
+            .map { it.text }
+        val reply = after.filter { it.role == "assistant" }.lastOrNull()?.text.orEmpty()
+        return RemoteTurnResult(
+            reply = reply,
+            tools = tools,
+            error = lastError,
+            proposal = pendingProposal,
+            plan = currentPlan,
+            fallbackNotice = fallbackNotice
+        )
+    }
+
+    override fun onCleared() {
+        voiceSpeaker.shutdown()
+        super.onCleared()
+    }
+
+    // ---- Skills (Phase 2, Step 4) ----
+
+    /** Skills on disk: getFilesDir()/skills/*.md (built-ins + user-added). */
+    val skillStore = SkillStore(app)
+
+    /** All skills, built-ins first. Refreshed after every add / edit / delete. */
+    var skills by mutableStateOf<List<Skill>>(emptyList())
+        private set
+
+    /** Skill id → enabled, from DataStore. No entry means enabled. */
+    val skillEnabled: StateFlow<Map<String, Boolean>> =
+        prefs.skillEnabled.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap()
+        )
+
+    /** One-line note / error from the last skills action, for the Skills screen. */
+    var skillNote by mutableStateOf<String?>(null)
+        private set
+    var skillError by mutableStateOf<String?>(null)
+        private set
+
     fun setToolRule(toolName: String, rule: String) {
         viewModelScope.launch { prefs.setToolRule(toolName, rule) }
     }
@@ -137,6 +315,13 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     init {
         viewModelScope.launch {
             prefs.onboarded.collect { onboarded = it }
+        }
+        // Seed the pre-filled (disabled) Exa MCP entry once.
+        viewModelScope.launch { prefs.ensureDefaultServers() }
+        // Seed the built-in skills into getFilesDir()/skills/ once.
+        viewModelScope.launch {
+            skillStore.ensureSeeded()
+            refreshSkills()
         }
         refreshExhausted()
     }
@@ -285,6 +470,190 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     fun dismissFallbackNotice() {
         fallbackNotice = null
+    }
+
+    // ---- MCP servers (Phase 2, Step 3) ----
+
+    /**
+     * Add a server. Returns false when the name is blank or the URL is
+     * not http(s). The token, when given, is stored encrypted in KeyStore
+     * only — the server record in DataStore only notes that one exists.
+     */
+    fun addMcpServer(name: String, url: String, token: String): Boolean {
+        val cleanName = name.trim()
+        val cleanUrl = url.trim()
+        if (cleanName.isEmpty()) return false
+        if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) return false
+        val id = slugify(cleanName) + "-" + UUID.randomUUID().toString().take(8)
+        val hasToken = token.isNotBlank() && keys.saveMcpToken(id, token)
+        val server = McpServer(id = id, name = cleanName, url = cleanUrl, enabled = true, hasToken = hasToken)
+        viewModelScope.launch {
+            prefs.addMcpServer(server)
+            refreshMcpTools(server)
+        }
+        return true
+    }
+
+    /** Delete a server: its token and its tools' permission rules go too. */
+    fun removeMcpServer(serverId: String) {
+        keys.removeMcpToken(serverId)
+        mcpServerTools = mcpServerTools - serverId
+        mcpErrors = mcpErrors - serverId
+        viewModelScope.launch {
+            prefs.removeMcpServer(serverId)
+            prefs.removeToolRules("mcp:$serverId:")
+        }
+    }
+
+    fun setMcpServerEnabled(serverId: String, enabled: Boolean) {
+        viewModelScope.launch { prefs.setMcpServerEnabled(serverId, enabled) }
+    }
+
+    /** Masked token for one server, for the MCP screen ("abc…wxyz"). */
+    fun mcpTokenMasked(serverId: String): String? = keys.mcpTokenMasked(serverId)
+
+    /** Fetch a server's tool list (initialize + tools/list). */
+    fun refreshMcpTools(server: McpServer) {
+        viewModelScope.launch {
+            mcpLoadingServers = mcpLoadingServers + server.id
+            try {
+                val tools = McpClient(server.url, keys.getMcpToken(server.id)).listTools()
+                mcpServerTools = mcpServerTools + (server.id to tools)
+                mcpErrors = mcpErrors - server.id
+            } catch (e: Exception) {
+                mcpErrors = mcpErrors + (server.id to (e.message ?: "Could not reach this server."))
+            } finally {
+                mcpLoadingServers = mcpLoadingServers - server.id
+            }
+        }
+    }
+
+    /** Tools the agent can call right now: enabled servers only. */
+    fun mcpTools(): List<Tool> {
+        return mcpServers.value.filter { it.enabled }.flatMap { server ->
+            mcpToolsFor(server, mcpServerTools[server.id].orEmpty()) { keys.getMcpToken(server.id) }
+        }
+    }
+
+    /**
+     * Before a chat turn, fetch tool lists for enabled servers that have
+     * none yet (and no recorded error). A server that is down does not
+     * block the turn — its error is recorded and the chat runs without it.
+     */
+    private suspend fun ensureMcpToolsLoaded() {
+        for (server in mcpServers.value) {
+            if (!server.enabled) continue
+            if (mcpServerTools.containsKey(server.id)) continue
+            if (mcpErrors.containsKey(server.id)) continue
+            try {
+                val tools = McpClient(server.url, keys.getMcpToken(server.id)).listTools()
+                mcpServerTools = mcpServerTools + (server.id to tools)
+            } catch (e: Exception) {
+                mcpErrors = mcpErrors + (server.id to (e.message ?: "Could not reach this server."))
+            }
+        }
+    }
+
+    /** URL-safe slug for a server id: "My Server" → "my-server". */
+    private fun slugify(name: String): String {
+        val slug = name.lowercase()
+            .map { if (it.isLetterOrDigit()) it else '-' }
+            .joinToString("")
+            .split('-').filter { it.isNotEmpty() }.joinToString("-")
+        return slug.ifBlank { "server" }
+    }
+
+    // ---- Skills (Phase 2, Step 4) ----
+
+    /** Re-read the skills folder into [skills]. */
+    fun refreshSkills() {
+        viewModelScope.launch { skills = skillStore.listSkills() }
+    }
+
+    /** Skills the agent may use right now: enabled only (no entry = enabled). */
+    fun enabledSkills(): List<Skill> =
+        skills.filter { skillEnabled.value[it.id] ?: true }
+
+    /** The skill tool for this turn, gated to the enabled skills. Always
+     *  present: the tool itself refuses unknown / disabled skills with a
+     *  clear message, so the model never gets a bare "Unknown tool". */
+    fun skillTools(): List<Tool> {
+        val enabled = enabledSkills().map { it.id }.toSet()
+        // Fully qualified: this function shares the name with the
+        // top-level skillTools() builder in the agent package.
+        return com.inyogeshwar.codesathi.agent.skillTools(skillStore) { it in enabled }
+    }
+
+    fun setSkillEnabled(skillId: String, enabled: Boolean) {
+        viewModelScope.launch { prefs.setSkillEnabled(skillId, enabled) }
+    }
+
+    /** Add a user skill. The name becomes the id ("Code Review" → "code-review"). */
+    fun createSkill(name: String, description: String, instructions: String) {
+        if (name.isBlank() || instructions.isBlank()) {
+            skillError = "Give the skill a name and some instructions."
+            skillNote = null
+            return
+        }
+        viewModelScope.launch {
+            val id = skillStore.createSkill(name.trim(), description.trim(), instructions.trim())
+            if (id == null) {
+                skillError = "A skill named “${name.trim()}” already exists — pick another name."
+                skillNote = null
+            } else {
+                skillNote = "Skill “$id” added and enabled."
+                skillError = null
+                refreshSkills()
+            }
+        }
+    }
+
+    /** Overwrite a skill's Markdown (view / edit on the Skills screen). */
+    fun saveSkill(skillId: String, markdown: String) {
+        viewModelScope.launch {
+            if (skillStore.saveSkill(skillId, markdown)) {
+                skillNote = "Skill “$skillId” saved."
+                skillError = null
+                refreshSkills()
+            } else {
+                skillError = "Could not save “$skillId” — check the text and try again."
+                skillNote = null
+            }
+        }
+    }
+
+    /** Delete a user-added skill (built-ins cannot be deleted). */
+    fun deleteSkill(skillId: String) {
+        viewModelScope.launch {
+            if (skillStore.deleteSkill(skillId)) {
+                prefs.removeSkillEnabled(skillId)
+                skillNote = "Skill “$skillId” deleted."
+                skillError = null
+                refreshSkills()
+            } else {
+                skillError = "Built-in skills cannot be deleted — disable or reset them instead."
+                skillNote = null
+            }
+        }
+    }
+
+    /** Restore an edited built-in skill to the version shipped with the app. */
+    fun resetSkill(skillId: String) {
+        viewModelScope.launch {
+            if (skillStore.resetSkill(skillId)) {
+                skillNote = "Skill “$skillId” reset to the built-in version."
+                skillError = null
+                refreshSkills()
+            } else {
+                skillError = "Could not reset “$skillId”."
+                skillNote = null
+            }
+        }
+    }
+
+    fun dismissSkillMessage() {
+        skillNote = null
+        skillError = null
     }
 
     fun toggleFavourite(providerId: String, modelId: String) {
@@ -511,7 +880,12 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         context: Context
     ) {
         val project = SafProject(context, Uri.parse(session.projectUri))
-        val runner = AgentRunner(llm, v1Tools(project), fallbackEngine)
+        // MCP tools for this turn: fetch any missing enabled-server lists
+        // first, then hand the built-ins + MCP tools + skill tool to the
+        // same runner. The enabled skills are also listed in the Build
+        // system prompt, so the model knows what it can call.
+        ensureMcpToolsLoaded()
+        val runner = AgentRunner(llm, v1Tools(project) + mcpTools() + skillTools(), fallbackEngine)
         val toolContext = ToolContext(
             readOnly = session.agentMode == "plan",
             projectUri = Uri.parse(session.projectUri),
@@ -533,10 +907,10 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         } else {
             runner.runBuild(
                 provider, session.modelId, apiKey, history, userMessage, project,
-                toolContext, toolRule, summary
+                toolContext, toolRule, summary, skills = enabledSkills()
             )
         }
-        collectRunEvents(session, flow, assistantText)
+        val turnFinishedCleanly = collectRunEvents(session, flow, assistantText)
         refreshExhausted()
         if (assistantText.isNotBlank()) {
             db.messageDao().insert(
@@ -544,6 +918,13 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             )
         }
         db.sessionDao().touch(session.id, System.currentTimeMillis())
+        // Voice output (Phase 2, Step 5): only when the toggle is ON and
+        // the turn finished cleanly. A turn that ended in an error, or
+        // paused for a file approval, stays silent.
+        if (turnFinishedCleanly && voiceOutputEnabled.value) {
+            if (assistantText.isNotBlank()) voiceSpeaker.speakReply(assistantText.toString())
+            if (session.agentMode == "build") voiceSpeaker.speakAnnouncement()
+        }
     }
 
     /** Continue a Build turn that paused for a file-approval. */
@@ -567,17 +948,26 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         }
     }
 
-    /** Persist tool results / verification messages and track plan/proposals. */
+    /**
+     * Persist tool results / verification messages and track plan/proposals.
+     * Returns true only when the flow ended with [AgentEvent.Done] and no
+     * error and no file proposal: a turn that failed, or paused for a
+     * diff-card approval, is not a finished turn (voice stays silent).
+     */
     private suspend fun collectRunEvents(
         session: Session,
         flow: Flow<AgentEvent>,
         assistantText: StringBuilder
-    ) {
+    ): Boolean {
+        var hadError = false
+        var hadProposal = false
+        var finishedCleanly = false
         flow.collect { event ->
             when (event) {
                 is AgentEvent.TextChunk -> assistantText.append(event.text)
                 is AgentEvent.PlanReady -> currentPlan = event.plan
                 is AgentEvent.FileProposal -> {
+                    hadProposal = true
                     pendingProposal = event.file
                     pendingProposalOld = event.oldContent
                 }
@@ -591,7 +981,10 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                         )
                     )
                 }
-                is AgentEvent.Error -> lastError = event.message
+                is AgentEvent.Error -> {
+                    hadError = true
+                    lastError = event.message
+                }
                 is AgentEvent.FallbackSwitched -> {
                     val toName = provider(event.toProviderId)?.name ?: event.toProviderId
                     val reason = when (event.kind) {
@@ -610,9 +1003,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                         Message(sessionId = session.id, role = "tool", text = event.message, createdAt = System.currentTimeMillis())
                     )
                 }
+                is AgentEvent.Done -> finishedCleanly = !hadError && !hadProposal
                 else -> Unit
             }
         }
+        return finishedCleanly
     }
 
     // ---- Compaction (Step 5) ----

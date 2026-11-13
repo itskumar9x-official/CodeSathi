@@ -1,5 +1,9 @@
 package com.inyogeshwar.codesathi.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,6 +16,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Stop
@@ -43,6 +49,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.inyogeshwar.codesathi.agent.VoiceInput
+import com.inyogeshwar.codesathi.agent.mcpToolName
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.TokenCounter
@@ -79,6 +88,57 @@ fun ChatScreen(
     var showSummary by remember { mutableStateOf(false) }
     var showToolRules by remember { mutableStateOf(false) }
     val toolRules by viewModel.toolRules.collectAsState()
+    // MCP tools (enabled servers) also appear in the permissions dialog.
+    val mcpServers by viewModel.mcpServers.collectAsState()
+    val mcpToolNames = mcpServers.filter { it.enabled }.flatMap { server ->
+        viewModel.mcpServerTools[server.id].orEmpty()
+            .map { info -> mcpToolName(server.id, info.name) }
+    }
+
+    // Voice (Phase 2, Step 5): mic input + voice-output toggle.
+    val voiceOutputEnabled by viewModel.voiceOutputEnabled.collectAsState()
+    var listening by remember { mutableStateOf(false) }
+    var voiceNote by remember { mutableStateOf<String?>(null) }
+    val voiceInput = remember {
+        VoiceInput(context).apply {
+            onResult = { text ->
+                input = if (input.isBlank()) text else "${input.trimEnd()} $text"
+                voiceNote = null
+            }
+            onErrorMessage = { message -> voiceNote = message }
+            onListeningChanged = { isListening -> listening = isListening }
+        }
+    }
+    DisposableEffect(voiceInput) {
+        onDispose { voiceInput.destroy() }
+    }
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            voiceNote = null
+            voiceInput.start()
+        } else {
+            voiceNote = "Microphone permission is needed for voice input. Allow it to use the mic."
+        }
+    }
+    fun onMicTapped() {
+        if (listening) {
+            voiceInput.stop()
+            return
+        }
+        // First tap with no permission yet asks for it; the launcher's
+        // callback starts listening when it is granted, so the next tap
+        // records. A denied tap just shows the note — never a crash.
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            voiceNote = null
+            voiceInput.start()
+        } else {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     if (session == null) {
         Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
@@ -132,6 +192,22 @@ fun ChatScreen(
                         DropdownMenuItem(
                             text = { Text("Tool permissions") },
                             onClick = { menuOpen = false; showToolRules = true }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Voice output") },
+                            trailingIcon = {
+                                Switch(
+                                    checked = voiceOutputEnabled,
+                                    onCheckedChange = {
+                                        menuOpen = false
+                                        viewModel.setVoiceOutputEnabled(it)
+                                    }
+                                )
+                            },
+                            onClick = {
+                                menuOpen = false
+                                viewModel.setVoiceOutputEnabled(!voiceOutputEnabled)
+                            }
                         )
                         DropdownMenuItem(
                             text = { Text("Providers & API keys") },
@@ -214,6 +290,7 @@ fun ChatScreen(
             }
             if (showToolRules) {
                 ToolRulesDialog(
+                    tools = listOf("read", "glob", "grep", "write", "edit") + mcpToolNames,
                     rules = toolRules,
                     onSetRule = { tool, rule -> viewModel.setToolRule(tool, rule) },
                     onClose = { showToolRules = false }
@@ -275,6 +352,16 @@ fun ChatScreen(
                     modifier = Modifier.weight(1f),
                     enabled = !viewModel.isRunning
                 )
+                // Mic: tap to dictate into the input field; tap again to stop.
+                // While listening the icon changes and turns red.
+                IconButton(onClick = { onMicTapped() }, enabled = !viewModel.isRunning) {
+                    Icon(
+                        if (listening) Icons.Filled.MicOff else Icons.Filled.Mic,
+                        contentDescription = if (listening) "Stop listening" else "Voice input",
+                        tint = if (listening) MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.onSurface
+                    )
+                }
                 if (viewModel.isRunning) {
                     IconButton(onClick = { viewModel.stopRun() }) {
                         Icon(Icons.Filled.Stop, contentDescription = "Stop")
@@ -287,6 +374,23 @@ fun ChatScreen(
                     }) {
                         Icon(Icons.Filled.Send, contentDescription = "Send")
                     }
+                }
+            }
+            // Listening state / voice-input message, under the input row.
+            if (listening) {
+                Text(
+                    "Listening… speak now.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            } else {
+                voiceNote?.let { note ->
+                    Text(
+                        note,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
                 }
             }
             if (messages.isEmpty() && !needsKey) {
@@ -337,11 +441,11 @@ private fun MessageBubble(msg: Message) {
  */
 @Composable
 private fun ToolRulesDialog(
+    tools: List<String>,
     rules: Map<String, String>,
     onSetRule: (String, String) -> Unit,
     onClose: () -> Unit
 ) {
-    val tools = listOf("read", "glob", "grep", "write", "edit")
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("Tool permissions") },

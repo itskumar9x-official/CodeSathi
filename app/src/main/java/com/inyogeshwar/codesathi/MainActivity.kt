@@ -13,12 +13,19 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.inyogeshwar.codesathi.ui.AppViewModel
+import com.inyogeshwar.codesathi.ui.GitViewModel
 import com.inyogeshwar.codesathi.ui.Screen
+import com.inyogeshwar.codesathi.ui.TerminalViewModel
 import com.inyogeshwar.codesathi.ui.screens.ChatScreen
+import com.inyogeshwar.codesathi.ui.screens.GitScreen
 import com.inyogeshwar.codesathi.ui.screens.HomeScreen
+import com.inyogeshwar.codesathi.ui.screens.McpScreen
 import com.inyogeshwar.codesathi.ui.screens.NewSessionScreen
 import com.inyogeshwar.codesathi.ui.screens.OnboardingScreen
 import com.inyogeshwar.codesathi.ui.screens.ProviderPickerScreen
+import com.inyogeshwar.codesathi.ui.screens.RemoteScreen
+import com.inyogeshwar.codesathi.ui.screens.SkillsScreen
+import com.inyogeshwar.codesathi.ui.screens.TerminalScreen
 import com.inyogeshwar.codesathi.ui.theme.CodeSathiTheme
 
 class MainActivity : ComponentActivity() {
@@ -31,6 +38,8 @@ class MainActivity : ComponentActivity() {
                     val vm: AppViewModel = viewModel(
                         factory = AppViewModel.factory(app)
                     )
+                    // RemoteService reuses this same ViewModel for remote turns.
+                    app.appViewModel = vm
                     val nav = rememberNavController()
                     val start = if (vm.onboarded) Screen.Home.route else Screen.Onboarding.route
                     NavHost(navController = nav, startDestination = start) {
@@ -49,7 +58,12 @@ class MainActivity : ComponentActivity() {
                                 viewModel = vm,
                                 onOpenSession = { id -> nav.navigate(Screen.Chat.route(id)) },
                                 onNewSession = { nav.navigate(Screen.NewSession.route) },
-                                onProviders = { nav.navigate(Screen.Providers.route) }
+                                onProviders = { nav.navigate(Screen.Providers.route) },
+                                onMcp = { nav.navigate(Screen.Mcp.route) },
+                                onSkills = { nav.navigate(Screen.Skills.route) },
+                                onTerminal = { nav.navigate(Screen.Terminal.route) },
+                                onRemote = { nav.navigate(Screen.Remote.route) },
+                                onGit = { nav.navigate(Screen.Git.route) }
                             )
                         }
                         composable(Screen.NewSession.route) {
@@ -74,6 +88,42 @@ class MainActivity : ComponentActivity() {
                         composable(Screen.Providers.route) {
                             ProviderPickerScreen(
                                 viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Mcp.route) {
+                            McpScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Skills.route) {
+                            SkillsScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Remote.route) {
+                            RemoteScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Terminal.route) {
+                            val terminalVm: TerminalViewModel = viewModel(
+                                factory = TerminalViewModel.factory(app)
+                            )
+                            TerminalScreen(
+                                viewModel = terminalVm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Git.route) {
+                            val gitVm: GitViewModel = viewModel(
+                                factory = GitViewModel.factory(app)
+                            )
+                            GitScreen(
+                                viewModel = gitVm,
                                 onBack = { nav.popBackStack() }
                             )
                         }

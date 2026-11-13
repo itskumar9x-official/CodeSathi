@@ -7,6 +7,15 @@
          folder picker (OpenDocumentTree) with a persistable URI grant. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Phase 2, Step 5: voice input in chat (SpeechRecognizer). Asked at
+         runtime when the mic button is first tapped, never at install. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Phase 2, Step 7: remote mode runs as a foreground service (the
+         local HTTP server) with a persistent notification. POST_NOTIFICATIONS
+         is asked at runtime from the Remote screen on Android 13+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".CodeSathiApp"
@@ -28,5 +37,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Phase 2, Step 7: remote mode. Not exported — only this app
+             starts / stops it. dataSync type: it serves data over the LAN. -->
+        <service
+            android:name=".remote.RemoteService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

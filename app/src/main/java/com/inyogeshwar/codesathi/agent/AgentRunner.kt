@@ -93,6 +93,18 @@ private data class ParsedToolCall(val name: String, val args: Map<String, String
  * [AgentEvent.FallbackSwitched] so the chat can say what changed. A
  * turn is only retried when nothing was emitted yet, so a reply is
  * never shown twice. Non-limit errors fail the turn as before.
+ *
+ * MCP tools (Phase 2, Step 3): tools whose names start with "mcp:" are
+ * listed in the Build system prompt and dispatched through the same
+ * loop and the same [toolRule] gating as the built-ins — no
+ * special-casing. A denied MCP tool is refused the same way.
+ *
+ * Skills (Phase 2, Step 4): the "skill" tool loads one skill's
+ * instructions (Markdown in getFilesDir()/skills/) and returns them as
+ * its result, so the model then follows them for the task. Enabled
+ * skills are listed by name in the Build system prompt, exactly like
+ * the MCP tools. A skill never writes files by itself — anything it
+ * asks for still goes through write / edit and the diff-card Approve.
  */
 class AgentRunner(
     private val llm: LlmClient,
@@ -109,7 +121,14 @@ class AgentRunner(
         Keep file contents complete and runnable. Do not add any text outside the JSON.
     """.trimIndent()
 
-    private val buildSystemPrompt = """
+    /**
+     * Build-mode system prompt. [mcpTools] are the enabled MCP tools
+     * (namespaced "mcp:<server>:<tool>") and [skills] are the enabled
+     * skills — both are listed here so the model knows it can call
+     * them, exactly like the built-in tools.
+     */
+    private fun buildSystemPrompt(mcpTools: List<Tool>, skills: List<Skill> = emptyList()): String {
+        val base = """
         You are CodeSathi, an on-device coding assistant in BUILD mode.
         You have these tools — call them with a fenced block, one tool per block:
         ```tool
@@ -127,13 +146,35 @@ class AgentRunner(
         ```tool
         {"tool":"edit","args":{"path":"index.html","old":"<title>Old</title>","new":"<title>New</title>"}}
         ```
+        ```tool
+        {"tool":"skill","args":{"name":"code-review"}}
+        ```
         Use read / glob / grep first to see the project before changing it.
         To change a file, call write (new file) or edit (change a snippet).
         The user approves every file change before it is applied, so propose
         one file at a time. When the work is done, finish with a short plain
         text summary and no more tool calls. Do not invent files that were
         not asked for.
+        A skill is a named way of doing one job well: call the skill tool
+        with the skill's name and it returns that skill's instructions —
+        follow them for the task at hand, then continue with the other
+        tools. A skill never writes files by itself; any file change it
+        asks for still goes through write / edit and needs the user's
+        Approve. When the user's request matches a skill below, use it.
     """.trimIndent()
+        var prompt = base
+        if (skills.isNotEmpty()) {
+            val listed = skills.joinToString("\n") { "- ${it.id}: ${it.description}" }
+            prompt += "\n\nEnabled skills — call the skill tool with the skill's name to use one:\n$listed"
+        }
+        if (mcpTools.isNotEmpty()) {
+            val listed = mcpTools.joinToString("\n") { "- ${it.name}: ${it.description}" }
+            prompt += "\n\nYou also have these MCP tools from connected servers. Call them " +
+                "exactly like the built-in tools, one fenced ```tool block per call, " +
+                "with string arguments:\n$listed"
+        }
+        return prompt
+    }
 
     companion object {
         /** Max model turns per user message — the Stop button cancels sooner. */
@@ -217,11 +258,12 @@ class AgentRunner(
         toolContext: ToolContext,
         toolRule: (String) -> String = { "ask" },
         summaryMarkdown: String? = null,
-        contextTokens: Int = Compaction.DEFAULT_CONTEXT_TOKENS
+        contextTokens: Int = Compaction.DEFAULT_CONTEXT_TOKENS,
+        skills: List<Skill> = emptyList()
     ): Flow<AgentEvent> = flow {
         // Compaction: only what is sent changes; history in Room is untouched.
         val toSend = Compaction.buildSendMessages(history, summaryMarkdown, contextTokens)
-        val llmMessages = mutableListOf(LlmMessage("system", buildSystemPrompt))
+        val llmMessages = mutableListOf(LlmMessage("system", buildSystemPrompt(tools.filter { it.name.startsWith("mcp:") }, skills)))
         llmMessages += toSend.map { LlmMessage(it.role, it.text) }
         llmMessages += LlmMessage("user", userMessage)
 

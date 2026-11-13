@@ -9,4 +9,9 @@ sealed class Screen(val route: String) {
         fun route(sessionId: String) = "chat/$sessionId"
     }
     object Providers : Screen("providers")
+    object Mcp : Screen("mcp")
+    object Skills : Screen("skills")
+    object Terminal : Screen("terminal")
+    object Remote : Screen("remote")
+    object Git : Screen("git")
 }

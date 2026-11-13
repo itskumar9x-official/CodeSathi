@@ -145,12 +145,230 @@ Compose BOM 2024.01.00, Room 2.6.1.
   changed: the fallback applies per turn, and the next message starts
   from the session model again.
 
+## Phase 2, Step 3 — MCP servers
+
+- **Add MCP servers** — name + URL + optional auth token, in the MCP
+  screen (puzzle-piece button on Home). Servers and their enabled flags
+  live in DataStore; auth tokens live **only in EncryptedSharedPreferences**
+  (one entry per server, shown masked, never in DataStore/Room/logs).
+- **MCP client** — JSON-RPC over streamable HTTP / SSE on
+  `HttpURLConnection` (no new dependencies): `initialize` handshake,
+  `tools/list`, `tools/call`. Accepts plain-JSON and SSE (`data:`)
+  replies, keeps an `Mcp-Session-Id` when the server hands one out,
+  sends `Authorization: Bearer` when a token exists. Short timeouts
+  (10 s connect / 30 s read); failures are user-facing messages, not
+  stack traces.
+- **MCP tools in the agent** — a server's tools appear as normal tools
+  named `mcp:<server>:<tool>`, under the same allow / ask / deny rules
+  as the built-ins (default "ask"). They are listed in the Build system
+  prompt when their server is enabled, dispatched through the same
+  `AgentRunner` path, and a denied MCP tool is refused exactly like a
+  denied built-in. A down server never blocks a chat turn — its error
+  is recorded and the turn runs without it.
+- **Exa web search** — `https://mcp.exa.ai/mcp` is pre-filled and
+  **disabled by default**. No API key is bundled: enable it and paste
+  your own Exa key as the server's token.
+- **Known limits** — MCP tool arguments are strings only (a value that
+  is itself valid JSON is sent as that JSON value); there is no
+  "change token" UI for an existing server — delete and re-add it.
+  No live MCP call has been tested yet (no server was reachable from
+  the machine this was written on); first check is enabling Exa with a
+  real key and tapping Refresh on the MCP screen.
+
+## Phase 2, Step 4 — Skills
+
+- **Skills are Markdown files** — one file per skill: a `# Name` line,
+  a `Description:` line, then the instructions. Built-in skills ship
+  under `assets/skills/` and are copied into the app-private
+  `getFilesDir()/skills/` folder on first use, so the user can edit
+  them; user-added skills are Markdown files in the same folder. No
+  skill is ever downloaded — no marketplace, no versioning.
+- **Built-in skills (written fresh)** — `code-review` (review a file
+  for bugs, security and style, findings with file + line), `write-tests`
+  (small focused tests per behaviour, happy path then edge cases),
+  `explain-code` (plain-language explanation, short summary first).
+- **The skill tool** — the agent calls
+  `{"tool":"skill","args":{"name":"code-review"}}` and the skill's
+  instructions come back as the tool result, which the model then
+  follows. Enabled skills are listed in the Build system prompt. The
+  tool is a normal tool: rule "ask" by default, same gating as the
+  built-ins, and it refuses unknown / disabled / empty skills with a
+  clear message. A skill never writes by itself — anything it asks for
+  still goes through write / edit and the diff-card Approve.
+- **Skills screen** — list with enable/disable switch (DataStore, no
+  entry = enabled), Edit (plain-text Markdown editor), Add new (name
+  becomes the id, duplicates refused), Delete (user skills only),
+  Reset (built-ins only, restores the shipped asset).
+- **Not yet verified live** — first-launch seeding, editing/saving a
+  skill, and a real turn where the model calls the skill tool are all
+  untested here (no Gradle build on this machine).
+
+## Phase 2, Step 5 — Voice
+
+- **Voice input** — mic button in the chat input row. Tapping it
+  asks for the microphone permission first (RECORD_AUDIO, in the
+  manifest and requested at runtime); once granted, the next tap
+  records with Android SpeechRecognizer and the recognised text is
+  appended to the input field. While listening the icon turns red and
+  "Listening… speak now." shows; tapping again stops. Failures show a
+  short message ("No speech heard — try again.", network variants).
+  One recognizer is created per listen and destroyed after each use,
+  so it never leaks.
+- **Voice output** — Android TextToSpeech reads the assistant's final
+  reply, with a "Voice output" toggle in the chat menu (persisted in
+  DataStore, off by default). Markdown is stripped first (code blocks
+  dropped, links keep their text, `#` / `**` / bullets removed) and
+  replies are cut to the first 500 characters. Turning the toggle off
+  stops any speech in progress. One TTS instance, owned by the
+  ViewModel, device default locale with English fallback, shut down in
+  `onCleared()`; if TTS fails to start, speaking is silently skipped
+  and the chat never crashes.
+- **"Task completed" announcement** — after a Build-mode turn finishes
+  cleanly, the app speaks "Task completed." (own wording), queued
+  after the reply. It fires only when the toggle is ON and the turn
+  ended with Done and no error and no file-proposal pause; Plan-mode
+  turns and failed turns stay silent.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). Riskiest lines: the Switch inside the dropdown
+  menu item, and the TextToSpeech constructor lambda. Also untested:
+  devices without a recognition service, and TTS voice availability
+  per locale.
+
+## Phase 2, Step 6 — Terminal
+
+- **In-app terminal** — runs shell commands in the last session's
+  project folder (`sh -c <command>` via ProcessBuilder), streams
+  stdout + stderr (merged) live into a scrollable monospace history,
+  shows the exit code when a command finishes. One command at a time;
+  Stop kills the running process. Past commands are kept as chips —
+  tap one to re-run it. Output is capped at the last 2,000 lines,
+  history at 20 commands.
+- **Folder resolution** — the project folder is a SAF tree URI, not a
+  filesystem path, so it is resolved best-effort to a raw path for
+  primary external storage ("primary:AgentMT" →
+  /storage/emulated/0/AgentMT). The screen always shows the folder
+  name and the exact path commands run in; when it cannot be resolved
+  (revoked grant, deleted folder, non-primary volume) the screen says
+  why and runs in the app's private files dir instead — never silently
+  in the wrong folder. With no session yet, the screen explains and
+  offers a button back to Home.
+- **User-facing only** — the agent has NO shell tool; the terminal is
+  not wired into AgentRunner at all. Commands run with the app's own
+  permissions (stated on screen).
+- **Honest limit** — the app holds no storage permission (folders come
+  only from the SAF picker grant), and a SAF grant does not give a
+  child shell process raw-filesystem access. So commands that touch
+  files in the resolved project folder may print "Permission denied" —
+  the terminal shows that stderr plainly instead of hiding it, and the
+  app-private fallback folder always works. Reliably reading/writing
+  the project folder from the shell would need a storage-permission
+  decision, which is out of scope for this step.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). Watch at compile time: `Icons.Filled.Terminal`
+  and `LocalTextStyle`.
+
+## Phase 2, Step 7 — Remote mode
+
+- **Local-network HTTP server, off by default** — a foreground service
+  with a persistent notification (with a Stop action) serves a small
+  REST API + web page on port 8080, so the user can chat with the
+  agent from another device on the same Wi-Fi. Hand-rolled minimal
+  HTTP/1.1 server on `java.net.ServerSocket` (no new dependency;
+  `com.sun.net.httpserver` is a JDK API, not in the Android runtime).
+- **Own small API** — `GET /` (plain HTML page, no frameworks),
+  `GET /api/sessions`, `GET /api/session/{id}`,
+  `POST /api/prompt {"sessionId","message"}`. The prompt call runs one
+  agent turn and returns JSON `{reply, tools[], error?, proposal?,
+  plan?, fallbackNotice?}` — no streaming, chat only.
+- **Password auth** — set on the Remote screen (min. 4 characters),
+  stored only in EncryptedSharedPreferences. Every `/api/*` call needs
+  `Authorization: Bearer <password>` (constant-time check); wrong /
+  missing → 401, no password set → 503 and the server refuses to
+  start. The password is never logged and never in a URL. The toggle
+  only shows "on" once the server is actually listening (a failed
+  start, e.g. port busy, leaves it off).
+- **Same agent loop** — a remote turn reuses `runAgentTurn` (same
+  provider / model / project, tool rules, MCP tools, skills,
+  compaction, fallback). It refuses to start while another turn runs
+  or a file change awaits approval on the phone. A turn that proposes
+  a file change does NOT apply it — the proposal stays on the phone's
+  diff card and is returned in the response. No remote approve, no
+  remote file browsing, no remote terminal. LAN only, plain HTTP.
+- **Remote screen** — on/off toggle, masked password set/change,
+  the local URL (Wi-Fi IP + port, with Refresh), session count, and a
+  "same Wi-Fi" note when no Wi-Fi address is found.
+- **Known quirks** — if voice output is ON, a remote turn that
+  finishes cleanly also speaks on the phone (it reuses the same turn
+  code); a remote turn's reply is read back from Room as the last
+  assistant message, so a turn that only emits a plan/proposal with no
+  assistant text returns an empty `reply` plus the `plan`/`proposal`
+  fields.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). Most likely friction: the `dataSync`
+  foreground-service type/permission on API 34+, and the
+  notification-permission flow on Android 13+.
+
+## Phase 2, Step 8 — Git
+
+- **JGit, one new dependency** —
+  `org.eclipse.jgit:org.eclipse.jgit:7.8.1.202611041320-r` (latest
+  stable on Maven Central, released 5 Nov 2026). Pure Java, no native
+  code, no `git` binary needed. Its only transitive dependencies are
+  JavaEWAH and slf4j-api — no BouncyCastle in core (that is the
+  separate `gpg.bc` artifact, for commit signing, which we do not
+  use), no SSH transport (separate artifact, deliberately not added),
+  so remotes are **HTTPS only**. JGit 7.x is compiled for Java 11,
+  which D8 dexes. Only packaging change: `META-INF/*.SF`, `*.DSA`,
+  `*.RSA`, `LICENSE*`, `NOTICE*` added to the existing
+  `packaging.resources.excludes` (the JGit jar is signed and its jars
+  ship duplicate license files). No library/AGP/Gradle version
+  changed.
+- **Status / stage / commit / push / pull** — the Git screen works on
+  the last session's project folder, resolved the same way as the
+  terminal (SAF tree URI → raw path, primary storage only). Status
+  shows the current branch, the redacted origin URL, and Staged /
+  Changed (not staged) / Untracked / Conflicts lists, each file with a
+  Stage/Unstage button; deletions stage via `rm --cached`. Commit
+  needs a message and something staged, and returns the short commit
+  id. The author is set explicitly (saved Git username, else
+  "CodeSathi"; email `codesathi@localhost` unless the username is an
+  email), so nothing depends on a `~/.gitconfig`. Pull throws a
+  plain-language error naming the conflicted files on a merge
+  conflict.
+- **Branches + clone** — local branch list with the current branch
+  marked, Checkout per branch. Clone takes a repo URL and clones into
+  a subfolder named after the repo (last URL segment minus `.git`,
+  sanitised); it refuses when a folder with that name already exists.
+  The clone is not the session's folder — open it as a new session
+  from Home to work in it.
+- **Credential** — username + token/password, stored only in
+  EncryptedSharedPreferences, shown masked only, passed via
+  `UsernamePasswordCredentialsProvider` (never in a URL, never
+  logged). Needed for push/pull and private clones (GitHub: username
+  + a personal access token). Remote URLs are shown with any
+  `user:token@` userinfo stripped.
+- **No fallback folder** — unlike the terminal, Git has no app-private
+  fallback: JGit needs a real filesystem path, so on an unresolved
+  folder every Git action is refused with a plain message ("go back
+  to Home and open the session to re-choose its folder").
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine). One first-build risk is already fixed: JGit 7.x uses
+  `java.nio.file` APIs that only exist on Android API 26+, so NIO
+  desugaring is enabled (`isCoreLibraryDesugaringEnabled = true` +
+  `coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.1")`
+  in `app/build.gradle.kts`) to backport `java.nio.file` for API 24/25
+  (minSdk 24 stays). slf4j ships with no binding, so expect a one-time
+  "No SLF4J providers were found" warning in logcat (harmless). If the
+  first sync complains about duplicate META-INF entries beyond the five
+  patterns added, extend the excludes block in
+  `app/build.gradle.kts`.
+
 ## What is TODO / Phase 2 (explicitly NOT in v1)
-- Phase 2, Step 1 (multi-key fallback / auto-switch) is done — see the
-  section above. Still to do:
-- MCP servers, custom skills, custom commands, voice, reasoning-effort
-  picker, remote-server mode, Git client, in-app terminal, editor tabs /
-  live preview, `MANAGE_EXTERNAL_STORAGE`.
+- Phase 2 is complete — Steps 1–8 are all done, see the sections
+  above. Still to do:
+- custom commands, reasoning-effort
+  picker, editor tabs / live preview,
+  `MANAGE_EXTERNAL_STORAGE`.
 - UI polish: syntax-highlighted diffs, folder tree browser.
 - The provider catalog grew from 12 (v1) to 208 providers in Phase 2,
   Step 2 plus the live-check pass (see `assets/providers.json`). The 200+
@@ -175,29 +393,45 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (36 files, ~4,600 lines total; 4,216 lines of Kotlin)
+CodeSathi/  (54 files, ~11,600 lines total; 9,006 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
   assets/providers.json          # 208-provider catalog (ours, Phase 2 Step 2 + live-check)
+  assets/skills/                 # Built-in skills (Step 4): code-review.md, write-tests.md, explain-code.md
   java/com/inyogeshwar/codesathi/
-    MainActivity.kt              # NavHost (85)
-    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons (26)
+    MainActivity.kt              # NavHost (135)
+    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (35)
     data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel (177)
-    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion (176)
-    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, masked display (146)
+    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled (313)
+    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, masked display (237)
     data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache (181)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
     agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree (163)
     agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
     agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException (252)
     agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset (143)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries (493)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback (740)
+    agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call (230)
+    agent/McpTools.kt            # MCP tools as normal Tool objects, mcp:<server>:<tool> names (50)
+    agent/Skills.kt              # Skill Markdown parse/store, SkillStore, skill tool (264)
+    agent/Voice.kt               # TextToSpeech speaker, SpeechRecognizer input, Markdown stripper (282)
+    agent/Terminal.kt            # SAF→path resolution, ProcessBuilder shell runner, streaming (139)
+    agent/Git.kt                 # JGit wrapper: status / stage / commit / push / pull / branches / clone (262)
+    remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080 (474)
+    remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (192)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries (535)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns (1135)
+    ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (202)
+    ui/GitViewModel.kt           # Git state: folder, status, one op at a time (306)
     ui/Markdown.kt               # Self-contained Markdown renderer for chat (275)
-    ui/Nav.kt                    # Routes (12)
+    ui/Nav.kt                    # Routes (17)
     ui/theme/Theme.kt            # (37)
     ui/screens/OnboardingScreen.kt   # (93)
-    ui/screens/HomeScreen.kt         # Home + New Session (204)
-    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice (442)
+    ui/screens/HomeScreen.kt         # Home + New Session (229)
+    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice, mic + voice output (546)
     ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order (422)
+    ui/screens/McpScreen.kt          # MCP servers: add / enable / delete, tools, per-tool rules (273)
+    ui/screens/SkillsScreen.kt       # Skills: list / enable / edit / add / delete / reset (283)
+    ui/screens/TerminalScreen.kt     # Terminal: folder card, streaming output, history chips (272)
+    ui/screens/RemoteScreen.kt       # Remote mode: toggle, password, Wi-Fi URL, session count (238)
+    ui/screens/GitScreen.kt          # Git: status, stage/commit/push/pull, branches, clone, credential (465)
 ```
