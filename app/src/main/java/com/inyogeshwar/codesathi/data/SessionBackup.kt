@@ -14,6 +14,12 @@ import kotlinx.serialization.json.Json
  * records. Usage is re-derived from new turns after a restore, so
  * exporting it would only leak history for no benefit.
  *
+ * Attached images are never in the file either (Phase 6, Step 2):
+ * [BackupMessage] has no images field, so a restored message keeps its
+ * text but not its images — the image files are app-private and do not
+ * travel with the backup, and a restored message's images are simply
+ * absent (the turn still sends its text).
+ *
  * The format is versioned: [SessionBackup.formatVersion] starts at 1.
  * A file whose version is not 1, or that is not valid backup JSON at
  * all, is refused whole — import writes nothing for that file.
@@ -98,6 +104,22 @@ data class BackupImportResult(
     val imported: Int,
     val skipped: Int,
     /** One line per skipped session, e.g. "My project — already exists". */
+    val skippedReasons: List<String>
+)
+
+/**
+ * Outcome of merging a synced backup (Phase 6, Step 4 — multi-device
+ * sync). Same backup format, different rule from [BackupImportResult]:
+ * a session that already exists is REPLACED when the incoming copy is
+ * newer (newest `updatedAt` wins) instead of being skipped, so two
+ * devices converge. `added` counts sessions this device did not have,
+ * `updated` counts sessions replaced by a newer copy.
+ */
+data class SyncMergeResult(
+    val added: Int,
+    val updated: Int,
+    val skipped: Int,
+    /** One line per skipped session, e.g. "My project — already up to date". */
     val skippedReasons: List<String>
 )
 

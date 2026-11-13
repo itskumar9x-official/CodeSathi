@@ -15,7 +15,7 @@ import java.net.URL
 data class Provider(
     val id: String,
     val name: String,
-    val kind: String, // "openai" | "anthropic" | "azure" | "bedrock"
+    val kind: String, // "openai" | "anthropic" | "azure" | "bedrock" | "local"
     val baseUrl: String,
     val models: List<String> = emptyList(),
     val topPick: Boolean = false,
@@ -114,6 +114,13 @@ class ProviderRepository(
     ): ModelFetchResult =
         withContext(Dispatchers.IO) {
             val cached = cachedModels(provider.id)
+            if (provider.kind == "local") {
+                return@withContext ModelFetchResult(
+                    models = cached,
+                    fromCache = true,
+                    error = "On-device models come from a .task file you pick in this card — there is no server list to refresh."
+                )
+            }
             if (provider.kind == "bedrock") {
                 return@withContext ModelFetchResult(
                     models = cached,

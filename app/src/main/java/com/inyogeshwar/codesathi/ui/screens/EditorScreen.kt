@@ -204,9 +204,11 @@ fun EditorScreen(
             // does NOT resume any agent turn (there is none) and reports
             // the outcome back so the tab's dirty marker can clear.
             // An agent proposal approved here resumes the agent loop,
-            // exactly as approving it in Chat would.
+            // exactly as approving it in Chat would. A template proposal
+            // (Phase 6, Step 3) shows only when it belongs to this
+            // session — see shouldShowProposalFor.
             val pendingSavePath = viewModel.awaitingApproval?.path
-            appViewModel.pendingProposal?.let { proposal ->
+            appViewModel.pendingProposal?.takeIf { appViewModel.shouldShowProposalFor(currentSession.id) }?.let { proposal ->
                 DiffCard(
                     proposal = proposal,
                     oldContent = appViewModel.pendingProposalOld,

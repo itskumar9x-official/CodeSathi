@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.Wifi
@@ -42,6 +43,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -59,6 +61,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
+import com.inyogeshwar.codesathi.agent.BUILT_IN_TEMPLATES
 import com.inyogeshwar.codesathi.agent.hasAllFilesAccess
 import com.inyogeshwar.codesathi.agent.isAllFilesAccessSupported
 import com.inyogeshwar.codesathi.agent.openAllFilesAccessSettings
@@ -81,6 +84,7 @@ fun HomeScreen(
     onCommands: () -> Unit,
     onTerminal: () -> Unit,
     onRemote: () -> Unit,
+    onSync: () -> Unit,
     onGit: () -> Unit,
     onEditor: () -> Unit,
     onUsage: () -> Unit
@@ -144,6 +148,11 @@ fun HomeScreen(
                             text = { Text("Remote mode") },
                             leadingIcon = { Icon(Icons.Filled.Wifi, contentDescription = null) },
                             onClick = { menuOpen = false; onRemote() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Sync devices") },
+                            leadingIcon = { Icon(Icons.Filled.Sync, contentDescription = null) },
+                            onClick = { menuOpen = false; onSync() }
                         )
                         DropdownMenuItem(
                             text = { Text("Skills") },
@@ -491,7 +500,10 @@ private fun RenameSessionDialog(
 
 /**
  * New session flow (Step 1): name prefilled from the folder name →
- * [Choose folder] (system picker) → current default model → Create.
+ * [Choose folder] (system picker) → template picker (Phase 6,
+ * Step 3 — blank by default) → current default model → Create.
+ * The template only queues its files as diff-card proposals in the
+ * new session's chat; nothing is written until Approve is tapped.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -535,12 +547,52 @@ fun NewSessionScreen(
                 Text(if (viewModel.pickedFolderUri == null) "Choose folder" else "Folder: $pickedName — change")
             }
             Spacer(Modifier.height(16.dp))
+            // Phase 6, Step 3 — template picker. It sits on this screen,
+            // after the folder is picked and before Create is tapped:
+            // the folder comes first (the template needs a folder to
+            // land in), and the choice is recorded in the ViewModel
+            // until Create consumes it. A template only pre-fills the
+            // first file(s) — each one still waits for Approve on the
+            // diff card in the chat, so nothing is written straight away.
+            Text("Template", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "A starting file for the new session. It is only created after you approve it in the chat — nothing is written straight away.",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Spacer(Modifier.height(8.dp))
+            BUILT_IN_TEMPLATES.forEach { template ->
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        .clickable { viewModel.selectTemplate(template.id) }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = viewModel.selectedTemplateId == template.id,
+                            onClick = { viewModel.selectTemplate(template.id) }
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(template.name, style = MaterialTheme.typography.titleMedium)
+                            Text(template.description, style = MaterialTheme.typography.bodyMedium)
+                            if (template.files.isNotEmpty()) {
+                                Text(
+                                    "Creates: ${template.files.joinToString(", ") { it.path }}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
             Text("Default model: ${viewModel.providerRepository.topPicks().firstOrNull()?.let { "${it.first.name} / ${it.second}" } ?: "not set"}")
             Text("Change it later in Providers.", style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(24.dp))
             Button(
                 onClick = {
-                    val id = viewModel.createSession(name.trim())
+                    val id = viewModel.createSession(name.trim(), context, viewModel.selectedTemplateId)
                     if (id == null) error = "Pehle folder chuniye (Choose folder)."
                     else onCreated(id)
                 },

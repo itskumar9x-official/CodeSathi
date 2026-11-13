@@ -21,6 +21,14 @@ data class LlmMessage(
     val role: String,
     val content: String,
     /**
+     * Images attached to this message (Phase 6, Step 2), already
+     * downscaled and JPEG re-encoded by [ImageStore]. Empty for every
+     * text-only message — and then the request body is byte-for-byte
+     * what text-only turns sent before, so no provider sees a new
+     * shape it did not ask for.
+     */
+    val images: List<LlmImage> = emptyList(),
+    /**
      * Tool calls the assistant made in this message (Bedrock only).
      * Bedrock's Converse API pairs each tool result with the toolUse id
      * it answers, so the ids must travel with the message. Every other
@@ -33,6 +41,14 @@ data class LlmMessage(
      */
     val toolResults: List<ToolResultFeedback>? = null
 )
+
+/**
+ * One attached image, already downscaled and JPEG re-encoded (see
+ * [ImageStore]). [base64] is the JPEG bytes, base64-encoded, with no
+ * line breaks; [mediaType] is always "image/jpeg" today — every picked
+ * format becomes JPEG on disk, so every provider gets the same bytes.
+ */
+data class LlmImage(val base64: String, val mediaType: String = "image/jpeg")
 
 /** One tool call the model asked for (OpenAI `tool_calls` shape). */
 data class LlmToolCall(
@@ -109,6 +125,15 @@ sealed interface ChatStreamEvent {
  * Streaming is best-effort: if the provider answers with plain JSON
  * instead of SSE, the single response is returned as one chunk, and any
  * `tool_calls` in it are surfaced as [ChatStreamEvent.ToolCall] events.
+ * - On-device .task models (Phase 6, Step 5, kind "local"): no HTTP at
+ *   all — the turn runs through [LocalLlmClient] (MediaPipe LLM
+ *   Inference, tasks-genai 0.10.27, verified from Google's docs — see
+ *   that file). The engine streams real text chunks and reports no
+ *   token usage, so no [ChatStreamEvent.Usage] is emitted and the
+ *   caller estimates (flagged estimated), like any provider that sends
+ *   no usage. Tool calls come back as fenced ```tool blocks in the
+ *   text, which the runner parses — the engine sends no native
+ *   tool_calls.
  * - Real token usage (Phase 5, Step 2): when the provider reports it,
  *   the turn ends with a [ChatStreamEvent.Usage] — the OpenAI SSE
  *   `usage` object in the final chunk (requested with
@@ -116,8 +141,23 @@ sealed interface ChatStreamEvent {
  *   message_delta usage, Bedrock Converse `usage`, or the `usage`
  *   object of a plain-JSON reply. A provider that sends no usage
  *   simply yields no Usage event, and the caller estimates instead.
+ * - Images (Phase 6, Step 2): a message with [LlmMessage.images] is
+ *   sent in each provider's own vision shape — OpenAI `image_url`
+ *   data URLs (also Azure, Google's OpenAI-compatible endpoint and
+ *   other OpenAI-kind providers), Anthropic image content blocks
+ *   (base64 + media_type), Bedrock Converse image blocks. A message
+ *   with no images sends exactly the plain-string content it always
+ *   did. Which models may receive images is decided before the
+ *   request is built ([com.inyogeshwar.codesathi.data.supportsVision]);
+ *   this client never has to refuse — it just renders the shape.
  */
-class LlmClient {
+/**
+ * Minimal LLM client over HttpURLConnection with SSE streaming, plus the
+ * on-device engine (Phase 6, Step 5) for kind "local" providers.
+ * [local] is null only on the plain client path (the approve-only runner
+ * never makes an LLM call); the ViewModel always wires a real one.
+ */
+class LlmClient(private val local: LocalLlmClient? = null) {
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -159,6 +199,16 @@ class LlmClient {
         azureResourceName: String? = null,
         awsCredentials: KeyStore.AwsCredentials? = null
     ): Flow<ChatStreamEvent> = flow {
+        if (provider.kind == "local") {
+            // On-device .task model (Phase 6, Step 5): no HTTP, no key —
+            // the MediaPipe engine streams the reply itself. A missing
+            // client here would mean the ViewModel forgot to wire it, so
+            // fail plainly instead of sending a request nowhere.
+            val localClient = local
+                ?: throw LlmException("On-device model support is not initialised.")
+            localClient.streamEvents(messages).collect { emit(it) }
+            return@flow
+        }
         if (provider.kind == "bedrock") {
             emitBedrockConverse(provider, modelId, messages, awsCredentials, this)
             return@flow
@@ -299,6 +349,26 @@ class LlmClient {
             val role = if (m.role == "assistant") "assistant" else "user"
             val blocks = StringBuilder()
             if (m.content.isNotBlank()) blocks.append("""{"text":"${escape(m.content)}"}""")
+            // Images (Phase 6, Step 2): Converse image blocks fit the
+            // existing content array — {"image":{"format":"jpeg",
+            // "source":{"bytes":"<base64>"}}}. The format is "jpeg"
+            // (not "image/jpeg") and the bytes are a base64 string in
+            // the REST JSON body. Only Claude models on Bedrock take
+            // images (see VisionSupport); other models are refused
+            // before the request is built, so an unsupported model
+            // never sees an image block here.
+            m.images.forEach { img ->
+                if (blocks.isNotEmpty()) blocks.append(",")
+                val format = when (img.mediaType) {
+                    "image/png" -> "png"
+                    "image/gif" -> "gif"
+                    "image/webp" -> "webp"
+                    else -> "jpeg"
+                }
+                blocks.append(
+                    """{"image":{"format":"$format","source":{"bytes":"${img.base64}"}}}"""
+                )
+            }
             m.toolUses?.forEach { call ->
                 val id = call.id ?: return@forEach
                 if (blocks.isNotEmpty()) blocks.append(",")
@@ -396,14 +466,12 @@ class LlmClient {
         reasoningEffort: String? = null
     ): String {
         val msgs = messages.joinToString(",") { m ->
-            val role = escape(m.role)
-            val content = escape(m.content)
-            """{"role":"$role","content":"$content"}"""
+            """{"role":"${escape(m.role)}","content":${openAiContentJson(m)}}"""
         }
         return if (provider.kind == "anthropic") {
             val system = messages.firstOrNull { it.role == "system" }?.content
             val rest = messages.filter { it.role != "system" }
-                .joinToString(",") { m -> """{"role":"${escape(m.role)}","content":"${escape(m.content)}"}""" }
+                .joinToString(",") { m -> """{"role":"${escape(m.role)}","content":${anthropicContentJson(m)}}""" }
             val systemPart = if (system != null) ",\"system\":\"${escape(system)}\"" else ""
             // Anthropic effort (verified, see KDoc above): only a valid,
             // user-set effort is sent; "default" (null) sends nothing.
@@ -426,6 +494,54 @@ class LlmClient {
             // normal LlmException path instead of silently losing usage.
             """{"model":"${escape(modelId)}","stream":true,"stream_options":{"include_usage":true}$effortPart,"messages":[$msgs]}"""
         }
+    }
+
+    /**
+     * OpenAI-style message content (Phase 6, Step 2): a plain string
+     * when the message has no images — exactly what text-only turns
+     * sent before, so no provider sees a new shape it did not ask for —
+     * otherwise a content list with the text part first and one
+     * `image_url` part per image, the base64 data URL shape from
+     * OpenAI's vision docs. Azure and Google's OpenAI-compatible
+     * endpoint take the same shape.
+     */
+    private fun openAiContentJson(m: LlmMessage): String {
+        if (m.images.isEmpty()) return "\"${escape(m.content)}\""
+        val parts = StringBuilder()
+        if (m.content.isNotBlank()) {
+            parts.append("""{"type":"text","text":"${escape(m.content)}"}""")
+        }
+        m.images.forEach { img ->
+            if (parts.isNotEmpty()) parts.append(",")
+            parts.append(
+                """{"type":"image_url","image_url":{"url":"data:${img.mediaType};base64,${img.base64}"}}"""
+            )
+        }
+        return "[$parts]"
+    }
+
+    /**
+     * Anthropic-style message content (Phase 6, Step 2): a plain string
+     * with no images, otherwise a content list with the image blocks
+     * FIRST and the text after them — Anthropic's docs recommend images
+     * before the text that asks about them. One block per image:
+     * `{"type":"image","source":{"type":"base64","media_type":
+     * "image/jpeg","data":"…"}}`.
+     */
+    private fun anthropicContentJson(m: LlmMessage): String {
+        if (m.images.isEmpty()) return "\"${escape(m.content)}\""
+        val parts = StringBuilder()
+        m.images.forEach { img ->
+            if (parts.isNotEmpty()) parts.append(",")
+            parts.append(
+                """{"type":"image","source":{"type":"base64","media_type":"${img.mediaType}","data":"${img.base64}"}}"""
+            )
+        }
+        if (m.content.isNotBlank()) {
+            if (parts.isNotEmpty()) parts.append(",")
+            parts.append("""{"type":"text","text":"${escape(m.content)}"}""")
+        }
+        return "[$parts]"
     }
 
     companion object {

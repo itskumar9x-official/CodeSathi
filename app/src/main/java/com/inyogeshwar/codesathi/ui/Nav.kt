@@ -14,6 +14,7 @@ sealed class Screen(val route: String) {
     object Commands : Screen("commands")
     object Terminal : Screen("terminal")
     object Remote : Screen("remote")
+    object Sync : Screen("sync")
     object Git : Screen("git")
     object Editor : Screen("editor")
     object Usage : Screen("usage")

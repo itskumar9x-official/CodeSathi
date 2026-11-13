@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "CodeSathi provider catalog (Phase 2 Step 2 + live-check pass 2026-11-12), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Live-check: every remote base URL was probed with GET {baseUrl}/models without auth (200/401/403 = reachable); 6 dead/duplicate entries were removed (Lambda, Predibase, MonsterAPI, Inflection, Gradient AI, Petals), 10 base URLs were corrected, and 62 providers were added. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. LangDB and Galadriel were both removed in Phase 4 (see below). Azure OpenAI and AWS Bedrock were fixed in Phase 4 (see below). CrofAI's /v1/models returns an HTML page without a key; it returns JSON with a key. Phase 4 catalog fixes (2026-11-13): LangDB removed — api.langdb.ai returned 503 ('service not available yet') on /models, /v1/models and / on both 2026-11-12 and 2026-11-13, although langdb.ai and the docs are alive; the correct form is project-scoped (https://api.langdb.ai/{projectId}/v1), which this flat catalog cannot express. Galadriel removed — api.galadriel.com completes TLS then sends an empty reply on /v1/verified/models and /v1/chat/completions, and an independent provider sweep (Oct 2026) lists its inference API as discontinued; galadriel.com itself still answers. Azure OpenAI fixed: kind 'azure', baseUrl template https://{resource}.openai.azure.com, resource name typed in the provider card, deployment URL with api-version 2024-10-21. AWS Bedrock fixed: kind 'bedrock', SigV4-signed Converse API with access key id + secret + region from the provider card. Catalog is now 206 providers.",
+  "note": "CodeSathi provider catalog (Phase 2 Step 2 + live-check pass 2026-11-12), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Live-check: every remote base URL was probed with GET {baseUrl}/models without auth (200/401/403 = reachable); 6 dead/duplicate entries were removed (Lambda, Predibase, MonsterAPI, Inflection, Gradient AI, Petals), 10 base URLs were corrected, and 62 providers were added. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. LangDB and Galadriel were both removed in Phase 4 (see below). Azure OpenAI and AWS Bedrock were fixed in Phase 4 (see below). CrofAI's /v1/models returns an HTML page without a key; it returns JSON with a key. Phase 4 catalog fixes (2026-11-13): LangDB removed — api.langdb.ai returned 503 ('service not available yet') on /models, /v1/models and / on both 2026-11-12 and 2026-11-13, although langdb.ai and the docs are alive; the correct form is project-scoped (https://api.langdb.ai/{projectId}/v1), which this flat catalog cannot express. Galadriel removed — api.galadriel.com completes TLS then sends an empty reply on /v1/verified/models and /v1/chat/completions, and an independent provider sweep (Oct 2026) lists its inference API as discontinued; galadriel.com itself still answers. Azure OpenAI fixed: kind 'azure', baseUrl template https://{resource}.openai.azure.com, resource name typed in the provider card, deployment URL with api-version 2024-10-21. AWS Bedrock fixed: kind 'bedrock', SigV4-signed Converse API with access key id + secret + region from the provider card. Catalog is now 206 providers. Phase 6, Step 5 (2026-11-13): on-device provider 'ondevice' (kind 'local') added - runs a .task model file the user picks, via MediaPipe LLM Inference (tasks-genai 0.10.27, the version Google's Android quickstart pins); no server, no API key, no bundled model. Catalog is now 207 providers.",
   "providers": [
     {
       "id": "anthropic",
@@ -1900,6 +1900,14 @@
       "models": [
         "local-model"
       ],
+      "local": true
+    },
+    {
+      "id": "ondevice",
+      "name": "On-device model (.task)",
+      "kind": "local",
+      "baseUrl": "",
+      "models": [],
       "local": true
     }
   ]

@@ -4,6 +4,8 @@ import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.data.TokenCounter
+import com.inyogeshwar.codesathi.data.supportsVision
+import com.inyogeshwar.codesathi.data.visionRefusalMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -142,6 +144,27 @@ private data class ParsedToolCall(
  * skills are listed by name in the Build system prompt, exactly like
  * the MCP tools. A skill never writes files by itself — anything it
  * asks for still goes through write / edit and the diff-card Approve.
+ *
+ * Agent Run (Phase 6, Step 1): the "run" tool executes a shell command
+ * in the project folder through the terminal screen's TerminalRunner
+ * and returns its exit code + merged output. It is gated by the same
+ * allow / ask / deny rule as every other tool (default "ask"). After a
+ * Build turn, a non-zero run consumes one of [MAX_FIX_ATTEMPTS] fix
+ * attempts for that turn; once all 3 are used, further `run` calls in
+ * the turn are refused without executing, so the loop can never run
+ * unbounded. A successful (exit 0) run consumes nothing.
+ *
+ * Images (Phase 6, Step 2): a user message may carry attached images
+ * ([LlmMessage.images], downscaled + JPEG re-encoded by ImageStore).
+ * History messages keep theirs through [imagesFor], so the model
+ * re-sees an old screenshot when the turn re-sends the history,
+ * exactly like it re-reads the old text. Before any attempt is tried,
+ * [visionAttempts] drops attempts whose model cannot see images —
+ * a vision request must never reach a text-only model, even through a
+ * fallback switch; when no attempt can see images the turn is refused
+ * with a plain message. The per-turn usage estimate adds
+ * [IMAGE_TOKENS_ESTIMATE] per image (only when the provider reports
+ * no usage — real counts already include image tokens).
  */
 class AgentRunner(
     private val llm: LlmClient,
@@ -208,8 +231,20 @@ class AgentRunner(
         ```tool
         {"tool":"skill","args":{"name":"code-review"}}
         ```
+        ```tool
+        {"tool":"run","args":{"command":"npm test"}}
+        ```
         Use read / glob / grep first to see the project before changing it.
         To change a file, call write (new file) or edit (change a snippet).
+        Use run to execute a command in the project folder — run tests, a
+        build, or a small script — and read its exit code and output. A
+        command that exits non-zero means something failed: fix the code
+        and run it again. You have at most 3 commands that exit non-zero
+        per turn; after the third, run is refused for the rest of the turn,
+        so make each re-run count. A "Permission denied" in the output
+        means the shell cannot touch that file (the folder grant gives the
+        shell no raw-filesystem access) — say so and use the read / write
+        tools instead.
         The user approves every file change before it is applied, so propose
         one file at a time. When the work is done, finish with a short plain
         text summary and no more tool calls. Do not invent files that were
@@ -238,6 +273,39 @@ class AgentRunner(
     companion object {
         /** Max model turns per user message — the Stop button cancels sooner. */
         const val MAX_STEPS = 10
+
+        /**
+         * Max commands that may exit non-zero in one Build turn (Phase 6,
+         * Step 1 — auto-fix bound). Each non-zero `run` result consumes
+         * one attempt; once all 3 are used, further `run` calls in the
+         * turn are refused without executing. The loop can never run
+         * unbounded, and a successful (exit 0) run consumes nothing.
+         */
+        const val MAX_FIX_ATTEMPTS = 3
+
+        /**
+         * Rough token cost of one attached image for the chars÷4
+         * estimate (Phase 6, Step 2): a 1568 px image is roughly
+         * 1,300–2,000 vision tokens depending on the provider, so 1,500
+         * is the middle. Only used when the provider reports no usage —
+         * real counts, when sent, already include the image tokens.
+         */
+        const val IMAGE_TOKENS_ESTIMATE = 1_500
+    }
+
+    /**
+     * Attempts that may actually be tried for this turn (Phase 6,
+     * Step 2): when the messages carry images, only attempts whose
+     * model can see images ([supportsVision]) survive — a vision
+     * request must never go to a text-only model, even through a
+     * fallback switch. With no images the list is unchanged.
+     */
+    private fun visionAttempts(
+        attempts: List<FallbackAttempt>,
+        messages: List<LlmMessage>
+    ): List<FallbackAttempt> {
+        if (messages.none { it.images.isNotEmpty() }) return attempts
+        return attempts.filter { supportsVision(it.provider, it.modelId) }
     }
 
     fun runPlan(
@@ -247,7 +315,9 @@ class AgentRunner(
         history: List<Message>,
         userGoal: String,
         project: SafProject,
-        folderName: String
+        folderName: String,
+        /** Images attached to this message (Phase 6, Step 2). */
+        userImages: List<LlmImage> = emptyList()
     ): Flow<AgentEvent> = flow {
         val files = try {
             project.listFiles().take(30).joinToString(", ")
@@ -256,12 +326,26 @@ class AgentRunner(
         }
         val messages = listOf(
             LlmMessage("system", planSystemPrompt),
-            LlmMessage("user", "Project folder: $folderName. Existing files: $files\n\nGoal: $userGoal")
+            LlmMessage(
+                "user",
+                "Project folder: $folderName. Existing files: $files\n\nGoal: $userGoal",
+                images = userImages
+            )
         )
-        val attempts = fallback?.attemptsFor(provider, modelId)
+        val rawAttempts = fallback?.attemptsFor(provider, modelId)
             ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
-        if (attempts.isEmpty()) {
+        if (rawAttempts.isEmpty()) {
             emit(AgentEvent.Error("All keys and fallback models are exhausted — limits reset at midnight. Add another key, or check the fallback order in Providers."))
+            return@flow
+        }
+        // Vision (Phase 6, Step 2): with images attached, only
+        // attempts whose model can see images may run. An empty list
+        // here means every attempt was filtered out — the plain refusal
+        // names a verified vision model instead of sending a request
+        // the model cannot answer.
+        val attempts = visionAttempts(rawAttempts, messages)
+        if (attempts.isEmpty()) {
+            emit(AgentEvent.Error(visionRefusalMessage(provider, modelId)))
             return@flow
         }
         var fullText: String? = null
@@ -357,23 +441,53 @@ class AgentRunner(
         toolRule: (String) -> String = { "ask" },
         summaryMarkdown: String? = null,
         contextTokens: Int = Compaction.DEFAULT_CONTEXT_TOKENS,
-        skills: List<Skill> = emptyList()
+        skills: List<Skill> = emptyList(),
+        /** Images attached to this message (Phase 6, Step 2). */
+        userImages: List<LlmImage> = emptyList(),
+        /**
+         * Images attached to a HISTORY message (Phase 6, Step 2):
+         * looked up fresh per turn, so an old message's images are
+         * re-sent with the history exactly like its text. Null when the
+         * caller has no images to resolve (plain text path).
+         */
+        imagesFor: (suspend (Message) -> List<LlmImage>)? = null
     ): Flow<AgentEvent> = flow {
         // Compaction: only what is sent changes; history in Room is untouched.
         val toSend = Compaction.buildSendMessages(history, summaryMarkdown, contextTokens)
         val llmMessages = mutableListOf(LlmMessage("system", buildSystemPrompt(tools.filter { it.name.startsWith("mcp:") }, skills)))
-        llmMessages += toSend.map { LlmMessage(it.role, it.text) }
-        llmMessages += LlmMessage("user", userMessage)
+        // History messages keep their images (Phase 6, Step 2): the
+        // model re-sees an old screenshot when the turn re-sends the
+        // history, exactly like it re-reads the old text.
+        for (msg in toSend) {
+            val imgs = imagesFor?.invoke(msg).orEmpty()
+            llmMessages += LlmMessage(msg.role, msg.text, images = imgs)
+        }
+        llmMessages += LlmMessage("user", userMessage, images = userImages)
 
         var steps = 0
+        // Auto-fix budget (Phase 6, Step 1): non-zero `run` results used
+        // up so far in THIS turn. Resets on the next user message (and on
+        // a post-approval resume, which is a new runBuild call).
+        var fixAttemptsUsed = 0
         while (steps < MAX_STEPS) {
             steps++
             // --- One model turn: stream text, collect any native tool calls. ---
             // On a limit error the turn retries with the next key / fallback
             // model instead of failing — but only when nothing was emitted
             // yet, so the chat never shows a duplicated reply.
-            val attempts = fallback?.attemptsFor(provider, modelId)
+            val rawAttempts = fallback?.attemptsFor(provider, modelId)
                 ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
+            // Vision (Phase 6, Step 2): with images attached, only
+            // attempts whose model can see images may run. When every
+            // attempt was filtered out the turn is refused with the
+            // plain message instead of sending a request the model
+            // cannot answer; an empty raw list keeps the old behaviour
+            // (the loop below reports exhaustion).
+            val attempts = visionAttempts(rawAttempts, llmMessages)
+            if (attempts.isEmpty() && llmMessages.any { it.images.isNotEmpty() }) {
+                emit(AgentEvent.Error(visionRefusalMessage(provider, modelId)))
+                return@flow
+            }
             val turnText = StringBuilder()
             val nativeCalls = mutableListOf<ParsedToolCall>()
             // The raw native calls (with their provider ids) — the
@@ -520,6 +634,18 @@ class AgentRunner(
                     callResults += call to line
                     continue
                 }
+                // Auto-fix bound (Phase 6, Step 1): once all 3 non-zero
+                // runs of this turn are used, refuse further `run` calls
+                // WITHOUT executing them — the loop can never run
+                // unbounded, and the model is told to summarise instead.
+                if (call.name == "run" && fixAttemptsUsed >= MAX_FIX_ATTEMPTS) {
+                    val line = "[run] Refused: 3 commands already exited non-zero this turn " +
+                        "(max 3 fix attempts). Do not run another command — summarise what " +
+                        "failed and what to try next."
+                    results.appendLine(line)
+                    callResults += call to line
+                    continue
+                }
                 when (call.name) {
                     "write", "edit" -> {
                         // Never execute a write directly: propose it and pause
@@ -549,6 +675,27 @@ class AgentRunner(
                             is ToolResult.Ok -> outcome.text
                             is ToolResult.Failed -> "Error: ${outcome.reason}"
                         }
+                        // Auto-fix accounting (Phase 6, Step 1): a `run`
+                        // that exits non-zero consumes one of the turn's
+                        // 3 fix attempts. The model is told how many are
+                        // left, so it can fix the code and re-run — or,
+                        // on the last one, stop and summarise. A
+                        // successful run, and a run that never executed
+                        // (refused, unresolved folder), consume nothing.
+                        var fixHint = ""
+                        val runExit = (outcome as? ToolResult.Ok)?.exitCode
+                        if (call.name == "run" && runExit != null && runExit != 0) {
+                            fixAttemptsUsed++
+                            fixHint = if (fixAttemptsUsed >= MAX_FIX_ATTEMPTS) {
+                                "\nFix attempt $fixAttemptsUsed of $MAX_FIX_ATTEMPTS — no more " +
+                                    "failing runs are allowed this turn. Do not run another " +
+                                    "command; summarise what failed and what to try next."
+                            } else {
+                                "\nFix attempt $fixAttemptsUsed of $MAX_FIX_ATTEMPTS: the command " +
+                                    "failed (exit code $runExit). Fix the code and run it again — " +
+                                    "or, if the failure is not in the code, say so and stop."
+                            }
+                        }
                         emit(
                             AgentEvent.ToolRan(
                                 tool = call.name,
@@ -556,7 +703,7 @@ class AgentRunner(
                                 result = resultText
                             )
                         )
-                        val line = "[${call.name}] $resultText"
+                        val line = "[${call.name}] $resultText$fixHint"
                         results.appendLine(line)
                         callResults += call to line
                     }
@@ -684,9 +831,14 @@ class AgentRunner(
      * for a turn, the counts are the chars÷4 estimate over the prompt
      * actually sent and the text actually received. The caller marks
      * the row estimated, so the dashboard never shows it as real.
+     * Images add [IMAGE_TOKENS_ESTIMATE] each — a prompt with images
+     * costs far more than its text, and counting only the text would
+     * under-report the turn.
      */
     private fun estimateUsage(promptMessages: List<LlmMessage>, completionText: String): LlmUsage {
-        val prompt = promptMessages.sumOf { TokenCounter.estimateTokens(it.content) }
+        val prompt = promptMessages.sumOf {
+            TokenCounter.estimateTokens(it.content) + it.images.size * IMAGE_TOKENS_ESTIMATE
+        }
         return LlmUsage(prompt, TokenCounter.estimateTokens(completionText))
     }
 

@@ -8,17 +8,27 @@ import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
 import java.io.File
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 
 /**
- * Phase 2, Step 6 — in-app terminal. User-facing screen only: the agent
- * has NO shell tool, and nothing here is wired into AgentRunner.
+ * Phase 2, Step 6 — in-app terminal, plus (Phase 6, Step 1) the shared
+ * shell executor the agent's `run` tool uses ([TerminalRunner], in
+ * Tools.kt). One executor, two callers: the terminal screen and the agent.
  *
  * A SAF tree URI is not a filesystem path, so the project folder is
  * resolved best-effort to a raw path for primary external storage
  * ("primary:AgentMT" → /storage/emulated/0/AgentMT). When that fails
  * the terminal falls back to the app's private files dir — never
- * silently running in the wrong folder.
+ * silently running in the wrong folder. The agent's `run` tool does
+ * NOT take that fallback: it refuses instead (see Tools.kt).
  */
+
+/** Output cap shared by the terminal screen and the agent's `run` tool:
+ *  only the last this-many lines of a command's output are kept. */
+const val TERMINAL_MAX_LINES = 2000
 
 /**
  * Phase 3, Step 4 — all-files access (MANAGE_EXTERNAL_STORAGE).
@@ -187,6 +197,7 @@ class TerminalRunner {
     }
 
     suspend fun run(command: String, workDir: File, onLine: (String) -> Unit): Int {
+        val job = currentCoroutineContext()[Job]
         val proc = ProcessBuilder("sh", "-c", command)
             .directory(workDir)
             .redirectErrorStream(true)
@@ -195,9 +206,22 @@ class TerminalRunner {
         try {
             // Reading on the caller's IO thread: lines stream in as the
             // command prints them. When the process is killed, its output
-            // stream closes and this loop ends.
+            // stream closes and this loop ends. A cancelled job (Stop)
+            // throws out of the loop so the process is killed in `finally`
+            // instead of running on after the caller gave up.
             proc.inputStream.bufferedReader().useLines { lines ->
-                for (line in lines) onLine(line)
+                for (line in lines) {
+                    if (job?.isActive == false) throw CancellationException("Command stopped.")
+                    onLine(line)
+                }
+            }
+            // Wait without blocking the thread forever: poll so a
+            // cancelled job can kill a quiet command (one printing
+            // nothing) instead of hanging in waitFor(). A process that
+            // already exited skips this loop entirely.
+            while (proc.isAlive) {
+                if (job?.isActive == false) throw CancellationException("Command stopped.")
+                delay(100)
             }
             return proc.waitFor()
         } finally {

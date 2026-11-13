@@ -8,6 +8,7 @@ import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.MIGRATION_1_2
 import com.inyogeshwar.codesathi.data.MIGRATION_2_3
 import com.inyogeshwar.codesathi.data.MIGRATION_3_4
+import com.inyogeshwar.codesathi.data.MIGRATION_4_5
 import com.inyogeshwar.codesathi.data.ProviderRepository
 import com.inyogeshwar.codesathi.ui.AppViewModel
 
@@ -24,7 +25,7 @@ class CodeSathiApp : Application() {
 
     val database: AppDatabase by lazy {
         Room.databaseBuilder(this, AppDatabase::class.java, "codesathi.db")
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
             .build()
     }
 

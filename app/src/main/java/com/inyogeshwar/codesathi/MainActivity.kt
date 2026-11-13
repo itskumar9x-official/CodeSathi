@@ -28,6 +28,7 @@ import com.inyogeshwar.codesathi.ui.screens.OnboardingScreen
 import com.inyogeshwar.codesathi.ui.screens.ProviderPickerScreen
 import com.inyogeshwar.codesathi.ui.screens.RemoteScreen
 import com.inyogeshwar.codesathi.ui.screens.SkillsScreen
+import com.inyogeshwar.codesathi.ui.screens.SyncScreen
 import com.inyogeshwar.codesathi.ui.screens.TerminalScreen
 import com.inyogeshwar.codesathi.ui.screens.UsageScreen
 import com.inyogeshwar.codesathi.ui.theme.CodeSathiTheme
@@ -68,6 +69,7 @@ class MainActivity : ComponentActivity() {
                                 onCommands = { nav.navigate(Screen.Commands.route) },
                                 onTerminal = { nav.navigate(Screen.Terminal.route) },
                                 onRemote = { nav.navigate(Screen.Remote.route) },
+                                onSync = { nav.navigate(Screen.Sync.route) },
                                 onGit = { nav.navigate(Screen.Git.route) },
                                 onEditor = { nav.navigate(Screen.Editor.route) },
                                 onUsage = { nav.navigate(Screen.Usage.route) }
@@ -118,6 +120,12 @@ class MainActivity : ComponentActivity() {
                         }
                         composable(Screen.Remote.route) {
                             RemoteScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Sync.route) {
+                            SyncScreen(
                                 viewModel = vm,
                                 onBack = { nav.popBackStack() }
                             )

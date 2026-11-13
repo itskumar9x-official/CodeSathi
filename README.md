@@ -79,7 +79,7 @@ Compose BOM 2024.01.00, Room 2.6.1.
    verification runs (exists, non-empty, basic HTML sanity) and shows
    "✓ Verified: …".
 4. **Providers + model picker** — a bundled `providers.json` written for
-   this app with 206 providers (the 12 v1 starters plus direct labs,
+   this app with 207 providers (the 12 v1 starters plus direct labs,
    inference hosts, gateways and 30 local servers — Anthropic, OpenAI,
    OpenRouter, Google Gemini, Groq, DeepSeek, xAI, Mistral, Together,
    Ollama local, LM Studio local, TokenHarbor, and 196 more), each with
@@ -257,9 +257,11 @@ Compose BOM 2024.01.00, Room 2.6.1.
   why and runs in the app's private files dir instead — never silently
   in the wrong folder. With no session yet, the screen explains and
   offers a button back to Home.
-- **User-facing only** — the agent has NO shell tool; the terminal is
-  not wired into AgentRunner at all. Commands run with the app's own
-  permissions (stated on screen).
+- **User-facing only, until Phase 6 Step 1** — the terminal was not
+  wired into AgentRunner at first; Phase 6, Step 1 adds the agent's
+  `run` tool on top of the same `TerminalRunner` (see below), so the
+  screen and the agent now share one shell executor. Commands run with
+  the app's own permissions (stated on screen).
 - **Honest limit** — the app holds no storage permission (folders come
   only from the SAF picker grant), and a SAF grant does not give a
   child shell process raw-filesystem access. So commands that touch
@@ -284,7 +286,12 @@ Compose BOM 2024.01.00, Room 2.6.1.
   `GET /api/sessions`, `GET /api/session/{id}`,
   `POST /api/prompt {"sessionId","message"}`. The prompt call runs one
   agent turn and returns JSON `{reply, tools[], error?, proposal?,
-  plan?, fallbackNotice?}` — no streaming, chat only.
+  plan?, fallbackNotice?}` — no streaming, chat only. Phase 6,
+  Step 4 adds two sync endpoints on the same server, same password:
+  `GET /api/sync/export` (every session as backup-format JSON) and
+  `POST /api/sync/import` (merge a backup, newest `updatedAt` wins,
+  answering `{added, updated, skipped, reasons}`) — see the Step 4
+  section below.
 - **Password auth** — set on the Remote screen (min. 4 characters),
   stored only in EncryptedSharedPreferences. Every `/api/*` call needs
   `Authorization: Bearer <password>` (constant-time check); wrong /
@@ -865,6 +872,436 @@ Compose BOM 2024.01.00, Room 2.6.1.
   `@Transaction` delete (same pattern as the existing
   `replaceForProvider` in `CachedModelDao`).
 
+## Phase 6, Step 1 — Agent Run + auto-fix
+
+- **The agent can now run commands** — a new `run` tool
+  (`{"tool":"run","args":{"command":"npm test"}}`), listed in the Build
+  system prompt next to read / glob / grep / write / edit / skill.
+  It runs `sh -c <command>` in the session's project folder and returns
+  the exit code plus the merged stdout + stderr as the tool result, so
+  the model can see a failure and fix the code. No second shell
+  executor was written: the tool calls the same `TerminalRunner.run`
+  the terminal screen uses (same `sh -c`, same ProcessBuilder, same
+  merged stream). The output cap is the same 2,000 lines as the
+  terminal screen, now one shared constant (`TERMINAL_MAX_LINES` in
+  `agent/Terminal.kt`, kept as the last lines — the error of a failing
+  command is usually at the end).
+- **Same allow / ask / deny rules** — `run` is gated by the exact
+  pattern as every other tool: `AgentRunner` consults
+  `toolRule("run")` before the call, "deny" refuses it before anything
+  runs, and the rule is editable in the chat's Tool permissions dialog
+  (Chat → ⋮ → "Tool permissions"), where `run` now appears alongside
+  read / glob / grep / write / edit. Default rule is **"ask"**, so
+  nothing runs until the user has approved it at least once. The rule
+  is an explicit entry in `DEFAULT_TOOL_RULES` (not just the
+  `?: "ask"` fallback in `toolRule()`).
+- **Auto-fix loop, bounded at 3** — after a Build turn, a `run` that
+  exits non-zero consumes one fix attempt for that turn
+  (`AgentRunner.MAX_FIX_ATTEMPTS = 3`). The tool result fed back to
+  the model says which attempt it was ("Fix attempt 1 of 3 …"), and
+  after the third non-zero run, further `run` calls in the same turn
+  are refused WITHOUT executing, with a message telling the model to
+  summarise the failure instead of running again. The bound is
+  enforced in code, not just in the prompt, so the loop can never run
+  unbounded. A successful run (exit 0) consumes nothing, and a run
+  that never executed (denied, or refused for an unresolved folder)
+  consumes nothing either. The budget resets on the next user message
+  (a post-approval resume is a new `runBuild` call, so it gets a fresh
+  budget of 3). The count uses a typed exit code
+  (`ToolResult.Ok.exitCode`, set only by the `run` tool) — never
+  string-parsing of the result text.
+- **Plan mode** — the `run` tool stays available in Plan mode (running
+  a command only reads its output), but write-like commands are refused
+  in Plan mode, exactly like the write / edit tools refuse:
+  `planModeRunRefusal` blocks a write command (`rm`, `mv`, `cp`,
+  `touch`, `mkdir`, `tee`, …), `sed -i`, and any unquoted `>`
+  redirection, splitting the command into segments outside quotes so
+  `ls; rm -rf out` is caught and `grep "a>b" file` is not falsely
+  refused. Honest limit: that screen is a heuristic, not a sandbox —
+  a command can still write through an interpreter (`python3 -c …`,
+  `node -e …`) or a tool the list does not name, so Plan mode's hard
+  guarantee stays what it always was (write / edit refuse, and no file
+  proposal is ever applied without Approve). Plan turns never call
+  tools today, so this is a guard for any future plan-tool path.
+- **Unresolved folder refuses, never falls back** — the folder is
+  resolved with the same `resolveTerminalFolder` as the terminal
+  screen, but unlike the terminal screen the agent NEVER runs in the
+  app-private fallback folder: the model must never believe it ran a
+  command in the project folder when it actually ran somewhere else.
+  An unresolved folder returns the plain reason instead.
+- **Stop kills the command** — the chat Stop button now also kills the
+  running shell process (`AppViewModel.stopRun` → `RunTool.stop()` →
+  `TerminalRunner.stop()`), because cancelling the job alone would
+  leave a quiet command blocked in its output read. `TerminalRunner`
+  also watches its own job now (throws `CancellationException` when a
+  line arrives after cancellation, and polls instead of blocking in
+  `waitFor()`), so a stopped command is killed in `finally` either way.
+- **Honest limit — "Permission denied"** — a SAF folder-picker grant
+  gives the child shell NO raw-filesystem access, so file-touching
+  commands in the project folder may print "Permission denied". That
+  stderr is returned plainly in the tool result (never hidden),
+  exactly like the terminal screen shows it, and when it appears the
+  result adds a plain note explaining why (SAF grant ≠ raw access)
+  and what fixes it (Home → Storage access, or the read / write tools,
+  which work through the folder grant).
+- **Remote turns** — a remote turn reuses the same `runAgentTurn`, so
+  the `run` tool is available remotely too, under the same rule. That
+  means a remote caller can run shell commands on the phone whenever
+  the `run` rule is not "deny" — the same exposure the read / write
+  tools already had, but a shell is more powerful, so set `run` to
+  "deny" if remote mode is ever on with a password shared beyond
+  trust. No new dependency, no version changes, no Room change.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine), no live agent run has called `run` yet. First-build
+  risks: the `v1Tools(project, context)` signature change (both call
+  sites updated); `currentCoroutineContext()[Job]` + `delay` in
+  `TerminalRunner.run`; the `ToolResult.Ok` second (defaulted)
+  parameter; the `filterIsInstance<RunTool>()` lookup in
+  `runAgentTurn`. Untested live: a real failing command triggering
+  the fix loop, the 3-attempt refusal, Stop mid-command, and a
+  "Permission denied" result from a real project folder.
+
+## Phase 6, Step 2 — Image input (vision)
+
+- **Attach up to 3 images to a message** — an image button in the chat
+  input row opens the system picker (SAF `GetMultipleContents`,
+  `image/*`). Picked images show as thumbnails above the input (× to
+  remove one) and, once sent, as thumbnails in the user message bubble
+  in the history.
+- **Downscaled + JPEG before anything is sent** — a raw phone photo is
+  several MB, far too large to base64 into a request. `ImageStore`
+  (new `agent/ImageAttachments.kt`, no new dependency — `BitmapFactory`
+  / `Bitmap` + JPEG compression only) decodes each pick subsampled,
+  scales it so its longest side is at most **1568 px**, and re-encodes
+  it as JPEG quality **80** before storing or sending it. The stored
+  file is what the model gets, so the thumbnail shows what the model
+  sees. Any format the decoder understands (JPEG, PNG, WebP, GIF, HEIC
+  on newer devices) becomes JPEG on disk. An unreadable image, and any
+  pick past the 3-per-message cap, is skipped with a plain note.
+- **App-private storage, never a blob, never exported** — images live
+  as files in `getFilesDir()/images/img_<uuid>.jpg`; Room stores only
+  the file names (`Message.imagesJson`, a JSON array). Room version is
+  now **5**, with a real `Migration(4, 5)` (`ALTER TABLE messages ADD
+  COLUMN imagesJson TEXT` — existing messages simply have no images).
+  Session backup / export never carries images (`BackupMessage` has no
+  images field): a restored message keeps its text but not its images.
+  Deleting a session deletes its image files too; removing a staged
+  image deletes its file. A staged image the user never sends stays
+  app-private until it is sent or removed.
+- **Each provider's own vision shape** — `LlmClient` sends the images
+  in the shape that provider documents: OpenAI `image_url` with a
+  base64 data URL (also Azure, Google's OpenAI-compatible endpoint and
+  other OpenAI-kind providers), Anthropic image content blocks
+  (`{"type":"image","source":{"type":"base64","media_type":"image/jpeg",
+  "data":"…"}}`, images before the text), Bedrock Converse image
+  blocks (`{"image":{"format":"jpeg","source":{"bytes":"…"}}}` — the
+  format fits the existing Converse body, no new request shape). A
+  message with no images sends exactly the plain-string content it
+  always did, so text-only turns are byte-for-byte unchanged.
+- **Verified vision list — everything else refuses** — only
+  (provider, model) pairs verified against the provider's own docs
+  (checked 2026-11-13, see `data/VisionSupport.kt`) may receive
+  images: OpenAI GPT-5 / GPT-4o / GPT-4.1 / GPT-4.5 / GPT-4 Turbo /
+  o-series; Anthropic Claude (all `claude-*`); Google Gemini
+  (`gemini-*`, via the OpenAI-compatible endpoint — Google's docs show
+  `image_url` with a base64 data URL for image understanding); Azure
+  OpenAI GPT-4o / GPT-5 (same families, deployment name = model id);
+  Bedrock `anthropic.claude*` (Claude 3.x/4.x support Converse images;
+  Titan / Llama / Mistral do not). Of the catalog's 260 bundled models,
+  11 are verified vision models. Every other provider — OpenRouter,
+  Groq, DeepSeek, xAI, Mistral, Together, Ollama, LM Studio,
+  TokenHarbor and the rest — is treated as unsupported, even when it
+  routes to a model that can see images: vision was not verified
+  against that provider's docs, so the app refuses plainly instead of
+  guessing. The picker warns before sending ("This model cannot see
+  images…"), `sendMessage` refuses before anything is stored or sent
+  (the text stays in the input field), and the agent runner filters
+  fallback attempts the same way — a fallback switch to a text-only
+  model is refused instead of sending a broken request.
+- **History images are re-sent** — an old message's images are resolved
+  fresh each turn (`imagesFor`), so the model re-sees a screenshot when
+  the history is re-sent, exactly like it re-reads the old text. A
+  missing image file (deleted, or a message restored from a backup) is
+  skipped silently — the text still goes out. Plan mode sees the
+  images too (the plan turn carries them). Remote turns have no image
+  input and are unaffected.
+- **Cost** — images count as tokens: when the provider reports usage,
+  its counts already include them; when it does not, the estimate adds
+  ~1,500 tokens per image (a 1568 px image is roughly 1,300–2,000
+  vision tokens depending on the provider). Re-sending history images
+  each turn costs tokens each turn, like any chat API.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine), no live vision call with a real key. First-build
+  risks: `ActivityResultContracts.GetMultipleContents` (activity 1.8.2
+  — present since 1.2, but untested here); `Icons.Filled.AddPhotoAlternate`
+  / `Close` (material-icons-extended, already a dependency);
+  `produceState` + `asImageBitmap` for thumbnails; the Room 4→5
+  migration on first launch after update; `BitmapFactory` decode of a
+  real phone photo (HEIC on some devices, very large panoramas).
+  Verification fix found by the balance check (real, compile-blocking):
+  the KDoc in `ImageAttachments.kt` and in `AppViewModel.kt` each
+  contained the text `` image/* ``, which Kotlin reads as a nested
+  block comment — the rest of each file was inside an unterminated
+  comment (same bug class as Phase 5, Step 2). Both are reworded.
+
+## Phase 6, Step 3 — Project templates
+
+- **Four templates on the New Session screen** — Blank (empty folder,
+  exactly as before, and the default), Portfolio website (a single
+  `index.html`), Python script (a small `main.py` starter), Markdown
+  notes (a `NOTES.md` starter). The picker sits on the New Session
+  screen **after the folder button and before Create**: the folder
+  comes first (the template needs a folder to land in), and the
+  choice is recorded in `AppViewModel.selectedTemplateId` until Create
+  consumes it once and resets it — a template picked and then
+  abandoned never leaks into a later session, and a session created
+  another way (the editor's "new session from a subfolder") always
+  gets Blank, because that path passes no template.
+- **Templates are small text files in assets** — new
+  `agent/Templates.kt` (registry + asset loader, 107 lines) lists the
+  four templates with their file lists, and the content ships under
+  `assets/templates/<id>/` (`portfolio/index.html`,
+  `python-script/main.py`, `notes/NOTES.md`), all written fresh for
+  this app. The portfolio is a genuine single-page site, not a stub:
+  sticky nav, hero, about, skills chips, three project cards, contact,
+  self-contained CSS in `:root` variables, one tiny script for the
+  footer year — no external files, so it also works in the editor's
+  live preview. No new dependency, no Room change, no new route.
+- **Nothing is written before Approve — the normal file-creation
+  path** — choosing a template only queues its files as `PlannedFile`
+  proposals, one at a time, through the same diff card (`DiffCard`)
+  and the same `AgentRunner.applyFileProposal` the agent's writes and
+  the editor's saves use. `createSession` reads the template from
+  assets off the main thread and queues the first file; approving it
+  queues the next file (still a proposal, never a direct write) until
+  the template is done. Template approvals never resume the agent
+  loop — there is no turn to resume — and the session gets a tool
+  message saying what was chosen and that nothing is written until
+  Approve is tapped. Rejecting a template file ends the template
+  (the rest is skipped, never proposed on its own); a failed write
+  clears the rest of the queue too.
+- **Plan mode is not bypassed** — a new session starts in Plan mode,
+  and the agent still cannot write there. A template proposal is
+  user-initiated (the user chose the template, then taps Approve on
+  the diff card), like an editor save — the Approve tap is the
+  approval, and the file only reaches the disk through it. The
+  template never writes straight to disk, and no template file is
+  ever created by the agent on its own.
+- **Scoped to its session** — a template proposal belongs to the
+  session it was created for (`pendingTemplateSessionId`); the Chat
+  and Editor screens only show the diff card when it belongs to the
+  session on screen (`shouldShowProposalFor`). A template chosen for
+  session A never offers its file in session B's chat. Agent and
+  editor proposals carry no session id and show wherever the card is,
+  as before.
+- **An existing file is never silently overwritten** — when the
+  template's file already exists in the folder, it is proposed as an
+  "edit" carrying the current text as `oldSnippet` (same pattern as
+  `proposeEditorSave`), so the diff card shows old vs new and the
+  write only replaces when the disk still holds that old text. An
+  empty file counts as missing, because an "edit" with an empty old
+  snippet would corrupt the file. The session's tool message says
+  when a file already exists.
+- **Edge cases, all with a plain message in the session** — a template
+  file that cannot be read from assets prepares no proposal; a
+  template chosen while another change already waits for approval is
+  not prepared at all (one approval at a time); if the agent proposes
+  a change while a template file is waiting, the agent's proposal
+  takes the single slot and the template file is set aside, never
+  written; deleting the template's session drops its proposal and
+  the rest of its queue.
+- **How to add a new template** — three touches, nothing else:
+  1. Put its files under `app/src/main/assets/templates/<new-id>/`
+     (one subfolder per template, named after the id).
+  2. Add one `ProjectTemplate(id = "<new-id>", name = …, description
+     = …, files = listOf(TemplateFile("<path>", "templates/<new-id>/<file>")))`
+     entry to `BUILT_IN_TEMPLATES` in `agent/Templates.kt`.
+  3. Nothing else: the picker reads the list, `createSession`
+     loads it, and the diff flow proposes it. No Room migration, no
+     new route, no ViewModel change. Keep template files small plain
+     text, and never put a secret in one — there is nothing to put a
+     key in here.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine), no live template session created yet.
+  First-build risks: `RadioButton` (Material3, already a dependency)
+  on the picker cards; the `takeIf { shouldShowProposalFor(…) }`
+  guard on both diff cards; the template proposal appearing in the
+  chat right after Create (it is queued in the same coroutine as the
+  session insert, so a very fast tap on the chat could briefly show
+  no card — it appears as soon as the insert finishes).
+
+## Phase 6, Step 4 — Multi-device sync
+
+- **Sync screen** — Home → "⋮" menu → "Sync devices" (`sync` route).
+  The user types the other device's IP address (shown on that device's
+  Remote screen) and port (blank = 8080), and the other device's Remote
+  password. Two checkboxes — Push my sessions / Pull the other device's
+  sessions, both on by default — and one "Sync now" button. A pasted
+  Remote-screen URL (`http://192.168.1.5:8080`) is cleaned up
+  automatically (scheme, path and `:port` stripped); IPv6 is refused
+  with a plain message. The password field is prefilled with this
+  device's Remote password (most users set the same one on both
+  devices) and is masked; change it when the other device uses a
+  different one.
+- **Built on Remote mode + the backup format — no second format, no
+  second password** — sync talks to the other device's remote server
+  (same port 8080, same Bearer password auth, same constant-time
+  check). Two new server endpoints: `GET /api/sync/export` returns
+  every session as the exact backup JSON the file export writes
+  (`formatVersion` 1, via the shared `buildBackupText()`), and
+  `POST /api/sync/import` takes that JSON and merges it, answering
+  `{added, updated, skipped, reasons}`. The client is a plain
+  `HttpURLConnection` caller (`remote/SyncClient.kt`, no new
+  dependency): 15 s connect / 60 s read timeouts, the password only
+  in an Authorization header, never in a URL or a log, and a 10 MB
+  reply cap (same cap as a file restore). The other device must have
+  Remote mode ON; this device does not need its own server on to
+  sync, only to be synced FROM.
+- **Merge rule: newest `updatedAt` wins** — per session. A session the
+  device does not have is added; an incoming copy newer than the local
+  one replaces it wholesale (session row + messages + summary, in one
+  Room transaction, so a failed write rolls back instead of leaving a
+  half-replaced session); an equal or older copy is skipped as
+  "already up to date". Invalid sessions and in-file duplicates are
+  skipped with their reason; the rest still merge. Pull runs first,
+  then Push, so one "both ways" round converges both devices on the
+  newest copy of each session, and a repeat sync right after is a
+  no-op (everything skipped). The result is a plain summary: "Pulled
+  3 sessions (2 new, 1 updated), 1 skipped. Pushed 5 sessions
+  (5 new, 0 updated)." with the first 3 non-routine skip reasons.
+- **Sessions only, exactly like a backup** — no API keys, provider
+  credentials, MCP tokens, remote/Git/AWS credentials or usage/cost
+  records ever leave the device, in either direction. The screen and
+  the result say so. The export endpoint serves the same
+  `encodeBackup` output as a file backup, so nothing new can leak
+  through sync that backup does not already exclude.
+- **Honest limits** — no conflict screen in v1: when the same session
+  changed on both devices, the older change is replaced by the newer
+  one, silently (the screen says so before syncing). Both devices must
+  be on the same Wi-Fi, and both must run the same app version's
+  format (formatVersion 1 — a wrong version is refused whole, like a
+  bad backup file). An imported session keeps its folder URI string,
+  but the SAF persistable grant does NOT travel: on the other device
+  the session shows "Folder unavailable" until the folder is re-chosen
+  from Home (same note as a file restore). A sync refuses to start
+  while a turn is running or a file change waits for approval, so a
+  merge can never land mid-turn. A backup over 10 MB is refused on
+  both ends (the server also refuses request bodies over 10 MB before
+  reading them). Sync failures are plain messages: wrong password,
+  no password set on the other device, unreachable device, or a
+  mid-sync break each get their own wording.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine), no live two-device sync tested. First-build risks:
+  `Icons.Filled.Sync` (material-icons-extended, already a dependency);
+  `Checkbox` in the Sync screen; `androidx.room.withTransaction`
+  (room-ktx 2.7.0, already a dependency); the `readCapped` loop and
+  the `errorStream` read in `SyncClient`; and the real two-device
+  behaviour (same-Wi-Fi reachability, the other device's server
+  staying up during a big push).
+
+## Phase 6, Step 5 — On-device local models (.task)
+
+- **Verified first, then built** — MediaPipe LLM Inference was checked
+  against official sources BEFORE any code was written (2026-11-13):
+  the artifact `com.google.mediapipe:tasks-genai:0.10.27` exists on
+  Google Maven (its POM is there — aar, Apache 2.0) and is the exact
+  version Google's own Android quickstart pins
+  (developers.google.com/edge/mediapipe/solutions/genai/llm_inference/
+  android). The metadata lists newer versions (up to 0.10.35), but the
+  docs pin 0.10.27, so the docs version is used. The API shape in code
+  is the one those docs show: `LlmInference.LlmInferenceOptions`
+  (`.setModelPath(path).setMaxTopK(64)`), `LlmInference.createFromOptions
+  (context, options)`, `generateResponse(prompt)` for one whole reply,
+  and `generateResponseAsync(prompt)` for streaming with
+  `.setResultListener { partialResult, done -> }`; maxTokens is input +
+  output tokens (default 512). The `.task` model format and the
+  Gemma-3 1B 4-bit quickstart model come from the same docs. The
+  session async shape (`LlmInferenceSession.generateResponseAsync`)
+  appears only in third-party tutorials, so it is NOT used — streaming
+  goes through the top-level `generateResponseAsync`, and multi-turn
+  context is a plain-text prompt, not a session.
+- **The user picks a `.task` file — the app never bundles a model** —
+  Providers → "On-device model (.task)" (new catalog provider
+  `ondevice`, kind `local`, no server URL, no API key). The system file
+  picker (SAF `OpenDocument`) returns the file; only `.task` files are
+  accepted (a GGUF or safetensors file is refused with a plain
+  message). The URI + a persistable READ grant are stored in DataStore
+  (same pattern as the folder picker), and the file's display name
+  becomes the model id — picking a file makes it the default model
+  (and the open session's model). The chosen file shows as a model row
+  (star / fallback / Use) like any other model; the key UI is hidden
+  for it, exactly like the other local providers, and Refresh is
+  replaced by a plain message (there is no server list to fetch).
+- **The engine needs a real file, so the file is copied once** —
+  `setModelPath` takes a filesystem path, and a SAF URI is not one.
+  On first use the picked file is copied into app-private storage
+  (`getFilesDir()/local-models/`, sanitised file name) and the cached
+  copy is what loads; the URI stays the source of truth, so a deleted
+  cache is re-copied from the URI. The copy doubles the disk the model
+  uses (file + cached copy) — the screen says so, and removing the
+  model (or picking a different one) deletes the cached copy again.
+  Loading is slow (copy a hundreds-of-MB file, then the native engine
+  loads it) and happens once — the engine is cached across turns until
+  the model changes or the app process dies. First load is the slow
+  one; later turns reuse the loaded model.
+- **Known-compatible models, download size warning** — Google's docs
+  name Gemma-3 1B in 4-bit quantized format (from Hugging Face) as the
+  quickstart model and Gemma-3n E2B / E4B for multimodal use. Gemma-3
+  1B 4-bit (`gemma-3-1b-it-int4.task`) is about **550 MB** — check the
+  download size before starting, and have free space about twice the
+  file size (the file plus the cached copy). The screen says both.
+  Other MediaPipe `.task` bundles may work; anything that is not a
+  `.task` file will not load. Google lists this API as
+  **maintenance-only** and recommends LiteRT-LM for new projects — a
+  LiteRT-LM migration is future work, not done here.
+- **Streaming is real; token counts are estimated** — the engine
+  streams through `generateResponseAsync` + the result listener, so
+  replies appear token by token like a remote provider. The engine
+  reports no token usage, so no Usage event is emitted and the runner
+  falls back to the chars÷4 estimate, flagged estimated — the
+  dashboard shows local turns as estimated, and "cost unknown" (local
+  turns are free; no price-table entry exists for a local model). The
+  reasoning-effort picker does nothing for local models (the engine
+  takes no effort field), so no effort chips or label are shown for
+  them. Images are refused for local models (text-only; Gemma-3n
+  multimodal is not wired) — the picker warns and `sendMessage`
+  refuses, exactly like any other text-only model.
+- **Small model, small context** — the engine is created with maxTokens
+  **4,096** (input + output tokens). The prompt is capped at 10,000
+  chars (~2,500 tokens) by dropping the oldest history turns first and
+  always keeping the latest user message, so ~1,500 tokens stay for the
+  reply. Compaction is measured against the same 4,096 (not the 128k
+  remote default), so a long local session compacts early instead of
+  overflowing the engine; the model summary call runs on the local
+  engine too, or falls back to the offline summary when no file is
+  picked. Tool calls come back as fenced ```tool blocks in the text
+  (the engine sends no native `tool_calls`), which the runner already
+  parses — a small 1B model will be much less reliable at exact tool
+  JSON than a frontier model, so expect more failed / malformed tool
+  calls. Fallback treats it like any other provider: it is a keyless
+  attempt (like the other local providers), and a fallback chain can
+  include it or a remote model after it.
+- **Not yet verified live** — no on-device run here (no Gradle build
+  on this machine), no live local-model run (no .task file exists in
+  this VM). First-build risks, in order: the MediaPipe AAR's minSdk
+  (if it is above 24, manifest merge fails — untested); the
+  `setResultListener` / `setErrorListener` SAM lambdas on
+  `LlmInferenceOptions` (the documented shapes, but uncompiled here);
+  `callbackFlow` + `awaitClose` around the async listener; the native
+  `.so` libraries the AAR brings (packaging); the result listener's
+  partials being deltas, not cumulative text (two independent
+  write-ups append them, and the code assumes deltas — if a first
+  on-device reply repeats itself, the partials are cumulative and the
+  listener must diff against the previous partial); a second
+  `generateResponseAsync` while one is still running after Stop +
+  immediate resend (MediaPipe's behaviour there is unverified — the
+  new call may fail with an error, which surfaces plainly); first load
+  time and RAM on a real mid-range phone (Gemma-3 1B 4-bit needs
+  roughly 1–2 GB free memory; Google says the API is optimised for
+  high-end devices such as Pixel 8 / S23 or later and does not
+  reliably support emulators — so the first real test should be on a
+  real phone, not an emulator).
+
 ## What is TODO / Phase 2 (explicitly NOT in v1)
 - Phase 2 is complete — Steps 1–8 are all done, see the sections
   above. Phase 3, Steps 1–5 (custom commands, reasoning-effort picker,
@@ -905,55 +1342,62 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (64 files; 13,769 lines of Kotlin)
+CodeSathi/  (73 files; 16,958 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
-  assets/providers.json          # 206-provider catalog (ours, Phase 2 Step 2 + live-check + Phase 4 fixes)
+  assets/providers.json          # 207-provider catalog (ours, Phase 2 Step 2 + live-check + Phase 4 fixes + Phase 6 Step 5 on-device provider)
   assets/skills/                 # Built-in skills (Step 4): code-review.md, write-tests.md, explain-code.md
+  assets/templates/              # Project templates (Phase 6, Step 3): portfolio/index.html, python-script/main.py, notes/NOTES.md
   java/com/inyogeshwar/codesathi/
-    MainActivity.kt              # NavHost (165)
-    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (36)
-    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel, UsageRecord (290)
-    data/SessionBackup.kt        # Versioned session backup format (v1): encode / parse / validate, sessions only, no secrets (212)
+    MainActivity.kt              # NavHost (173)
+    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (38)
+    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel, UsageRecord (389)
+    data/SessionBackup.kt        # Versioned session backup format (v1): encode / parse / validate, sessions only, no secrets, no images; SyncMergeResult for multi-device sync (239)
     data/ModelPrices.kt          # Bundled price table for cost estimates, 18 entries, price date 2026-11-13 (144)
-    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name (515)
+    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name, local .task model file (552)
     data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, AWS Bedrock credentials, masked display (308)
-    data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache, Azure deployments list, Bedrock note (233)
+    data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache, Azure deployments list, Bedrock note, local kind guard (240)
+    data/VisionSupport.kt        # Which (provider, model) pairs can see images — verified list only, everything else refuses; local models are text-only (90)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
-    agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries (183)
+    agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries, `run` shell tool + Plan-mode write screen (369)
     agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
-    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming), real usage parsing (632)
+    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming), real usage parsing, per-provider vision shapes, on-device .task branch (748)
+    agent/LocalLlm.kt            # On-device local models (Phase 6, Step 5): MediaPipe LLM Inference (tasks-genai 0.10.27), .task file copy + cached engine, streaming via generateResponseAsync, 4,096-token context, plain-text prompt (384)
     agent/BedrockSigner.kt       # Hand-rolled AWS SigV4 signing for Bedrock Converse, model-id percent-encoding (130)
     agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset, Bedrock single keyless attempt (157)
+    agent/ImageAttachments.kt    # Image store: downscale to 1568 px + JPEG q80, app-private files, file-name JSON for Room (216)
     agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call (230)
     agent/McpTools.kt            # MCP tools as normal Tool objects, mcp:<server>:<tool> names (50)
     agent/Skills.kt              # Skill Markdown parse/store, SkillStore, skill tool (264)
+    agent/Templates.kt           # Project templates (Phase 6, Step 3): registry + asset loader, BUILT_IN_TEMPLATES (107)
     agent/Voice.kt               # TextToSpeech speaker, SpeechRecognizer input, Markdown stripper (282)
-    agent/Terminal.kt            # SAF→path resolution, ProcessBuilder shell runner, streaming (139)
+    agent/Terminal.kt            # SAF→path resolution, ProcessBuilder shell runner, streaming, shared 2,000-line cap, cancellation-aware wait (232)
     agent/Git.kt                 # JGit wrapper: status / stage / commit / push / pull / branches / clone (262)
-    remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080 (474)
-    remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (192)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing, per-turn usage events (729)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials, usage recording, session backup/restore (1695)
-    ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (202)
+    remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080, sync export/import endpoints (548)
+    remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (200)
+    remote/SyncClient.kt         # Multi-device sync client (Phase 6, Step 4): HttpURLConnection pull/push, host + port parsing, plain errors (215)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing, per-turn usage events, `run` tool + max-3 auto-fix bound, vision-attempt filter (881)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials, usage recording, session backup/restore, `run` tool wiring + Stop kills shell, staged images, project-template picker + proposal queue, multi-device sync merge + syncWithDevice, local .task model file + 4,096-token local context (2510)
+    ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (204)
     ui/GitViewModel.kt           # Git state: folder, status, one op at a time (306)
     ui/EditorViewModel.kt        # Editor state: tabs, in-memory edits, binary checks, save proposals, folder tree (576)
     ui/Markdown.kt               # Self-contained Markdown renderer for chat (282)
     ui/SyntaxHighlight.kt        # Hand-rolled syntax highlighter for diffs + code blocks (368)
-    ui/Nav.kt                    # Routes (20)
+    ui/Nav.kt                    # Routes (21)
     ui/theme/Theme.kt            # (37)
     ui/screens/OnboardingScreen.kt   # (93)
-    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu, backup/restore pickers (399)
-    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice, mic + voice output, command suggestions, effort label (542)
-    ui/screens/DiffCard.kt           # Shared Approve/Reject diff card (Chat + Editor), syntax-highlighted (75)
+    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu, backup/restore pickers, template picker, sync menu entry (609)
+    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog (incl. `run`), fallback notice, mic + voice output, command suggestions, effort label (hidden for local models), image attach + thumbnails + vision warning (678)
+    ui/screens/DiffCard.kt           # Shared Approve/Reject diff card (Chat + Editor + templates), syntax-highlighted (76)
     ui/screens/FolderTree.kt         # Folder tree browser for the Editor (243)
-    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, reasoning-effort chips, Azure resource name, AWS Bedrock credentials (602)
+    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, reasoning-effort chips, Azure resource name, AWS Bedrock credentials, on-device .task file picker (689)
     ui/screens/McpScreen.kt          # MCP servers: add / enable / delete, tools, per-tool rules (273)
     ui/screens/SkillsScreen.kt       # Skills: list / enable / edit / add / delete / reset (283)
     ui/screens/CommandsScreen.kt     # Custom commands: add / enable / edit / delete (279)
     ui/screens/TerminalScreen.kt     # Terminal: folder card, streaming output, history chips (272)
     ui/screens/RemoteScreen.kt       # Remote mode: toggle, password, Wi-Fi URL, session count (238)
+    ui/screens/SyncScreen.kt         # Multi-device sync (Phase 6, Step 4): other device IP + port + Remote password, push/pull checkboxes, plain result (183)
     ui/screens/GitScreen.kt          # Git: status, stage/commit/push/pull, branches, clone, credential (465)
-    ui/screens/EditorScreen.kt       # Editor: folder tree, tabs, diff card, .html WebView preview (351)
+    ui/screens/EditorScreen.kt       # Editor: folder tree, tabs, diff card, .html WebView preview (353)
     ui/screens/UsageScreen.kt        # Usage & cost dashboard: totals, per-model and per-session breakdowns (296)
 ```

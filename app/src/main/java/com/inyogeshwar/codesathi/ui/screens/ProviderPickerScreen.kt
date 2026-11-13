@@ -1,5 +1,7 @@
 package com.inyogeshwar.codesathi.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -38,8 +40,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import android.net.Uri
 import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.ui.AppViewModel
 
@@ -63,10 +67,23 @@ import com.inyogeshwar.codesathi.ui.AppViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
+    val context = LocalContext.current
     var query by remember { mutableStateOf("") }
     var selectedProviderId by remember { mutableStateOf<String?>(null) }
     var keyInput by remember { mutableStateOf("") }
     var keySavedNote by remember { mutableStateOf<String?>(null) }
+    // On-device .task model file (Phase 6, Step 5): the system picker
+    // returns any file, so the ViewModel refuses non-.task files with a
+    // plain message — the mime filter here is only a hint.
+    val localModelLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val error = viewModel.setLocalModelFile(context, uri)
+            keySavedNote = error
+                ?: "Model file set — it is now the default model. The first load copies the file into the app and takes a while."
+        }
+    }
     val favourites by viewModel.favourites.collectAsState()
     val fallbackChain by viewModel.fallbackChain.collectAsState()
     // Reasoning effort per model (Phase 3, Step 2): "providerId/modelId" → low/medium/high.
@@ -281,6 +298,12 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                     onRemoveAwsCredential = {
                         viewModel.removeAwsCredential()
                         keySavedNote = "AWS credentials removed for ${provider.name}."
+                    },
+                    localModelName = viewModel.localModelName,
+                    onChooseLocalModel = { localModelLauncher.launch(arrayOf("*/*")) },
+                    onRemoveLocalModel = {
+                        viewModel.removeLocalModelFile()
+                        keySavedNote = "On-device model file removed. Pick another .task file to use the on-device model again."
                     }
                 )
             }
@@ -320,9 +343,11 @@ private fun ModelRow(
             if (provider.local) Text("Runs on this device (no key needed)", style = MaterialTheme.typography.bodySmall)
             // Reasoning effort (Phase 3, Step 2): per-model low / medium /
             // high, or Default (unset — nothing is sent). Shown for every
-            // provider: OpenAI-kind sends `reasoning_effort`, Anthropic-kind
-            // sends `output_config.effort` (verified from Anthropic's docs).
-            if (onSetEffort != null) {
+            // provider except the on-device one: OpenAI-kind sends
+            // `reasoning_effort`, Anthropic-kind sends `output_config.effort`
+            // (verified from Anthropic's docs); the local engine takes no
+            // effort field, so its rows show no chips.
+            if (onSetEffort != null && provider.kind != "local") {
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     EffortChip(label = "Default", selected = effort == null, onClick = { onSetEffort(null) })
                     EffortChip(label = "Low", selected = effort == "low", onClick = { onSetEffort("low") })
@@ -390,7 +415,13 @@ private fun ProviderCard(
     /** Save an AWS credential set (the screen sets the note). Only used for kind == "bedrock". */
     onSaveAwsCredential: (String, String, String) -> Unit = { _, _, _ -> },
     /** Delete the AWS credential set. Only used for kind == "bedrock". */
-    onRemoveAwsCredential: () -> Unit = {}
+    onRemoveAwsCredential: () -> Unit = {},
+    /** Display name of the picked .task file, or null when none is picked. Only used for kind == "local". */
+    localModelName: String? = null,
+    /** Open the system picker for a .task file. Only used for kind == "local". */
+    onChooseLocalModel: () -> Unit = {},
+    /** Forget the picked .task file. Only used for kind == "local". */
+    onRemoveLocalModel: () -> Unit = {}
 ) {
     var manualModel by remember { mutableStateOf("") }
     var azureInput by remember { mutableStateOf("") }
@@ -406,7 +437,8 @@ private fun ProviderCard(
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(provider.name, style = MaterialTheme.typography.titleMedium)
-                    Text(provider.baseUrl, style = MaterialTheme.typography.bodySmall)
+                    // The on-device provider has no server URL (its baseUrl is empty).
+                    if (provider.baseUrl.isNotBlank()) Text(provider.baseUrl, style = MaterialTheme.typography.bodySmall)
                     // Bedrock has no API key — its status is the AWS
                     // credential set (Phase 4), not a key count.
                     val keyStatus = when {
@@ -422,6 +454,60 @@ private fun ProviderCard(
             }
             if (expanded) {
                 Spacer(Modifier.height(8.dp))
+                // On-device .task model (Phase 6, Step 5): no server, no
+                // fetched or bundled list, no API key — the model is a
+                // file the user picks. The fetched / manual / bundled
+                // sections below are skipped for this kind.
+                if (provider.kind == "local") {
+                    Text("Model file (.task)", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        "Runs completely on this device — no server, no API key, no internet. " +
+                            "Download a .task model file yourself first, then pick the file here. " +
+                            "The app never bundles a model. Gemma-3 1B in 4-bit (about 550 MB) is the " +
+                            "known-good starting point — check the download size before you start.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (localModelName != null) {
+                        Text("Chosen file: $localModelName", style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            "First use copies the file into the app and loads it — this takes a while " +
+                                "and needs free space about twice the file size. Later turns reuse the loaded model.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        Text("No model file chosen yet.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = onChooseLocalModel) {
+                            Text(if (localModelName == null) "Choose .task file" else "Choose a different file")
+                        }
+                        if (localModelName != null) {
+                            OutlinedButton(onClick = onRemoveLocalModel) { Text("Remove") }
+                        }
+                    }
+                    Text(
+                        "Known-compatible .task models (Google's MediaPipe docs): Gemma-3 1B (4-bit) " +
+                            "and Gemma-3n E2B / E4B. Another MediaPipe .task bundle may work, but a GGUF " +
+                            "or safetensors file will not load — it must be a .task file.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    // The chosen file as a model row, so it can be starred,
+                    // added to the fallback order, or tapped Use like any
+                    // other model. Its id is the file name.
+                    if (localModelName != null) {
+                        ModelRow(
+                            provider = provider,
+                            modelId = localModelName,
+                            starred = favourites.any { it.modelKey == provider.modelKey(localModelName) },
+                            effort = null,
+                            onSetEffort = null,
+                            onStar = { onStar(localModelName) },
+                            onSelect = { onSelectModel(localModelName) },
+                            onAddFallback = { onAddFallback(localModelName) }
+                        )
+                    }
+                }
+                if (provider.kind != "local") {
                 // (3) Fetched models — GET {baseUrl}/models, cached in Room.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -487,6 +573,7 @@ private fun ProviderCard(
                         onAddFallback = { onAddFallback(model) }
                     )
                 }
+                } // end of the non-local sections (fetched / manual / bundled)
                 // Azure resource name (Phase 4): the {resource} in
                 // https://{resource}.openai.azure.com. Chat won't run
                 // until this is set, and the model id is the deployment

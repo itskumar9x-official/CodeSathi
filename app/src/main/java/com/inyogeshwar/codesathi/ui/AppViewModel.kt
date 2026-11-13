@@ -3,6 +3,7 @@ package com.inyogeshwar.codesathi.ui
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -10,18 +11,27 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.room.withTransaction
 import com.inyogeshwar.codesathi.CodeSathiApp
 import com.inyogeshwar.codesathi.agent.AgentEvent
 import com.inyogeshwar.codesathi.agent.AgentRunner
+import com.inyogeshwar.codesathi.agent.BLANK_TEMPLATE_ID
 import com.inyogeshwar.codesathi.agent.Compaction
 import com.inyogeshwar.codesathi.agent.FallbackEngine
+import com.inyogeshwar.codesathi.agent.ImageStore
 import com.inyogeshwar.codesathi.agent.LimitKind
 import com.inyogeshwar.codesathi.agent.LlmClient
+import com.inyogeshwar.codesathi.agent.LlmImage
 import com.inyogeshwar.codesathi.agent.LlmMessage
+import com.inyogeshwar.codesathi.agent.LocalLlmClient
+import com.inyogeshwar.codesathi.agent.loadTemplateFiles
+import com.inyogeshwar.codesathi.agent.decodeImageNames
+import com.inyogeshwar.codesathi.agent.encodeImageNames
 import com.inyogeshwar.codesathi.agent.McpClient
 import com.inyogeshwar.codesathi.agent.McpToolInfo
 import com.inyogeshwar.codesathi.agent.PlannedFile
 import com.inyogeshwar.codesathi.agent.Plan
+import com.inyogeshwar.codesathi.agent.RunTool
 import com.inyogeshwar.codesathi.agent.SafProject
 import com.inyogeshwar.codesathi.agent.Skill
 import com.inyogeshwar.codesathi.agent.SkillStore
@@ -29,6 +39,7 @@ import com.inyogeshwar.codesathi.agent.VoiceSpeaker
 import com.inyogeshwar.codesathi.agent.Tool
 import com.inyogeshwar.codesathi.agent.ToolContext
 import com.inyogeshwar.codesathi.agent.mcpToolsFor
+import com.inyogeshwar.codesathi.agent.templateById
 import com.inyogeshwar.codesathi.agent.v1Tools
 import com.inyogeshwar.codesathi.data.CustomCommand
 import com.inyogeshwar.codesathi.data.FallbackEntry
@@ -39,7 +50,9 @@ import com.inyogeshwar.codesathi.data.BackupImportResult
 import com.inyogeshwar.codesathi.data.BackupParseResult
 import com.inyogeshwar.codesathi.data.MAX_BACKUP_BYTES
 import com.inyogeshwar.codesathi.data.Message
+import com.inyogeshwar.codesathi.data.SessionBackup
 import com.inyogeshwar.codesathi.data.SessionBackupData
+import com.inyogeshwar.codesathi.data.SyncMergeResult
 import com.inyogeshwar.codesathi.data.encodeBackup
 import com.inyogeshwar.codesathi.data.parseBackup
 import com.inyogeshwar.codesathi.data.toSession
@@ -49,10 +62,15 @@ import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.data.SessionSummary
 import com.inyogeshwar.codesathi.data.TokenCounter
+import com.inyogeshwar.codesathi.data.supportsVision
+import com.inyogeshwar.codesathi.data.visionRefusalMessage
 import com.inyogeshwar.codesathi.data.UsageBySessionModel
 import com.inyogeshwar.codesathi.data.UsageRecord
 import com.inyogeshwar.codesathi.data.UsageTotals
 import com.inyogeshwar.codesathi.remote.RemoteTurnResult
+import com.inyogeshwar.codesathi.remote.SyncClient
+import com.inyogeshwar.codesathi.remote.SyncException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,6 +80,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /**
@@ -147,7 +166,10 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     /**
      * Delete a session and everything that belongs to it — messages,
      * compaction summary and usage rows, in one Room transaction
-     * ([SessionDao.deleteSessionAndData]). Deleting the session that
+     * ([SessionDao.deleteSessionAndData]), plus its attached-image
+     * files (Phase 6, Step 2): image bytes are app-private files, not
+     * Room rows, so they are deleted here or they would be orphaned
+     * when the messages go. Deleting the session that
      * is open, or the last session, never crashes: the active-session
      * pointer and the last-session preference are cleared, and the
      * terminal / Git / editor screens fall back to the most recent
@@ -156,8 +178,21 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
      * "Session not found." with a Back button.
      */
     fun deleteSession(sessionId: String) {
+        // Deleting the session a template proposal belongs to drops
+        // the proposal and the rest of its queue — a stale proposal
+        // must never resurface in another session's chat.
+        if (pendingTemplateSessionId == sessionId) {
+            pendingProposal = null
+            pendingProposalOld = null
+            pendingTemplateFiles = emptyList()
+            pendingProposalIsTemplate = false
+            pendingTemplateSessionId = null
+        }
         viewModelScope.launch {
+            val imageNames = db.messageDao().getMessages(sessionId)
+                .flatMap { decodeImageNames(it.imagesJson) }
             db.sessionDao().deleteSessionAndData(sessionId)
+            withContext(Dispatchers.IO) { ImageStore.deleteAll(app, imageNames) }
             if (activeSessionId == sessionId) activeSessionId = null
             if (prefs.lastSessionId.first() == sessionId) prefs.setLastSession(null)
         }
@@ -195,6 +230,27 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     }
 
     /**
+     * Every session (with its messages and compaction summary) as
+     * backup data, ready to encode. Shared by the file export below
+     * and by multi-device sync (Phase 6, Step 4): the server's
+     * export endpoint and the push both send exactly this, so there
+     * is one backup format, not two.
+     */
+    private suspend fun buildBackupData(): List<SessionBackupData> {
+        val sessions = db.sessionDao().observeSessions().first()
+        return sessions.map { session ->
+            SessionBackupData(
+                session = session,
+                messages = db.messageDao().getMessages(session.id),
+                summary = db.summaryDao().get(session.id)
+            )
+        }
+    }
+
+    /** The backup data above, encoded as formatVersion 1 JSON text. */
+    private suspend fun buildBackupText(): String = encodeBackup(buildBackupData())
+
+    /**
      * Write every session (with its messages and compaction summary)
      * to the file the user picked with the system file picker.
      * Sessions only — no API keys, credentials, MCP tokens or usage
@@ -205,14 +261,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             backupNote = null
             backupError = null
             try {
-                val sessions = db.sessionDao().observeSessions().first()
-                val data = sessions.map { session ->
-                    SessionBackupData(
-                        session = session,
-                        messages = db.messageDao().getMessages(session.id),
-                        summary = db.summaryDao().get(session.id)
-                    )
-                }
+                val data = buildBackupData()
                 val text = encodeBackup(data)
                 val written = context.contentResolver.openOutputStream(uri)?.use { out ->
                     out.write(text.toByteArray(Charsets.UTF_8))
@@ -221,8 +270,8 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 if (!written) {
                     backupError = "Could not write the backup file — try another location."
                 } else {
-                    backupNote = "Backup saved — ${sessions.size} session" +
-                        (if (sessions.size == 1) "" else "s") +
+                    backupNote = "Backup saved — ${data.size} session" +
+                        (if (data.size == 1) "" else "s") +
                         ". It holds sessions only: no API keys, no usage records."
                 }
             } catch (e: Exception) {
@@ -352,6 +401,227 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         return BackupImportResult(imported, skipped.size, skipped)
     }
 
+    // ---- Multi-device sync (Phase 6, Step 4) ----
+
+    /** One-line result from the last sync, for the Sync screen. */
+    var syncResult by mutableStateOf<String?>(null)
+        private set
+    /** One-line error from the last sync, for the Sync screen. */
+    var syncError by mutableStateOf<String?>(null)
+        private set
+    /** True while a sync is running — the Sync button is disabled then. */
+    var syncBusy by mutableStateOf(false)
+        private set
+
+    fun dismissSyncMessage() {
+        syncResult = null
+        syncError = null
+    }
+
+    /**
+     * This device's Remote password, for prefilling the Sync screen —
+     * the password the OTHER device checks is its own Remote password,
+     * and most users set the same one on both devices. Null when none
+     * is set here. The value is only ever put in a masked password
+     * field and sent as an Authorization header, never logged.
+     */
+    fun remotePassword(): String? = keys.getRemotePassword()
+
+    /** Backup text of every session, for the server's sync-export endpoint. */
+    suspend fun exportBackupText(): String = buildBackupText()
+
+    /**
+     * Merge a backup received from another device. Same format and
+     * validation as a file restore, different rule for a session that
+     * already exists: newest `updatedAt` wins — the incoming copy
+     * replaces the local one (session row, messages and summary
+     * together) instead of being skipped, so the two devices converge.
+     * An equal timestamp keeps the local copy ("already up to date").
+     *
+     * Each session is replaced inside one Room transaction, so a
+     * failed write rolls back to the old session instead of leaving
+     * a half-replaced one. A session that fails is skipped with its
+     * reason; the rest still merge.
+     */
+    suspend fun mergeSyncedSessions(backup: SessionBackup): SyncMergeResult {
+        var added = 0
+        var updated = 0
+        val skipped = mutableListOf<String>()
+        val seenIds = mutableSetOf<String>()
+        for (entry in backup.sessions) {
+            val invalid = validateBackupSession(entry)
+            if (invalid != null) {
+                skipped += "“${entry.title.ifBlank { entry.id.ifBlank { "unnamed" } }}” — $invalid"
+                continue
+            }
+            if (entry.id in seenIds) {
+                skipped += "“${entry.title}” — sent twice in one sync"
+                continue
+            }
+            seenIds += entry.id
+            val existing = db.sessionDao().getSession(entry.id)
+            if (existing != null && entry.updatedAt <= existing.updatedAt) {
+                skipped += "“${entry.title}” — already up to date"
+                continue
+            }
+            val isUpdate = existing != null
+            try {
+                db.withTransaction {
+                    if (isUpdate) {
+                        db.messageDao().deleteForSession(entry.id)
+                        db.sessionDao().deleteSummaryForSession(entry.id)
+                    }
+                    // ABORT insert for a new session (never overwrite by
+                    // accident); REPLACE upsert for an update, whose row
+                    // is still there because only its messages were deleted.
+                    if (isUpdate) {
+                        db.sessionDao().upsert(entry.toSession())
+                    } else {
+                        db.sessionDao().insert(entry.toSession())
+                    }
+                    val insertedIds = entry.messages.map { message ->
+                        db.messageDao().insert(
+                            Message(
+                                sessionId = entry.id,
+                                role = message.role,
+                                text = message.text,
+                                toolJson = message.toolJson,
+                                createdAt = message.createdAt
+                            )
+                        )
+                    }
+                    if (entry.summaryMarkdown != null) {
+                        db.summaryDao().save(
+                            SessionSummary(
+                                sessionId = entry.id,
+                                summaryMarkdown = entry.summaryMarkdown,
+                                // Old message ids are gone (fresh ids
+                                // above), so the summary covers up to
+                                // the last imported message instead.
+                                coversUpToMessageId = insertedIds.lastOrNull() ?: 0L,
+                                modelId = entry.summaryModelId.orEmpty(),
+                                createdAt = entry.summaryCreatedAt ?: System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+                if (isUpdate) updated++ else added++
+            } catch (e: Exception) {
+                skipped += "“${entry.title}” — could not be saved (${e.message ?: "write failed"})"
+            }
+        }
+        return SyncMergeResult(added, updated, skipped.size, skipped)
+    }
+
+    /**
+     * Sync with another device running CodeSathi: pull its sessions,
+     * push this device's, or both (pull first, then push, so one
+     * round converges both sides on the newest copy of each session).
+     *
+     * The other device must have Remote mode ON — sync talks to its
+     * remote server on the same port with the same Bearer password.
+     * The password typed here is the OTHER device's Remote password.
+     *
+     * Sessions only, exactly like a file backup: no API keys, no
+     * provider credentials, no MCP tokens, no usage records ever
+     * leave the device. A sync refuses to start while a turn is
+     * running or a file change waits for approval, so a merge can
+     * never land in the middle of a turn.
+     */
+    fun syncWithDevice(hostRaw: String, portRaw: String, password: String, push: Boolean, pull: Boolean) {
+        viewModelScope.launch {
+            syncResult = null
+            syncError = null
+            if (syncBusy) return@launch
+            if (isRunning) {
+                syncError = "Wait for the current turn to finish, then sync."
+                return@launch
+            }
+            if (pendingProposal != null) {
+                syncError = "A file change is waiting for approval — approve or reject it first, then sync."
+                return@launch
+            }
+            if (!push && !pull) {
+                syncError = "Choose Push, Pull, or both."
+                return@launch
+            }
+            val host = try {
+                SyncClient.normaliseHost(hostRaw)
+            } catch (e: SyncException) {
+                syncError = e.message
+                return@launch
+            }
+            val port = try {
+                SyncClient.parsePort(portRaw)
+            } catch (e: SyncException) {
+                syncError = e.message
+                return@launch
+            }
+            if (password.isBlank()) {
+                syncError = "Type the other device's Remote password."
+                return@launch
+            }
+            val remotePassword = password.trim()
+            syncBusy = true
+            try {
+                val parts = mutableListOf<String>()
+                var pulledAny = false
+                val extraReasons = mutableListOf<String>()
+                if (pull) {
+                    val text = withContext(Dispatchers.IO) {
+                        SyncClient.pullExport(host, port, remotePassword)
+                    }
+                    val backup = when (val parsed = parseBackup(text)) {
+                        is BackupParseResult.Error -> {
+                            syncError = parsed.message
+                            return@launch
+                        }
+                        is BackupParseResult.Ok -> parsed.backup
+                    }
+                    val merged = withContext(Dispatchers.IO) { mergeSyncedSessions(backup) }
+                    pulledAny = merged.added + merged.updated > 0
+                    extraReasons += merged.skippedReasons.filter { !it.endsWith("already up to date") }
+                    parts += "Pulled ${merged.added + merged.updated} session" +
+                        (if (merged.added + merged.updated == 1) "" else "s") +
+                        " (${merged.added} new, ${merged.updated} updated)" +
+                        if (merged.skipped > 0) ", ${merged.skipped} skipped" else ""
+                }
+                if (push) {
+                    val text = withContext(Dispatchers.IO) { buildBackupText() }
+                    val response = withContext(Dispatchers.IO) {
+                        SyncClient.pushImport(host, port, remotePassword, text)
+                    }
+                    extraReasons += response.reasons.filter { !it.endsWith("already up to date") }
+                    val pushed = response.added + response.updated
+                    parts += "Pushed $pushed session" +
+                        (if (pushed == 1) "" else "s") +
+                        " (${response.added} new, ${response.updated} updated)" +
+                        if (response.skipped > 0) ", ${response.skipped} skipped" else ""
+                }
+                syncResult = buildString {
+                    append(parts.joinToString(". "))
+                    append(".")
+                    val shown = extraReasons.take(3)
+                    if (shown.isNotEmpty()) {
+                        append(" Skipped: ")
+                        append(shown.joinToString("; "))
+                        append(".")
+                    }
+                    if (pulledAny) {
+                        append(" Pulled sessions keep their folder, but the folder " +
+                            "permission may need re-choosing on a new device.")
+                    }
+                }
+            } catch (e: SyncException) {
+                syncError = e.message
+            } catch (e: Exception) {
+                syncError = "Sync failed: ${e.message ?: "could not reach the other device."}"
+            } finally {
+                syncBusy = false
+            }
+        }
+    }
+
     /** Folder picked in the New Session flow (or re-choose flow). */
     var pickedFolderUri by mutableStateOf<Uri?>(null)
         private set
@@ -367,6 +637,136 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         private set
     var pendingProposalOld by mutableStateOf<String?>(null)
         private set
+
+    // ---- Project templates (Phase 6, Step 3) ----
+
+    /**
+     * The template picked on the New Session screen, if the user picked
+     * one. "blank" is the default — an empty folder, exactly as before.
+     * It is consumed once by [createSession] (which resets it), so a
+     * template picked and then abandoned never leaks into a later
+     * session created another way (e.g. from a subfolder in the editor).
+     */
+    var selectedTemplateId by mutableStateOf(BLANK_TEMPLATE_ID)
+        private set
+
+    /** Pick a template on the New Session screen. Unknown ids fall back to blank. */
+    fun selectTemplate(id: String) {
+        selectedTemplateId = templateById(id)?.id ?: BLANK_TEMPLATE_ID
+    }
+
+    /**
+     * Template files still waiting to be proposed, in the template's
+     * file order. Only the first file is ever in [pendingProposal] at
+     * once — approving it queues the next one (see [approveProposal]),
+     * so a multi-file template still goes through the one-proposal-at-
+     * a-time diff flow. Rejecting a template file, or a failed write,
+     * clears the rest of the queue.
+     *
+     * [TemplateQueueEntry.oldContent] is the file's current text when
+     * it already exists in the folder (empty / missing files have
+     * null): an existing file is proposed as an "edit", so the diff
+     * card shows the old text and the write only replaces when the
+     * disk still holds it — exactly like [proposeEditorSave]. A
+     * template Approve can never silently overwrite a file the user
+     * cannot see in the diff.
+     */
+    private var pendingTemplateFiles: List<TemplateQueueEntry> = emptyList()
+
+    /** One template file waiting its turn, with its current on-disk text if it exists. */
+    private data class TemplateQueueEntry(
+        val path: String,
+        val content: String,
+        val oldContent: String?
+    )
+
+    /** Build the diff-card proposal for one queued template file. */
+    private fun queueTemplateEntry(entry: TemplateQueueEntry) {
+        pendingProposal = if (entry.oldContent != null) {
+            PlannedFile(path = entry.path, action = "edit", oldSnippet = entry.oldContent, newSnippet = entry.content)
+        } else {
+            PlannedFile(path = entry.path, action = "create", newContent = entry.content)
+        }
+        pendingProposalOld = entry.oldContent
+    }
+
+    /**
+     * The session a pending template proposal belongs to, or null when
+     * the pending proposal is not a template file. Template proposals
+     * are scoped to their session (see [shouldShowProposalFor]) — a
+     * template chosen for session A must never show its diff card in
+     * session B's chat. Agent and editor proposals carry no session
+     * id and show wherever the card is, as before.
+     */
+    var pendingTemplateSessionId by mutableStateOf<String?>(null)
+        private set
+
+    /** True while [pendingProposal] is a template file, not an agent or editor change. */
+    private var pendingProposalIsTemplate: Boolean = false
+
+    /**
+     * True when the pending diff card belongs on [sessionId]'s screens.
+     * Template proposals show only in their own session's chat / editor;
+     * every other proposal (agent, editor) shows wherever the card is.
+     */
+    fun shouldShowProposalFor(sessionId: String): Boolean =
+        pendingTemplateSessionId == null || pendingTemplateSessionId == sessionId
+
+    /**
+     * Queue a template's files for approval in [sessionId]'s chat.
+     * Nothing is written here — the first file becomes [pendingProposal]
+     * (a "create", or an "edit" when [oldContents] holds that file's
+     * current text, so the diff card shows what Approve would replace),
+     * and the rest wait in [pendingTemplateFiles] until each Approve
+     * queues the next one. A tool message in the session says what was
+     * chosen and that nothing is written until Approve is tapped, so
+     * the card never appears unexplained. When another proposal is
+     * already waiting, the template is not queued at all (one approval
+     * at a time) and the message says so instead.
+     */
+    private suspend fun queueTemplateProposal(
+        sessionId: String,
+        templateName: String,
+        files: List<Pair<String, String>>,
+        oldContents: Map<String, String>
+    ) {
+        if (files.isEmpty()) return
+        if (pendingProposal != null) {
+            db.messageDao().insert(
+                Message(
+                    sessionId = sessionId,
+                    role = "tool",
+                    text = "Template “$templateName” was chosen, but another file change " +
+                        "is already waiting for approval, so the template was not " +
+                        "prepared. Approve or reject that change first, then start " +
+                        "a new session with the template. Nothing was written.",
+                    createdAt = System.currentTimeMillis()
+                )
+            )
+            return
+        }
+        val entries = files.map { (path, content) ->
+            TemplateQueueEntry(path, content, oldContents[path])
+        }
+        pendingTemplateFiles = entries.drop(1)
+        pendingTemplateSessionId = sessionId
+        pendingProposalIsTemplate = true
+        val first = entries.first()
+        queueTemplateEntry(first)
+        val more = if (entries.size > 1) " (${entries.size - 1} more file${if (entries.size > 2) "s" else ""} after this one)" else ""
+        val existsNote = if (first.oldContent != null) {
+            " It already exists in this folder — approving replaces it, and the diff shows the old text."
+        } else ""
+        db.messageDao().insert(
+            Message(
+                sessionId = sessionId,
+                role = "tool",
+                text = "Template “$templateName” chosen — ${first.path} is waiting for " +
+                    "approval below$more.$existsNote Nothing is written until you tap Approve.",
+                createdAt = System.currentTimeMillis()
+            )
+        )
+    }
 
     var isRunning by mutableStateOf(false)
         private set
@@ -557,6 +957,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     }
 
     override fun onCleared() {
+        localLlm.close()
         voiceSpeaker.shutdown()
         super.onCleared()
     }
@@ -587,11 +988,29 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     }
 
     private var runJob: Job? = null
-    private val llm = LlmClient()
+    /**
+     * The `run` tool of the turn in progress, if any (Phase 6, Step 1).
+     * [stopRun] kills its shell process as well as cancelling the job.
+     * Set in [runAgentTurn], cleared when the turn's events are done
+     * (including on cancellation, via try/finally there).
+     */
+    private var activeRunTool: RunTool? = null
+    /** On-device .task model engine (Phase 6, Step 5), wired into [llm]. */
+    private val localLlm = LocalLlmClient(app)
+    private val llm = LlmClient(local = localLlm)
+
+    /** Display name of the picked .task model file, or null when none is picked. */
+    var localModelName by mutableStateOf<String?>(null)
+        private set
 
     init {
         viewModelScope.launch {
             prefs.onboarded.collect { onboarded = it }
+        }
+        // On-device model file (Phase 6, Step 5): keep the picked file's
+        // display name in state for the provider screen.
+        viewModelScope.launch {
+            prefs.localModelName.collect { localModelName = it }
         }
         // Seed the pre-filled (disabled) Exa MCP entry once.
         viewModelScope.launch { prefs.ensureDefaultServers() }
@@ -634,7 +1053,23 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         viewModelScope.launch { prefs.setOnboarded(true) }
     }
 
-    fun createSession(title: String): String? {
+    /**
+     * Create a session in the picked folder, with the default model and
+     * Plan mode. [templateId] is the template picked on the New Session
+     * screen (blank by default — an empty folder, exactly as before);
+     * the editor's subfolder flow passes nothing, so it always gets
+     * blank. The choice is consumed once here and [selectedTemplateId]
+     * is reset, so a later session starts blank again.
+     *
+     * A template's files are never written here. When [context] is
+     * given and the template has files, they are read from assets off
+     * the main thread and handed to [queueTemplateProposal], which
+     * turns the first file into a diff-card proposal — the file only
+     * reaches the disk when the user taps Approve in the chat, exactly
+     * like an agent write or an editor save. When a template file
+     * cannot be read, no proposal is queued and the session says so.
+     */
+    fun createSession(title: String, context: Context? = null, templateId: String = BLANK_TEMPLATE_ID): String? {
         val uri = pickedFolderUri ?: return null
         val id = UUID.randomUUID().toString()
         val providerId = defaultProviderPair().first
@@ -650,10 +1085,45 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             createdAt = System.currentTimeMillis(),
             updatedAt = System.currentTimeMillis()
         )
+        val template = templateById(templateId) ?: templateById(BLANK_TEMPLATE_ID)!!
+        selectedTemplateId = BLANK_TEMPLATE_ID
         viewModelScope.launch {
             db.sessionDao().upsert(session)
             prefs.setLastSession(id)
             clearPickedFolder()
+            if (template.files.isNotEmpty() && context != null) {
+                // Read the template files from assets and, for each one,
+                // its current text in the folder when it already exists
+                // — both off the main thread. An existing file is
+                // proposed as an "edit" (see queueTemplateProposal), so
+                // Approve can never silently overwrite it; an empty file
+                // counts as missing, because an "edit" with an empty old
+                // snippet would corrupt the file (same guard as
+                // proposeEditorSave).
+                val (files, oldContents) = withContext(Dispatchers.IO) {
+                    val loaded = loadTemplateFiles(context, template)
+                    val olds = loaded?.let { list ->
+                        val project = SafProject(context, Uri.parse(session.projectUri))
+                        list.mapNotNull { (path, _) ->
+                            project.readText(path)?.takeIf { it.isNotEmpty() }?.let { path to it }
+                        }.toMap()
+                    }
+                    loaded to olds
+                }
+                if (files == null) {
+                    db.messageDao().insert(
+                        Message(
+                            sessionId = id,
+                            role = "tool",
+                            text = "Template “${template.name}” could not be loaded — " +
+                                "its files were not prepared. Nothing was written.",
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                } else {
+                    queueTemplateProposal(id, template.name, files, oldContents.orEmpty())
+                }
+            }
         }
         return id
     }
@@ -700,7 +1170,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             pickedFolderUri = treeUri
             pickedFolderName = name
         }
-        return createSession(name)
+        return createSession(name, context)
     }
 
     private var cachedDefault: Pair<String, String>? = null
@@ -1225,6 +1695,138 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         return useModel(providerId, trimmed)
     }
 
+    // ---- On-device .task model file (Phase 6, Step 5) ----
+
+    /**
+     * Called with the URI the system file picker returned for a .task
+     * model file. Only ".task" files are accepted — a GGUF or
+     * safetensors file is not a MediaPipe model and would fail at load.
+     * Takes a persistable READ grant (the file is only ever read — the
+     * engine copies it into app-private storage), stores the URI +
+     * display name, drops any loaded engine so the next turn loads the
+     * new file, and makes it the default model (and the open session's
+     * model, when a chat is open) via [useModel]. Returns an error
+     * message, or null on success.
+     */
+    fun setLocalModelFile(context: Context, uri: Uri): String? {
+        val name = displayNameOf(context, uri) ?: uri.lastPathSegment.orEmpty()
+        if (!name.endsWith(".task", ignoreCase = true)) {
+            return "That is not a .task model file — pick the .task file you downloaded (for example gemma-3-1b-it-int4.task)."
+        }
+        return try {
+            context.contentResolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+            viewModelScope.launch {
+                prefs.setLocalModel(uri.toString(), name)
+                localLlm.onModelChanged()
+                useModel(LocalLlmClient.LOCAL_PROVIDER_ID, name)
+            }
+            null
+        } catch (_: SecurityException) {
+            "Could not keep access to that file — pick it again."
+        }
+    }
+
+    /** Forget the picked .task file; the cached copy and engine are dropped too. */
+    fun removeLocalModelFile() {
+        viewModelScope.launch {
+            prefs.clearLocalModel()
+            localLlm.onModelChanged()
+        }
+    }
+
+    /** Display name of a SAF document URI, or null when it cannot be read. */
+    private fun displayNameOf(context: Context, uri: Uri): String? {
+        return try {
+            context.contentResolver.query(
+                uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ---- Attached images (Phase 6, Step 2) ----
+
+    /**
+     * Images staged for the next message: file names in
+     * getFilesDir()/images/, already downscaled + JPEG re-encoded by
+     * [ImageStore]. At most [ImageStore.MAX_IMAGES_PER_MESSAGE]; the
+     * chat screen shows them as thumbnails above the input. They become
+     * part of the message on send; tapping × deletes the staged file.
+     * A staged image the user never sends stays app-private until it is
+     * sent or removed — it is never sent on its own.
+     */
+    var pendingImages by mutableStateOf<List<String>>(emptyList())
+        private set
+
+    /** One-line note from the last image staging (too many, unreadable). */
+    var imageNote by mutableStateOf<String?>(null)
+        private set
+
+    fun dismissImageNote() {
+        imageNote = null
+    }
+
+    /**
+     * Stage images picked with the system picker (SAF image picker).
+     * Each one is downscaled + JPEG re-encoded into app-private storage
+     * before it is shown — a raw phone photo is far too large to base64
+     * into a request. Images past the 3-per-message cap are skipped
+     * with a plain note; an unreadable image is skipped the same way.
+     * Nothing here sends anything.
+     */
+    fun addPendingImages(context: Context, uris: List<Uri>) {
+        viewModelScope.launch {
+            val results = withContext(Dispatchers.IO) {
+                uris.map { uri -> ImageStore.saveImage(context, uri) }
+            }
+            val saved = results.filterNotNull()
+            val failed = results.size - saved.size
+            val room = ImageStore.MAX_IMAGES_PER_MESSAGE - pendingImages.size
+            val kept = saved.take(room.coerceAtLeast(0))
+            val overCap = saved.size - kept.size
+            if (kept.isNotEmpty()) pendingImages = pendingImages + kept
+            imageNote = when {
+                kept.isEmpty() && failed > 0 ->
+                    "Could not read ${if (failed == 1) "that image" else "those $failed images"} — nothing was attached."
+                overCap > 0 ->
+                    "Only ${ImageStore.MAX_IMAGES_PER_MESSAGE} images per message — " +
+                        "${if (overCap == 1) "1 image was" else "$overCap images were"} skipped."
+                failed > 0 ->
+                    "${if (failed == 1) "1 image" else "$failed images"} could not be read and " +
+                        "${if (failed == 1) "was" else "were"} skipped."
+                else -> null
+            }
+        }
+    }
+
+    /** Remove one staged image (× on its thumbnail): the file is deleted too. */
+    fun removePendingImage(fileName: String) {
+        pendingImages = pendingImages - fileName
+        viewModelScope.launch(Dispatchers.IO) { ImageStore.delete(app, fileName) }
+    }
+
+    /**
+     * The images of one stored message, as base64 for the request body.
+     * A file that is missing (deleted, or a message restored from a
+     * backup — backups never carry images) is skipped silently, so an
+     * old message never breaks a turn; the text still goes out.
+     */
+    private suspend fun loadImagesForMessage(message: Message): List<LlmImage> =
+        loadImagesForNames(decodeImageNames(message.imagesJson))
+
+    /** The same, from file names directly (the just-staged message). */
+    private suspend fun loadImagesForNames(fileNames: List<String>): List<LlmImage> =
+        withContext(Dispatchers.IO) {
+            fileNames.mapNotNull { name ->
+                ImageStore.loadBase64(app, name)?.let { LlmImage(it) }
+            }
+        }
+
     // ---- Chat ----
 
     private val messageFlows = mutableMapOf<String, StateFlow<List<Message>>>()
@@ -1238,6 +1840,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     fun tokenEstimate(messages: List<Message>): Int = TokenCounter.estimateTokens(messages)
 
     fun stopRun() {
+        // Kill a running shell command too (Phase 6, Step 1): cancelling
+        // the job alone would leave a quiet `run` command blocked in its
+        // output read. Destroying the process closes its stream, which
+        // lets the cancelled turn unwind.
+        activeRunTool?.stop()
         runJob?.cancel()
         isRunning = false
     }
@@ -1340,14 +1947,20 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
     }
 
     /**
-     * Approve the pending proposal and write the file (agent's or
-     * editor's — both are the same [PlannedFile]).
+     * Approve the pending proposal and write the file (agent's,
+     * editor's or template's — all three are the same [PlannedFile]).
      *
      * [resumeAgent] is true for agent proposals: after a verified write
      * the Build loop resumes with a continuation message. Editor saves
      * pass false — there is no agent turn to resume. [onApplied] reports
      * whether the write succeeded, so the editor can clear its dirty
      * marker (or keep it and show the error).
+     *
+     * Template proposals never resume the agent: there is no turn to
+     * resume — the user only approved a starter file. Instead, an
+     * approved template file queues the template's NEXT file as the
+     * next proposal (still through the diff card), until the template
+     * is done. A failed template write clears the rest of the queue.
      */
     fun approveProposal(
         session: Session,
@@ -1356,10 +1969,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         onApplied: ((Boolean) -> Unit)? = null
     ) {
         val proposal = pendingProposal ?: return
+        val wasTemplate = pendingProposalIsTemplate
         pendingProposal = null
         pendingProposalOld = null
         val project = SafProject(context, Uri.parse(session.projectUri))
-        val runner = AgentRunner(llm, v1Tools(project))
+        val runner = AgentRunner(llm, v1Tools(project, context))
         viewModelScope.launch {
             val event = runner.applyFileProposal(proposal, project)
             val text = when (event) {
@@ -1376,7 +1990,20 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             // Editor saves (resumeAgent = false) have no turn to resume.
             if (event is AgentEvent.Verified) {
                 onApplied?.invoke(true)
-                if (resumeAgent) {
+                if (wasTemplate) {
+                    // Next template file, if any — still a diff-card
+                    // proposal, never a direct write. When the template
+                    // is done, clear the template state.
+                    val next = pendingTemplateFiles.firstOrNull()
+                    if (next != null) {
+                        pendingTemplateFiles = pendingTemplateFiles.drop(1)
+                        queueTemplateEntry(next)
+                    } else {
+                        pendingTemplateFiles = emptyList()
+                        pendingProposalIsTemplate = false
+                        pendingTemplateSessionId = null
+                    }
+                } else if (resumeAgent) {
                     resumeBuild(
                         session,
                         context,
@@ -1386,40 +2013,76 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 }
             } else {
                 onApplied?.invoke(false)
+                // A failed write ends the template: a stale queue must
+                // never resurface as a proposal for a later session.
+                if (wasTemplate) {
+                    pendingTemplateFiles = emptyList()
+                    pendingProposalIsTemplate = false
+                    pendingTemplateSessionId = null
+                }
             }
         }
     }
 
     fun rejectProposal(session: Session) {
         val proposal = pendingProposal ?: return
+        val wasTemplate = pendingProposalIsTemplate
         pendingProposal = null
         pendingProposalOld = null
+        // Rejecting a template file ends the template — the rest of its
+        // files are skipped, never proposed on their own.
+        pendingTemplateFiles = emptyList()
+        pendingProposalIsTemplate = false
+        pendingTemplateSessionId = null
         viewModelScope.launch {
             db.messageDao().insert(
                 Message(
                     sessionId = session.id,
                     role = "tool",
-                    text = "Change to ${proposal.path} rejected — nothing was written.",
+                    text = if (wasTemplate) {
+                        "Template file ${proposal.path} rejected — nothing was written, " +
+                            "and the rest of the template was skipped."
+                    } else {
+                        "Change to ${proposal.path} rejected — nothing was written."
+                    },
                     createdAt = System.currentTimeMillis()
                 )
             )
         }
     }
 
-    /** [context] is required: file tools run against the picked SAF folder. */
-    fun sendMessage(session: Session, text: String, context: Context) {
+    /**
+     * Send a chat message (with any staged images). Returns false when
+     * nothing was sent — empty text, a turn already running, no key, or
+     * (Phase 6, Step 2) images attached to a model that cannot see them
+     * — so the chat screen keeps the input text instead of clearing it.
+     * The vision refusal happens here, before anything is stored or
+     * sent; the runner checks again per attempt, so a fallback switch
+     * to a text-only model is refused there too.
+     *
+     * [context] is required: file tools run against the picked SAF folder.
+     */
+    fun sendMessage(session: Session, text: String, context: Context): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty() || isRunning) return
+        if (trimmed.isEmpty() || isRunning) return false
         val provider = provider(session.providerId)
         val apiKey = keys.getKey(session.providerId)
         if (provider == null) {
             lastError = "Unknown provider ${session.providerId}. Pick a model in Providers."
-            return
+            return false
+        }
+        if (pendingImages.isNotEmpty() && !supportsVision(provider, session.modelId)) {
+            lastError = visionRefusalMessage(provider, session.modelId)
+            return false
         }
         missingCredentialMessage(provider, apiKey)?.let { message ->
             lastError = message
-            return
+            return false
         }
+        // The staged images become this message's images; clear the
+        // staging list now so a second send cannot re-attach them.
+        val attached = pendingImages.toList()
+        pendingImages = emptyList()
         isRunning = true
         lastError = null
         fallbackNotice = null
@@ -1428,7 +2091,13 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 // Insert the user message first, in this coroutine, so the
                 // history read below always includes it.
                 db.messageDao().insert(
-                    Message(sessionId = session.id, role = "user", text = trimmed, createdAt = System.currentTimeMillis())
+                    Message(
+                        sessionId = session.id,
+                        role = "user",
+                        text = trimmed,
+                        imagesJson = if (attached.isEmpty()) null else encodeImageNames(attached),
+                        createdAt = System.currentTimeMillis()
+                    )
                 )
                 db.sessionDao().touch(session.id, System.currentTimeMillis())
                 val history = db.messageDao().getMessages(session.id)
@@ -1436,7 +2105,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 // as the user typed it; only the text sent to the model is
                 // expanded. Works in Plan and Build alike.
                 val expanded = expandCommand(trimmed)
-                runAgentTurn(session, provider, apiKey, history, expanded, context)
+                // Images for this turn (Phase 6, Step 2): the just-saved
+                // files as base64; history messages' images are resolved
+                // inside runAgentTurn through imagesFor.
+                val userImages = loadImagesForNames(attached)
+                runAgentTurn(session, provider, apiKey, history, expanded, context, userImages)
             } catch (e: Exception) {
                 if (e !is kotlinx.coroutines.CancellationException) {
                     lastError = e.message ?: "Agent run failed."
@@ -1445,6 +2118,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 isRunning = false
             }
         }
+        return true
     }
 
     /**
@@ -1472,7 +2146,9 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         apiKey: String?,
         history: List<Message>,
         userMessage: String,
-        context: Context
+        context: Context,
+        /** Images attached to this message (Phase 6, Step 2). */
+        userImages: List<LlmImage> = emptyList()
     ) {
         // Azure (Phase 4): without a resource name there is no URL to
         // call — stop here with a plain message instead of sending a
@@ -1482,14 +2158,32 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             lastError = "Set your Azure resource name first (Providers → Azure OpenAI)."
             return
         }
+        // On-device model (Phase 6, Step 5): without a .task file there
+        // is no engine to call — stop here with a plain message, like
+        // the Azure guard above. (LocalLlmClient throws too, as a
+        // second layer, if any other caller forgets this check.)
+        if (provider.kind == "local" && !localLlm.hasModelFile()) {
+            lastError = "Pick a .task model file first (Providers → On-device model (.task))."
+            return
+        }
+        // The on-device engine's whole context window is 4,096 tokens
+        // (LocalLlmClient.CONTEXT_TOKENS) — compaction thresholds and
+        // the prune step are measured against that, not the 128k remote
+        // default, so a long local session compacts early instead of
+        // overflowing the engine.
+        val contextTokens = if (provider.kind == "local") LocalLlmClient.CONTEXT_TOKENS
+        else Compaction.DEFAULT_CONTEXT_TOKENS
         val project = SafProject(context, Uri.parse(session.projectUri))
         // MCP tools for this turn: fetch any missing enabled-server lists
         // first, then hand the built-ins + MCP tools + skill tool to the
         // same runner. The enabled skills are also listed in the Build
-        // system prompt, so the model knows what it can call.
+        // system prompt, so the model knows what it can call. The
+        // built-ins include the `run` shell tool (Phase 6, Step 1).
         ensureMcpToolsLoaded()
+        val tools = v1Tools(project, context) + mcpTools() + skillTools()
+        activeRunTool = tools.filterIsInstance<RunTool>().firstOrNull()
         val runner = AgentRunner(
-            llm, v1Tools(project) + mcpTools() + skillTools(), fallbackEngine,
+            llm, tools, fallbackEngine,
             // Reasoning effort (Phase 3, Step 2): looked up per attempt
             // inside the runner, for the model actually being called.
             effortFor = { providerId, modelId -> prefs.reasoningEffort(providerId, modelId) },
@@ -1510,19 +2204,34 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         // over 75% of the context window; the summary is sent, not the
         // full old history. Nothing is dropped from Room.
         val summary = if (session.agentMode == "build") {
-            maybeCompact(session, provider, apiKey, history)
+            maybeCompact(session, provider, apiKey, history, contextTokens)
         } else {
             null
         }
         val flow = if (session.agentMode == "plan") {
-            runner.runPlan(provider, session.modelId, apiKey, history, userMessage, project, session.folderName)
+            runner.runPlan(
+                provider, session.modelId, apiKey, history, userMessage, project,
+                session.folderName, userImages = userImages
+            )
         } else {
             runner.runBuild(
                 provider, session.modelId, apiKey, history, userMessage, project,
-                toolContext, toolRule, summary, skills = enabledSkills()
+                toolContext, toolRule, summary, contextTokens = contextTokens, skills = enabledSkills(),
+                // Images (Phase 6, Step 2): this message's images, plus
+                // every history message's images, resolved fresh per
+                // turn so the model re-sees old screenshots with the
+                // history. Remote turns pass none (no image input).
+                userImages = userImages,
+                imagesFor = { msg -> loadImagesForMessage(msg) }
             )
         }
-        val turnFinishedCleanly = collectRunEvents(session, flow, assistantText)
+        val turnFinishedCleanly = try {
+            collectRunEvents(session, flow, assistantText)
+        } finally {
+            // Clear even when the turn is stopped mid-command, so a later
+            // Stop can never kill a command from an old turn.
+            activeRunTool = null
+        }
         refreshExhausted()
         if (assistantText.isNotBlank()) {
             db.messageDao().insert(
@@ -1580,6 +2289,31 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 is AgentEvent.PlanReady -> currentPlan = event.plan
                 is AgentEvent.FileProposal -> {
                     hadProposal = true
+                    if (pendingProposalIsTemplate) {
+                        // The agent proposed a change while a template
+                        // file was waiting for approval. There is only
+                        // one proposal slot, so the agent's proposal
+                        // takes it and the template file is set aside —
+                        // never written, never silently kept queued.
+                        // The session says so plainly.
+                        val setAside = pendingProposal?.path
+                        pendingTemplateFiles = emptyList()
+                        pendingProposalIsTemplate = false
+                        pendingTemplateSessionId = null
+                        if (setAside != null) {
+                            db.messageDao().insert(
+                                Message(
+                                    sessionId = session.id,
+                                    role = "tool",
+                                    text = "Template file “$setAside” was waiting for approval, " +
+                                        "but the agent proposed a change first — the template " +
+                                        "file was set aside and nothing was written. Ask the " +
+                                        "agent to create it, or start a new session with the template.",
+                                    createdAt = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                    }
                     pendingProposal = event.file
                     pendingProposalOld = event.oldContent
                 }
@@ -1673,10 +2407,12 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         session: Session,
         provider: Provider,
         apiKey: String?,
-        history: List<Message>
+        history: List<Message>,
+        /** Context window the thresholds are measured against (4,096 for local). */
+        contextTokens: Int = Compaction.DEFAULT_CONTEXT_TOKENS
     ): String? {
         val estimate = TokenCounter.estimateTokens(history)
-        if (!Compaction.needsSummary(estimate, Compaction.DEFAULT_CONTEXT_TOKENS)) return null
+        if (!Compaction.needsSummary(estimate, contextTokens)) return null
         val already = db.summaryDao().get(session.id)
         val (covered, _) = Compaction.splitForSummary(history)
         val lastCovered = covered.lastOrNull()?.id ?: 0L
@@ -1706,6 +2442,10 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         if (provider.kind == "azure" && prefs.azureResourceName(provider.id).isNullOrBlank()) return null
         // Bedrock without its credential set cannot be called either.
         if (provider.kind == "bedrock" && !keys.hasAwsCredential()) return null
+        // On-device model without a .task file cannot summarise — fall
+        // through to the local summary instead of attempting a slow
+        // engine load that would fail.
+        if (provider.kind == "local" && !localLlm.hasModelFile()) return null
         if (!provider.local && provider.kind != "bedrock" && apiKey.isNullOrBlank()) return null
         val (covered, _) = Compaction.splitForSummary(history)
         if (covered.isEmpty()) return null

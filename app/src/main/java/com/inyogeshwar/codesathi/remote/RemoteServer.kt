@@ -2,8 +2,13 @@ package com.inyogeshwar.codesathi.remote
 
 import com.inyogeshwar.codesathi.agent.Plan
 import com.inyogeshwar.codesathi.agent.PlannedFile
+import com.inyogeshwar.codesathi.data.BackupParseResult
+import com.inyogeshwar.codesathi.data.MAX_BACKUP_BYTES
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.Session
+import com.inyogeshwar.codesathi.data.SessionBackup
+import com.inyogeshwar.codesathi.data.SyncMergeResult
+import com.inyogeshwar.codesathi.data.parseBackup
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
@@ -32,6 +37,14 @@ import kotlinx.serialization.json.Json
  * one agent turn and returns the final reply as JSON. Chat only — no
  * remote file browsing, no remote terminal, no remote approve.
  *
+ * Phase 6, Step 4 adds two sync endpoints for a second device running
+ * CodeSathi: GET /api/sync/export returns every session as the same
+ * versioned backup JSON the file export writes (sessions only — no
+ * keys, no usage records), and POST /api/sync/import takes that JSON
+ * and merges it, newest updatedAt wins. Both need the same Bearer
+ * password as every other call under /api/ — sync reuses the Remote
+ * mode password, it does not invent a second one.
+ *
  * Fixed port [PORT] (8080), also shown on the Remote screen.
  * Auth: every call under /api/ needs `Authorization: Bearer <password>`,
  * compared in constant time against the password in KeyStore
@@ -50,6 +63,18 @@ class RemoteServer(
         suspend fun listSessions(): List<Session>
         suspend fun getSessionMessages(sessionId: String): List<Message>?
         suspend fun runTurn(sessionId: String, message: String): RemoteTurnResult
+        /**
+         * Every session as backup-format JSON text (Phase 6, Step 4):
+         * the same [com.inyogeshwar.codesathi.data.encodeBackup] output
+         * the file export writes, so the other device can pull it.
+         */
+        suspend fun exportBackupText(): String
+        /**
+         * Merge a backup received from another device (Phase 6, Step 4):
+         * newest `updatedAt` wins per session. Returns what was added,
+         * updated and skipped, for the reply.
+         */
+        suspend fun mergeBackup(backup: SessionBackup): SyncMergeResult
     }
 
     companion object {
@@ -160,6 +185,13 @@ class RemoteServer(
                 }
             }
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+            // A backup is at most 10 MB (same cap as a file restore) —
+            // refuse a bigger body before reading it, so a stray huge
+            // request cannot fill memory. Prompt bodies are tiny.
+            if (contentLength > MAX_BACKUP_BYTES) {
+                sendJson(output, 400, json.encodeToString(ErrorDto("That request is too large (over 10 MB).")))
+                return
+            }
             val bodyBytes = if (contentLength > 0) readExact(input, contentLength) else ByteArray(0)
             dispatch(method, rawPath, headers, bodyBytes, output)
         } catch (_: Exception) {
@@ -232,6 +264,28 @@ class RemoteServer(
                 // while it runs; the connection stays open until it finishes.
                 val result = runBlocking { handler.runTurn(request.sessionId, request.message) }
                 sendJson(output, 200, json.encodeToString(result))
+            }
+            // Phase 6, Step 4 — multi-device sync. Both endpoints serve
+            // the backup format (formatVersion 1): export hands out this
+            // device's sessions, import merges the other device's.
+            method == "GET" && rawPath == "/api/sync/export" -> {
+                val text = runBlocking { handler.exportBackupText() }
+                sendJson(output, 200, text)
+            }
+            method == "POST" && rawPath == "/api/sync/import" -> {
+                if (body.size > MAX_BACKUP_BYTES) {
+                    sendJson(output, 400, json.encodeToString(ErrorDto("That backup is too large (over 10 MB) — nothing was imported.")))
+                    return
+                }
+                val backup = when (val parsed = parseBackup(body.decodeToString())) {
+                    is BackupParseResult.Error -> {
+                        sendJson(output, 400, json.encodeToString(ErrorDto(parsed.message)))
+                        return
+                    }
+                    is BackupParseResult.Ok -> parsed.backup
+                }
+                val result = runBlocking { handler.mergeBackup(backup) }
+                sendJson(output, 200, json.encodeToString(result.toResponse()))
             }
             else -> sendJson(output, 404, json.encodeToString(ErrorDto("Not found.")))
         }
@@ -347,6 +401,26 @@ data class RemoteMessageDto(
 
 @Serializable
 data class PromptRequest(val sessionId: String, val message: String)
+
+/**
+ * What a sync import merged (Phase 6, Step 4): how many sessions were
+ * new here, how many were replaced by a newer copy, how many were
+ * skipped, and why the skipped ones were skipped.
+ */
+@Serializable
+data class SyncImportResponse(
+    val added: Int,
+    val updated: Int,
+    val skipped: Int,
+    val reasons: List<String> = emptyList()
+)
+
+private fun SyncMergeResult.toResponse() = SyncImportResponse(
+    added = added,
+    updated = updated,
+    skipped = skipped,
+    reasons = skippedReasons
+)
 
 @Serializable
 data class ErrorDto(val error: String)

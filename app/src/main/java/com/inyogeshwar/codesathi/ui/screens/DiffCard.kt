@@ -21,7 +21,8 @@ import com.inyogeshwar.codesathi.ui.languageForPath
  * Diff card: Approve / Reject before any write.
  *
  * Shared by the Chat screen (agent proposals) and the Editor screen
- * (Phase 3, Step 3 — editor saves). Both go through the same
+ * (Phase 3, Step 3 — editor saves), and by the New Session flow
+ * (Phase 6, Step 3 — template starter files). All three go through the same
  * [com.inyogeshwar.codesathi.ui.AppViewModel.pendingProposal] state
  * and the same Approve / Reject calls, so there is exactly one
  * approval path and one write path in the app.

@@ -78,6 +78,8 @@ class PreferencesStore(private val context: Context) {
         private val COMMAND_DEFAULTS_SEEDED = booleanPreferencesKey("commands_defaults_seeded")
         private val REASONING_EFFORT = stringPreferencesKey("reasoning_effort_json")
         private val AZURE_RESOURCE_NAMES = stringPreferencesKey("azure_resource_names_json")
+        private val LOCAL_MODEL_URI = stringPreferencesKey("local_model_uri")
+        private val LOCAL_MODEL_NAME = stringPreferencesKey("local_model_name")
         private val SKILL_ENABLED = stringPreferencesKey("skill_enabled_json")
         private val VOICE_OUTPUT = booleanPreferencesKey("voice_output_enabled")
         private val REMOTE_ENABLED = booleanPreferencesKey("remote_enabled")
@@ -120,6 +122,11 @@ class PreferencesStore(private val context: Context) {
             "grep" to RULE_ALLOW,
             "write" to RULE_ASK,
             "edit" to RULE_ASK,
+            // A shell can change or delete anything in the folder, so it
+            // asks — nothing runs until the user has approved it at least
+            // once (the rule can then be set to "allow" per the same
+            // Tool permissions screen as every other tool).
+            "run" to RULE_ASK,
             // A skill can lead to writes, so it asks — and any write it
             // proposes still needs the diff-card Approve anyway.
             "skill" to RULE_ASK
@@ -428,6 +435,36 @@ class PreferencesStore(private val context: Context) {
     /** The stored Azure resource name for one provider, or null when unset. */
     suspend fun azureResourceName(providerId: String): String? =
         azureResourceNames.first()[providerId]
+
+    // ---- On-device .task model file (Phase 6, Step 5) ----
+
+    /**
+     * The .task model file the user picked: its SAF URI string plus its
+     * display name. The URI is NOT a secret — it is a file location,
+     * like the project folder URI — so plain DataStore storage is fine.
+     * The persistable read grant is taken when the file is picked (see
+     * AppViewModel.setLocalModelFile); the engine copies the file into
+     * app-private storage from this URI (see LocalLlmClient). No model
+     * file is ever bundled with the app.
+     */
+    val localModelUri: Flow<String?> = context.dataStore.data.map { it[LOCAL_MODEL_URI] }
+    val localModelName: Flow<String?> = context.dataStore.data.map { it[LOCAL_MODEL_NAME] }
+
+    /** Remember a picked .task file (URI + display name). */
+    suspend fun setLocalModel(uri: String, name: String) {
+        context.dataStore.edit {
+            it[LOCAL_MODEL_URI] = uri
+            it[LOCAL_MODEL_NAME] = name
+        }
+    }
+
+    /** Forget the picked file (the cached copy is dropped by LocalLlmClient). */
+    suspend fun clearLocalModel() {
+        context.dataStore.edit {
+            it.remove(LOCAL_MODEL_URI)
+            it.remove(LOCAL_MODEL_NAME)
+        }
+    }
 
     /**
      * Set the Azure resource name for one provider. Returns false when the

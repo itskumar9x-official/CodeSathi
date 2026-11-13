@@ -43,6 +43,14 @@ data class Message(
     val text: String,
     /** Optional JSON describing a tool call (name, args, result) — kept for history. */
     val toolJson: String? = null,
+    /**
+     * Attached images (Phase 6, Step 2): a JSON array of file NAMES in
+     * getFilesDir()/images/ (see [com.inyogeshwar.codesathi.agent.ImageStore]),
+     * e.g. `["img_….jpg"]`. Only names — never bytes, never a content
+     * URI — live in Room; the image files themselves are app-private and
+     * are never written into a session backup. Null / missing = no images.
+     */
+    val imagesJson: String? = null,
     val createdAt: Long
 )
 
@@ -304,7 +312,7 @@ interface CachedModelDao {
 
 @Database(
     entities = [Session::class, Message::class, FavouriteModel::class, SessionSummary::class, CachedModel::class, UsageRecord::class],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -362,6 +370,20 @@ val MIGRATION_3_4 = object : androidx.room.migration.Migration(3, 4) {
     override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
         db.execSQL(
             "ALTER TABLE `sessions` ADD COLUMN `pinned` INTEGER NOT NULL DEFAULT 0"
+        )
+    }
+}
+
+/**
+ * v4 → v5 (Phase 6, Step 2): adds the imagesJson column to messages —
+ * a JSON array of attached-image file names (see ImageStore). Nullable
+ * with no default, so existing messages simply have no images; no other
+ * table is touched and no message text moves or is lost.
+ */
+val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL(
+            "ALTER TABLE `messages` ADD COLUMN `imagesJson` TEXT"
         )
     }
 }

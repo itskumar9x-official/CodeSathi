@@ -2,9 +2,12 @@ package com.inyogeshwar.codesathi.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,10 +15,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreVert
@@ -43,20 +49,29 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.inyogeshwar.codesathi.agent.ImageStore
 import com.inyogeshwar.codesathi.agent.VoiceInput
+import com.inyogeshwar.codesathi.agent.decodeImageNames
 import com.inyogeshwar.codesathi.agent.mcpToolName
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.TokenCounter
+import com.inyogeshwar.codesathi.data.supportsVision
 import com.inyogeshwar.codesathi.ui.AppViewModel
 import com.inyogeshwar.codesathi.ui.MarkdownText
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Chat screen (Steps 2 + 3, same screen).
@@ -148,6 +163,17 @@ fun ChatScreen(
         }
     }
 
+    // Images (Phase 6, Step 2): attach up to 3 pictures to a message.
+    // The system picker (SAF, image/*) returns content URIs; the
+    // ViewModel downscales + JPEG re-encodes each one into app-private
+    // storage before it is shown or sent.
+    val pendingImages = viewModel.pendingImages
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        if (uris.isNotEmpty()) viewModel.addPendingImages(context, uris)
+    }
+
     if (session == null) {
         Column(modifier = Modifier.fillMaxSize().padding(24.dp)) {
             Text("Session not found.", style = MaterialTheme.typography.titleLarge)
@@ -174,10 +200,17 @@ fun ChatScreen(
     val isPlan = session.agentMode == "plan"
     val provider = viewModel.provider(session.providerId)
     val needsKey = provider != null && !provider.local && !viewModel.hasApiKey(session.providerId)
+    // Warn before sending when the current model cannot see images
+    // (Phase 6, Step 2): the picker warns, and sendMessage refuses, so
+    // a vision request never goes to a text-only model.
+    val visionBlocked = pendingImages.isNotEmpty() && provider != null &&
+        !supportsVision(provider, session.modelId)
     val tokenEstimate = viewModel.tokenEstimate(messages)
     // Reasoning effort for this session's model (Phase 3, Step 2), if set.
+    // The on-device engine takes no effort field (Phase 6, Step 5), so no
+    // effort label is shown for a local model even when one is stored.
     val efforts by viewModel.reasoningEfforts.collectAsState()
-    val effort = efforts["${session.providerId}/${session.modelId}"]
+    val effort = if (provider?.kind == "local") null else efforts["${session.providerId}/${session.modelId}"]
 
     Scaffold(
         topBar = {
@@ -303,7 +336,7 @@ fun ChatScreen(
             }
             if (showToolRules) {
                 ToolRulesDialog(
-                    tools = listOf("read", "glob", "grep", "write", "edit") + mcpToolNames,
+                    tools = listOf("read", "glob", "grep", "write", "edit", "run") + mcpToolNames,
                     rules = toolRules,
                     onSetRule = { tool, rule -> viewModel.setToolRule(tool, rule) },
                     onClose = { showToolRules = false }
@@ -340,8 +373,11 @@ fun ChatScreen(
                 )
             }
 
-            // Diff card: Approve / Reject before any write.
-            viewModel.pendingProposal?.let { proposal ->
+            // Diff card: Approve / Reject before any write. A template
+            // proposal (Phase 6, Step 3) shows only in its own session's
+            // chat — see shouldShowProposalFor — so a template chosen
+            // for another session never offers its file here.
+            viewModel.pendingProposal?.takeIf { viewModel.shouldShowProposalFor(session.id) }?.let { proposal ->
                 DiffCard(
                     proposal = proposal,
                     oldContent = viewModel.pendingProposalOld,
@@ -367,10 +403,60 @@ fun ChatScreen(
                     }
                 }
             }
+            // Attached images (Phase 6, Step 2): thumbnails of the staged
+            // images, with × to remove one before sending.
+            if (pendingImages.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    pendingImages.forEach { fileName ->
+                        PendingImageThumbnail(
+                            fileName = fileName,
+                            onRemove = { viewModel.removePendingImage(fileName) }
+                        )
+                    }
+                }
+            }
+            // Vision warning: the current model cannot see the attached
+            // images — pick a vision model in Providers, or remove the
+            // image before sending. Send is refused while this shows.
+            if (visionBlocked) {
+                Text(
+                    "This model cannot see images — pick a vision model in Providers, " +
+                        "or remove the image before sending.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+            }
+            viewModel.imageNote?.let { note ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        note,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedButton(onClick = { viewModel.dismissImageNote() }) {
+                        Text("OK")
+                    }
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Attach image: system picker (image/*), up to 3 per message.
+                IconButton(
+                    onClick = { imagePickerLauncher.launch("image/*") },
+                    enabled = !viewModel.isRunning
+                ) {
+                    Icon(Icons.Filled.AddPhotoAlternate, contentDescription = "Attach image")
+                }
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
@@ -395,8 +481,10 @@ fun ChatScreen(
                 } else {
                     IconButton(onClick = {
                         val text = input
-                        input = ""
-                        viewModel.sendMessage(session, text, context)
+                        // Only clear the input when the message was
+                        // actually sent — a vision refusal keeps the text
+                        // (and the staged images) in place.
+                        if (viewModel.sendMessage(session, text, context)) input = ""
                     }) {
                         Icon(Icons.Filled.Send, contentDescription = "Send")
                     }
@@ -451,6 +539,19 @@ private fun MessageBubble(msg: Message) {
                 },
                 style = MaterialTheme.typography.labelMedium
             )
+            // Attached images (Phase 6, Step 2): thumbnails above the
+            // message text, so a screenshot stays visible in the history.
+            val imageNames = remember(msg.imagesJson) { decodeImageNames(msg.imagesJson) }
+            if (imageNames.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    imageNames.forEach { fileName ->
+                        StoredImageThumbnail(fileName = fileName)
+                    }
+                }
+            }
             // Assistant replies render as Markdown (headings, bold, code
             // blocks, lists, links); user and tool messages stay plain.
             if (msg.role == "assistant") MarkdownText(msg.text)
@@ -537,6 +638,41 @@ private fun PlanCard(
                 "Nothing is written to disk until you approve.",
                 style = MaterialTheme.typography.bodySmall
             )
+        }
+    }
+}
+
+/**
+ * One stored image as a small thumbnail, decoded off the main thread
+ * (Phase 6, Step 2). A missing or undecodable file shows nothing —
+ * the message text still renders, and the turn still sends the text.
+ */
+@Composable
+private fun StoredImageThumbnail(fileName: String, size: Dp = 72.dp) {
+    val context = LocalContext.current
+    val bitmap by produceState<Bitmap?>(initialValue = null, fileName) {
+        value = withContext(Dispatchers.IO) { ImageStore.loadThumbnailBitmap(context, fileName) }
+    }
+    bitmap?.let {
+        Image(
+            bitmap = it.asImageBitmap(),
+            contentDescription = "Attached image",
+            modifier = Modifier.size(size),
+            contentScale = ContentScale.Crop
+        )
+    }
+}
+
+/** A staged image above the input, with × to remove it before sending. */
+@Composable
+private fun PendingImageThumbnail(fileName: String, onRemove: () -> Unit) {
+    Box {
+        StoredImageThumbnail(fileName = fileName, size = 72.dp)
+        IconButton(
+            onClick = onRemove,
+            modifier = Modifier.size(24.dp).align(Alignment.TopEnd)
+        ) {
+            Icon(Icons.Filled.Close, contentDescription = "Remove image")
         }
     }
 }

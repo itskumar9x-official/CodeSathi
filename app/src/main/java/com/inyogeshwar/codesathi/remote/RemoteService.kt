@@ -15,6 +15,8 @@ import com.inyogeshwar.codesathi.MainActivity
 import com.inyogeshwar.codesathi.R
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.Session
+import com.inyogeshwar.codesathi.data.SessionBackup
+import com.inyogeshwar.codesathi.data.SyncMergeResult
 import com.inyogeshwar.codesathi.ui.AppViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -106,6 +108,12 @@ class RemoteService : Service() {
 
             override suspend fun runTurn(sessionId: String, message: String): RemoteTurnResult =
                 vm.runRemoteTurn(sessionId, message, this@RemoteService)
+
+            // Phase 6, Step 4 — multi-device sync endpoints.
+            override suspend fun exportBackupText(): String = vm.exportBackupText()
+
+            override suspend fun mergeBackup(backup: SessionBackup): SyncMergeResult =
+                vm.mergeSyncedSessions(backup)
         }
         val remoteServer = RemoteServer(handler) { app.keyStore.getRemotePassword() }
         if (!remoteServer.start()) {

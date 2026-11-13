@@ -8,6 +8,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.inyogeshwar.codesathi.CodeSathiApp
+import com.inyogeshwar.codesathi.agent.TERMINAL_MAX_LINES
 import com.inyogeshwar.codesathi.agent.TerminalFolder
 import com.inyogeshwar.codesathi.agent.TerminalLine
 import com.inyogeshwar.codesathi.agent.TerminalLineKind
@@ -40,8 +41,9 @@ import kotlinx.coroutines.withContext
 class TerminalViewModel(private val app: CodeSathiApp) : ViewModel() {
 
     companion object {
-        /** Keep only the last ~2000 lines. */
-        const val MAX_LINES = 2000
+        /** Keep only the last [TERMINAL_MAX_LINES] lines (shared with the
+         *  agent's `run` tool, Phase 6 Step 1 — one cap, two callers). */
+        const val MAX_LINES = TERMINAL_MAX_LINES
         /** Past commands kept for tap-to-re-run (most recent first). */
         const val MAX_HISTORY = 20
 

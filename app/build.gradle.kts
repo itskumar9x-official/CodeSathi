@@ -113,6 +113,18 @@ dependencies {
     // warning in logcat). See agent/Git.kt for the wrapper.
     implementation("org.eclipse.jgit:org.eclipse.jgit:7.8.1.202611041320-r")
 
+    // MediaPipe LLM Inference (Phase 6, Step 5) — on-device .task models.
+    // com.google.mediapipe:tasks-genai:0.10.27 is the exact version
+    // Google's own Android quickstart pins (developers.google.com/edge/
+    // mediapipe/solutions/genai/llm_inference/android); the POM exists on
+    // Google Maven. 0.10.35 is newer in the metadata, but the docs pin
+    // 0.10.27, so the docs version is used — the API shape in
+    // agent/LocalLlm.kt (LlmInferenceOptions, createFromOptions,
+    // generateResponseAsync + setResultListener) is the one those docs
+    // show. Google lists this API as maintenance-only and recommends
+    // LiteRT-LM for new projects — see README before upgrading.
+    implementation("com.google.mediapipe:tasks-genai:0.10.27")
+
     // NIO desugar library (Phase 2, Step 8 fix) — backports java.nio.file
     // for JGit on API 24/25. 2.0.1 is the version cited in Android's docs
     // table; the artifact lives on Google Maven, not Maven Central.
