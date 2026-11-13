@@ -15,7 +15,7 @@ import java.net.URL
 data class Provider(
     val id: String,
     val name: String,
-    val kind: String, // "openai" | "anthropic"
+    val kind: String, // "openai" | "anthropic" | "azure" | "bedrock"
     val baseUrl: String,
     val models: List<String> = emptyList(),
     val topPick: Boolean = false,
@@ -24,6 +24,17 @@ data class Provider(
     /** "providerId/modelId" — the stable key used for favourites and sessions. */
     fun modelKey(modelId: String) = "$id/$modelId"
 }
+
+/**
+ * Azure OpenAI REST API version pinned for chat completions and deployment
+ * listing (Phase 4). 2024-10-21 is a stable Azure version whose chat
+ * completions shape is the OpenAI one; verified against Azure's docs and
+ * the deployment URL form
+ * https://{resource}.openai.azure.com/openai/deployments/{deployment}/
+ * chat/completions?api-version=2024-10-21. Shared by [LlmClient] and the
+ * deployments list fetch below so the two can never drift apart.
+ */
+const val AZURE_API_VERSION = "2024-10-21"
 
 @Serializable
 private data class CatalogFile(
@@ -85,23 +96,64 @@ class ProviderRepository(
      * must show the error and never pretend the fetch worked. Returns an
      * empty list with an error when there is neither a network result nor
      * a cached list.
+     *
+     * Azure (Phase 4): there is no /models list — deployments are listed
+     * instead, GET https://{resource}.openai.azure.com/openai/deployments?
+     * api-version=[AZURE_API_VERSION] with the `api-key` header. Without a
+     * resource name there is no URL to call at all, so the fetch refuses
+     * with a plain message instead of guessing a host.
+     * Bedrock (Phase 4): no /models list exists on the runtime API
+     * (ListFoundationModels is a separate SigV4-signed control-plane call
+     * this client does not make) — the bundled model and manual entry
+     * cover first use, and the error says so plainly.
      */
-    suspend fun refreshModels(provider: Provider, apiKey: String?): ModelFetchResult =
+    suspend fun refreshModels(
+        provider: Provider,
+        apiKey: String?,
+        azureResourceName: String? = null
+    ): ModelFetchResult =
         withContext(Dispatchers.IO) {
             val cached = cachedModels(provider.id)
+            if (provider.kind == "bedrock") {
+                return@withContext ModelFetchResult(
+                    models = cached,
+                    fromCache = true,
+                    error = "Bedrock has no /models list — use the bundled model or type a model id by hand."
+                )
+            }
+            if (provider.kind == "azure" && azureResourceName.isNullOrBlank()) {
+                return@withContext ModelFetchResult(
+                    models = cached,
+                    fromCache = true,
+                    error = "Set the Azure resource name first (Providers → Azure OpenAI)."
+                )
+            }
             try {
-                val url = URL(provider.baseUrl.trimEnd('/') + "/models")
+                val url = when (provider.kind) {
+                    "azure" -> URL(
+                        "https://${azureResourceName!!.trim()}.openai.azure.com" +
+                            "/openai/deployments?api-version=$AZURE_API_VERSION"
+                    )
+                    else -> URL(provider.baseUrl.trimEnd('/') + "/models")
+                }
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     connectTimeout = 15_000
                     readTimeout = 30_000
                     setRequestProperty("Accept", "application/json")
                     setRequestProperty("User-Agent", "CodeSathi/1.0 (CodeSathi; Android)")
-                    if (provider.kind == "anthropic") {
-                        setRequestProperty("anthropic-version", "2023-06-01")
-                        if (!apiKey.isNullOrBlank()) setRequestProperty("x-api-key", apiKey)
-                    } else if (!apiKey.isNullOrBlank()) {
-                        setRequestProperty("Authorization", "Bearer $apiKey")
+                    when (provider.kind) {
+                        "anthropic" -> {
+                            setRequestProperty("anthropic-version", "2023-06-01")
+                            if (!apiKey.isNullOrBlank()) setRequestProperty("x-api-key", apiKey)
+                        }
+                        // Azure API keys go in the `api-key` header, never Bearer.
+                        "azure" -> {
+                            if (!apiKey.isNullOrBlank()) setRequestProperty("api-key", apiKey)
+                        }
+                        else -> {
+                            if (!apiKey.isNullOrBlank()) setRequestProperty("Authorization", "Bearer $apiKey")
+                        }
                     }
                 }
                 try {

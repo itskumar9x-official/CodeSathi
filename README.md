@@ -79,7 +79,7 @@ Compose BOM 2024.01.00, Room 2.6.1.
    verification runs (exists, non-empty, basic HTML sanity) and shows
    "✓ Verified: …".
 4. **Providers + model picker** — a bundled `providers.json` written for
-   this app with 208 providers (the 12 v1 starters plus direct labs,
+   this app with 206 providers (the 12 v1 starters plus direct labs,
    inference hosts, gateways and 30 local servers — Anthropic, OpenAI,
    OpenRouter, Google Gemini, Groq, DeepSeek, xAI, Mistral, Together,
    Ollama local, LM Studio local, TokenHarbor, and 196 more), each with
@@ -132,7 +132,12 @@ Compose BOM 2024.01.00, Room 2.6.1.
   is never duplicated.
 - **Limit kinds** — quota / long limit is HTTP 402 or a response body
   that mentions quota; a plain HTTP 429 is a short rate limit. The kind
-  is shown in the switch notice; both mark the key exhausted.
+  is shown in the switch notice; both mark the key exhausted. Bedrock
+  throttling is a 429 too, so it maps to the same RATE kind — no new
+  failure kind was invented. Bedrock has one credential set, not a key
+  list, so it gets a single keyless attempt per turn and the synthetic
+  key id "aws" lets a throttled Bedrock model be marked exhausted until
+  midnight like any other provider's key.
 - **Exhaustion resets at midnight** — a key marked exhausted is skipped
   until the start of the next local day. Exhaustion is tracked by key
   id (a SHA-256 prefix, never the key value) in DataStore, and expired
@@ -684,12 +689,25 @@ Compose BOM 2024.01.00, Room 2.6.1.
   target is reached: every remote base URL was probed live with
   `GET {baseUrl}/models` (no auth; 200/401/403 = reachable), 6 dead /
   duplicate entries were removed, 10 base URLs were corrected and 62
-  providers were added. Two entries still need a fix before first use —
-  Azure OpenAI (replace `YOUR-RESOURCE` with your resource name) and AWS
-  Bedrock (needs SigV4 signing, not a plain API key) — and two are
-  uncertain (LangDB returned 503 when probed; Galadriel's probe was
-  blocked by this machine's egress proxy, URL corrected from official
-  docs). Details in the catalog's `note` field.
+  providers were added. Phase 4 (2026-11-13) fixed the four remaining
+  entries: LangDB was removed (its API host returned 503 on every path,
+  probed twice — and the correct form is project-scoped, which a flat
+  catalog cannot express) and Galadriel was removed (its API host
+  completes TLS then sends an empty reply, and an independent sweep
+  lists its inference API as discontinued); Azure OpenAI now works via
+  a resource-name field in the provider card (kind `azure`, deployment
+  URL with api-version 2024-10-21, `api-key` header) and AWS Bedrock
+  now works via SigV4-signed Converse API calls with an access key id,
+  secret access key and region from the provider card (kind `bedrock`).
+  The catalog is now 206 providers. Details in the catalog's `note` field.
+  Bedrock known limits (Phase 4, honest): Converse is non-streaming —
+  the reply arrives whole and is shown as one chunk, never faked as a
+  stream; Bedrock has no `/models` list, so the bundled model or a
+  hand-typed model id is the way in; the reasoning-effort picker does
+  nothing for Bedrock (Converse has no effort field); tool results go
+  back paired by toolUse id only when every call of the turn carried
+  an id — a mixed turn (native + fenced calls) falls back to the plain
+  combined text, exactly as other providers get.
 
 ## Acceptance tests (from the checklist)
 
@@ -702,23 +720,24 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (60 files, ~14,584 lines total; 11,677 lines of Kotlin)
+CodeSathi/  (61 files, ~15,505 lines total; 12,522 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
-  assets/providers.json          # 208-provider catalog (ours, Phase 2 Step 2 + live-check)
+  assets/providers.json          # 206-provider catalog (ours, Phase 2 Step 2 + live-check + Phase 4 fixes)
   assets/skills/                 # Built-in skills (Step 4): code-review.md, write-tests.md, explain-code.md
   java/com/inyogeshwar/codesathi/
     MainActivity.kt              # NavHost (156)
     CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (35)
     data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel (177)
-    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model (467)
-    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, masked display (237)
-    data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache (181)
+    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name (515)
+    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, AWS Bedrock credentials, masked display (308)
+    data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache, Azure deployments list, Bedrock note (233)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
     agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries (183)
     agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
-    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only) (287)
-    agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset (143)
+    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming) (509)
+    agent/BedrockSigner.kt       # Hand-rolled AWS SigV4 signing for Bedrock Converse, model-id percent-encoding (130)
+    agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset, Bedrock single keyless attempt (157)
     agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call (230)
     agent/McpTools.kt            # MCP tools as normal Tool objects, mcp:<server>:<tool> names (50)
     agent/Skills.kt              # Skill Markdown parse/store, SkillStore, skill tool (264)
@@ -727,8 +746,8 @@ app/src/main/
     agent/Git.kt                 # JGit wrapper: status / stage / commit / push / pull / branches / clone (262)
     remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080 (474)
     remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (192)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort (553)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions (1397)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing (644)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials (1479)
     ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (202)
     ui/GitViewModel.kt           # Git state: folder, status, one op at a time (306)
     ui/EditorViewModel.kt        # Editor state: tabs, in-memory edits, binary checks, save proposals, folder tree (576)
@@ -741,7 +760,7 @@ app/src/main/
     ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog, fallback notice, mic + voice output, command suggestions, effort label (542)
     ui/screens/DiffCard.kt           # Shared Approve/Reject diff card (Chat + Editor), syntax-highlighted (75)
     ui/screens/FolderTree.kt         # Folder tree browser for the Editor (243)
-    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, reasoning-effort chips (470)
+    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, reasoning-effort chips, Azure resource name, AWS Bedrock credentials (602)
     ui/screens/McpScreen.kt          # MCP servers: add / enable / delete, tools, per-tool rules (273)
     ui/screens/SkillsScreen.kt       # Skills: list / enable / edit / add / delete / reset (283)
     ui/screens/CommandsScreen.kt     # Custom commands: add / enable / edit / delete (279)

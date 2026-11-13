@@ -71,6 +71,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     val fallbackChain by viewModel.fallbackChain.collectAsState()
     // Reasoning effort per model (Phase 3, Step 2): "providerId/modelId" → low/medium/high.
     val efforts by viewModel.reasoningEfforts.collectAsState()
+    // Azure resource names (Phase 4): "providerId" → resource name.
+    val azureResourceNames by viewModel.azureResourceNames.collectAsState()
     val exhaustedModelKeys = viewModel.exhaustedModelKeys
     // Read for subscription only: KeyStore is not a Flow, so the key lists
     // below are re-read whenever this version bumps (add / delete key).
@@ -256,6 +258,29 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                         } else {
                             "Default model set: ${provider.name} / ${modelId.trim()}"
                         }
+                    },
+                    azureResourceName = azureResourceNames[provider.id],
+                    onSaveAzureResourceName = { name ->
+                        val ok = viewModel.saveAzureResourceName(provider.id, name)
+                        keySavedNote = if (ok) {
+                            "Azure resource name saved for ${provider.name}."
+                        } else {
+                            "That name doesn't match Azure's rules (3–24 chars, lowercase letters, digits, hyphens)."
+                        }
+                    },
+                    awsAccessKeyIdMasked = viewModel.awsAccessKeyIdMasked(),
+                    awsRegion = viewModel.awsRegion(),
+                    onSaveAwsCredential = { accessKeyId, secret, region ->
+                        val ok = viewModel.saveAwsCredential(accessKeyId, secret, region)
+                        keySavedNote = if (ok) {
+                            "AWS credentials saved for ${provider.name} (encrypted on this device)."
+                        } else {
+                            "The access key id and secret access key can't be blank."
+                        }
+                    },
+                    onRemoveAwsCredential = {
+                        viewModel.removeAwsCredential()
+                        keySavedNote = "AWS credentials removed for ${provider.name}."
                     }
                 )
             }
@@ -353,9 +378,25 @@ private fun ProviderCard(
     fetchError: String?,
     onLoadCached: () -> Unit,
     onRefresh: () -> Unit,
-    onUseManualModel: (String) -> Unit
+    onUseManualModel: (String) -> Unit,
+    /** The saved Azure resource name, or null when unset. Only used for kind == "azure". */
+    azureResourceName: String? = null,
+    /** Save a new Azure resource name (the screen sets the note). Only used for kind == "azure". */
+    onSaveAzureResourceName: (String) -> Unit = {},
+    /** Masked AWS access key id, or null when unset. Only used for kind == "bedrock". */
+    awsAccessKeyIdMasked: String? = null,
+    /** Stored AWS region (us-east-1 when unset). Only used for kind == "bedrock". */
+    awsRegion: String = "us-east-1",
+    /** Save an AWS credential set (the screen sets the note). Only used for kind == "bedrock". */
+    onSaveAwsCredential: (String, String, String) -> Unit = { _, _, _ -> },
+    /** Delete the AWS credential set. Only used for kind == "bedrock". */
+    onRemoveAwsCredential: () -> Unit = {}
 ) {
     var manualModel by remember { mutableStateOf("") }
+    var azureInput by remember { mutableStateOf("") }
+    var awsAccessKeyIdInput by remember { mutableStateOf("") }
+    var awsSecretInput by remember { mutableStateOf("") }
+    var awsRegionInput by remember { mutableStateOf("") }
     // Show the cached fetched list as soon as the card opens.
     if (expanded) {
         LaunchedEffect(provider.id) { onLoadCached() }
@@ -366,12 +407,16 @@ private fun ProviderCard(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(provider.name, style = MaterialTheme.typography.titleMedium)
                     Text(provider.baseUrl, style = MaterialTheme.typography.bodySmall)
-                    Text(
-                        if (provider.local) "Local — no API key needed"
-                        else if (keyCount > 0) "$keyCount API key${if (keyCount == 1) "" else "s"} saved ✓"
-                        else "No API key yet",
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    // Bedrock has no API key — its status is the AWS
+                    // credential set (Phase 4), not a key count.
+                    val keyStatus = when {
+                        provider.local -> "Local — no API key needed"
+                        provider.kind == "bedrock" ->
+                            if (awsAccessKeyIdMasked != null) "AWS credentials saved ✓" else "No AWS credentials yet"
+                        keyCount > 0 -> "$keyCount API key${if (keyCount == 1) "" else "s"} saved ✓"
+                        else -> "No API key yet"
+                    }
+                    Text(keyStatus, style = MaterialTheme.typography.bodySmall)
                 }
                 OutlinedButton(onClick = onExpand) { Text(if (expanded) "Hide" else "Show") }
             }
@@ -442,7 +487,90 @@ private fun ProviderCard(
                         onAddFallback = { onAddFallback(model) }
                     )
                 }
-                if (!provider.local) {
+                // Azure resource name (Phase 4): the {resource} in
+                // https://{resource}.openai.azure.com. Chat won't run
+                // until this is set, and the model id is the deployment
+                // name — see LlmClient. Not a secret, so it is shown.
+                if (provider.kind == "azure") {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Azure resource name", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        "Your Azure OpenAI resource name — the {resource} in https://{resource}.openai.azure.com. The model id you pick is the deployment name. Chat won't run until this is set.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (azureResourceName != null) {
+                        Text("Saved: $azureResourceName", style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedTextField(
+                        value = azureInput,
+                        onValueChange = { azureInput = it },
+                        label = { Text("Resource name") },
+                        placeholder = { Text("e.g. my-resource") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { onSaveAzureResourceName(azureInput); azureInput = "" },
+                            enabled = azureInput.isNotBlank()
+                        ) { Text("Save resource name") }
+                    }
+                }
+                // AWS credentials (Phase 4): Bedrock has no API key — it
+                // needs an access key id, a secret access key and a region,
+                // signed per request (SigV4). The secret is never shown;
+                // the access key id is masked like other keys.
+                if (provider.kind == "bedrock") {
+                    Spacer(Modifier.height(8.dp))
+                    Text("AWS credentials", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        "Bedrock does not use an API key. Enter the access key id, secret access key and region of an AWS account with bedrock:InvokeModel permission. Requests are signed (SigV4) and sent to the Converse API.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (awsAccessKeyIdMasked != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Access key id: $awsAccessKeyIdMasked", modifier = Modifier.weight(1f))
+                            OutlinedButton(onClick = onRemoveAwsCredential) { Text("Delete") }
+                        }
+                        Text("Region: $awsRegion", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text("No AWS credentials saved yet.", style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedTextField(
+                        value = awsAccessKeyIdInput,
+                        onValueChange = { awsAccessKeyIdInput = it },
+                        label = { Text("Access key id") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = awsSecretInput,
+                        onValueChange = { awsSecretInput = it },
+                        label = { Text("Secret access key") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = awsRegionInput,
+                        onValueChange = { awsRegionInput = it },
+                        label = { Text("Region") },
+                        placeholder = { Text(awsRegion) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                onSaveAwsCredential(awsAccessKeyIdInput, awsSecretInput, awsRegionInput)
+                                awsAccessKeyIdInput = ""
+                                awsSecretInput = ""
+                                awsRegionInput = ""
+                            },
+                            enabled = awsAccessKeyIdInput.isNotBlank() && awsSecretInput.isNotBlank()
+                        ) { Text("Save AWS credentials") }
+                    }
+                }
+                if (!provider.local && provider.kind != "bedrock") {
                     Spacer(Modifier.height(8.dp))
                     Text("API keys", style = MaterialTheme.typography.labelMedium)
                     if (apiKeys.isEmpty()) {

@@ -36,6 +36,19 @@ class KeyStore(context: Context) {
     /** One stored key: its stable id plus the value (value never leaves this class). */
     data class StoredKey(val id: String, val value: String)
 
+    /**
+     * AWS credentials for Bedrock (Phase 4): an access key id, a secret
+     * access key and a region. Only ever stored here, encrypted — never
+     * in DataStore / Room / providers.json / a URL / a log. The access
+     * key id may be shown masked (like other keys); the secret is never
+     * displayed anywhere.
+     */
+    data class AwsCredentials(
+        val accessKeyId: String,
+        val secretAccessKey: String,
+        val region: String
+    )
+
     /** Masked view for the UI — the value is never shown. */
     data class KeyDisplay(val id: String, val masked: String)
 
@@ -139,10 +152,68 @@ class KeyStore(context: Context) {
     fun remotePasswordMasked(): String? =
         getRemotePassword()?.let { maskKey(it) }
 
+    // ---- AWS Bedrock credentials (Phase 4) ----
+
+    /**
+     * Save the AWS credential set for Bedrock. Returns false when the
+     * access key id or the secret is blank (nothing is stored). A blank
+     * region means the default, us-east-1. The region is not validated
+     * beyond that — a wrong region surfaces as a Bedrock error, and new
+     * AWS regions appear over time.
+     */
+    fun saveAwsCredential(accessKeyId: String, secretAccessKey: String, region: String): Boolean {
+        val id = accessKeyId.trim()
+        val secret = secretAccessKey.trim()
+        val reg = region.trim().ifBlank { DEFAULT_AWS_REGION }
+        if (id.isEmpty() || secret.isEmpty()) return false
+        prefs.edit()
+            .putString(AWS_ACCESS_KEY_ID_KEY, id)
+            .putString(AWS_SECRET_ACCESS_KEY_KEY, secret)
+            .putString(AWS_REGION_KEY, reg)
+            .apply()
+        return true
+    }
+
+    /** The full AWS credential set, or null when any part is missing. */
+    fun awsCredentials(): AwsCredentials? {
+        val id = getAwsAccessKeyId() ?: return null
+        val secret = getAwsSecretAccessKey() ?: return null
+        return AwsCredentials(id, secret, getAwsRegion())
+    }
+
+    fun getAwsAccessKeyId(): String? =
+        prefs.getString(AWS_ACCESS_KEY_ID_KEY, null)?.takeIf { it.isNotBlank() }
+
+    fun getAwsSecretAccessKey(): String? =
+        prefs.getString(AWS_SECRET_ACCESS_KEY_KEY, null)?.takeIf { it.isNotBlank() }
+
+    /** Stored region, or the default us-east-1 when none was saved. */
+    fun getAwsRegion(): String =
+        prefs.getString(AWS_REGION_KEY, null)?.takeIf { it.isNotBlank() } ?: DEFAULT_AWS_REGION
+
+    fun hasAwsCredential(): Boolean = awsCredentials() != null
+
+    fun removeAwsCredential() {
+        prefs.edit()
+            .remove(AWS_ACCESS_KEY_ID_KEY)
+            .remove(AWS_SECRET_ACCESS_KEY_KEY)
+            .remove(AWS_REGION_KEY)
+            .apply()
+    }
+
+    /** Masked access key id for the UI — the secret is never displayed. */
+    fun awsAccessKeyIdMasked(): String? =
+        getAwsAccessKeyId()?.let { maskKey(it) }
+
     private companion object {
         const val REMOTE_PASSWORD_KEY = "remote_password"
         const val GIT_USERNAME_KEY = "git_username"
         const val GIT_TOKEN_KEY = "git_token"
+        const val AWS_ACCESS_KEY_ID_KEY = "aws_access_key_id"
+        const val AWS_SECRET_ACCESS_KEY_KEY = "aws_secret_access_key"
+        const val AWS_REGION_KEY = "aws_region"
+        /** The region used when the user leaves the region field blank. */
+        const val DEFAULT_AWS_REGION = "us-east-1"
     }
 
     // ---- Git remote credential (Phase 2, Step 8) ----

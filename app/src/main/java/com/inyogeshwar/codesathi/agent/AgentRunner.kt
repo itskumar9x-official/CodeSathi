@@ -1,5 +1,6 @@
 package com.inyogeshwar.codesathi.agent
 
+import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Message
 import com.inyogeshwar.codesathi.data.Provider
 import kotlinx.coroutines.CancellationException
@@ -55,7 +56,16 @@ sealed class AgentEvent {
 }
 
 /** One tool call, from the model's native `tool_calls` or a ```tool block. */
-private data class ParsedToolCall(val name: String, val args: Map<String, String>)
+private data class ParsedToolCall(
+    val name: String,
+    val args: Map<String, String>,
+    /**
+     * The provider-assigned id of this call (Bedrock Converse toolUseId).
+     * Null for fenced ```tool calls, which carry no id — and for native
+     * calls from providers that assign none.
+     */
+    val id: String? = null
+)
 
 /**
  * The v1 agent loop.
@@ -121,7 +131,21 @@ class AgentRunner(
      * never the first attempt's. Null means no effort is ever sent
      * (the plain client path, e.g. the approve-only runner).
      */
-    private val effortFor: (suspend (providerId: String, modelId: String) -> String?)? = null
+    private val effortFor: (suspend (providerId: String, modelId: String) -> String?)? = null,
+    /**
+     * Azure OpenAI resource name for one provider id (Phase 4). Looked up
+     * fresh for EVERY attempt, like [effortFor] — a fallback switch to
+     * Azure must use Azure's resource name, never another provider's.
+     * Null means the plain client path (no Azure provider in the run).
+     */
+    private val azureResourceFor: (suspend (providerId: String) -> String?)? = null,
+    /**
+     * AWS credentials for Bedrock (Phase 4). Looked up fresh for EVERY
+     * attempt, like [effortFor] — only Bedrock attempts use it; every
+     * other kind passes null and is unaffected. Null means the plain
+     * client path (no Bedrock provider in the run).
+     */
+    private val awsCredentialsFor: (suspend () -> KeyStore.AwsCredentials?)? = null
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -225,7 +249,17 @@ class AgentRunner(
                 // Effort is looked up for THIS attempt's model, so a
                 // fallback switch sends the new model's effort (or none).
                 val effort = effortFor?.invoke(attempt.provider.id, attempt.modelId)
-                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages, effort).collect { chunk ->
+                // Azure resource, looked up the same way — only for Azure
+                // attempts; every other kind passes null and is unaffected.
+                val azureResource = if (attempt.provider.kind == "azure") {
+                    azureResourceFor?.invoke(attempt.provider.id)
+                } else null
+                // AWS credentials, looked up the same way — only for
+                // Bedrock attempts; every other kind passes null.
+                val awsCreds = if (attempt.provider.kind == "bedrock") {
+                    awsCredentialsFor?.invoke()
+                } else null
+                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages, effort, azureResource, awsCreds).collect { chunk ->
                     full.append(chunk)
                     emit(AgentEvent.TextChunk(chunk))
                 }
@@ -293,16 +327,32 @@ class AgentRunner(
                 ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
             val turnText = StringBuilder()
             val nativeCalls = mutableListOf<ParsedToolCall>()
+            // The raw native calls (with their provider ids) — the
+            // assistant message carries these back to Bedrock so each
+            // tool result can be paired by id. Kept in step with
+            // nativeCalls: only added when parseToolArgs succeeds.
+            val nativeToolCalls = mutableListOf<LlmToolCall>()
             var turnOk = false
             var lastLimitError: Exception? = null
             for ((index, attempt) in attempts.withIndex()) {
                 turnText.clear()
                 nativeCalls.clear()
+                nativeToolCalls.clear()
                 try {
                     // Effort is looked up for THIS attempt's model, so a
                     // fallback switch sends the new model's effort (or none).
                     val effort = effortFor?.invoke(attempt.provider.id, attempt.modelId)
-                    llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, llmMessages, effort).collect { event ->
+                    // Azure resource, looked up the same way — only for Azure
+                    // attempts; every other kind passes null and is unaffected.
+                    val azureResource = if (attempt.provider.kind == "azure") {
+                        azureResourceFor?.invoke(attempt.provider.id)
+                    } else null
+                    // AWS credentials, looked up the same way — only for
+                    // Bedrock attempts; every other kind passes null.
+                    val awsCreds = if (attempt.provider.kind == "bedrock") {
+                        awsCredentialsFor?.invoke()
+                    } else null
+                    llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, llmMessages, effort, azureResource, awsCreds).collect { event ->
                         when (event) {
                             is ChatStreamEvent.Text -> {
                                 turnText.append(event.chunk)
@@ -310,7 +360,8 @@ class AgentRunner(
                             }
                             is ChatStreamEvent.ToolCall -> {
                                 parseToolArgs(event.call.argumentsJson)?.let { args ->
-                                    nativeCalls += ParsedToolCall(event.call.name, args)
+                                    nativeCalls += ParsedToolCall(event.call.name, args, event.call.id)
+                                    nativeToolCalls += event.call
                                 }
                             }
                         }
@@ -343,9 +394,6 @@ class AgentRunner(
                 return@flow
             }
             val text = turnText.toString()
-            if (text.isNotBlank()) {
-                llmMessages += LlmMessage("assistant", text)
-            }
 
             // --- Gather tool calls: native ones first, then fenced ```tool blocks. ---
             val calls = mutableListOf<ParsedToolCall>()
@@ -353,6 +401,21 @@ class AgentRunner(
             val seen = calls.map { it.name to it.args }.toSet()
             parseFencedToolCalls(text).forEach { call ->
                 if ((call.name to call.args) !in seen) calls += call
+            }
+
+            // Structured tool pairing (Bedrock, Phase 4): only when every
+            // call of this turn carried a provider-assigned id. Then the
+            // assistant message carries the toolUses and the feedback goes
+            // back paired by id; otherwise both stay plain text, exactly
+            // as before Phase 4 — a toolUse without a matching toolResult
+            // would make Bedrock reject the next request, so a mixed turn
+            // (native + fenced calls) must not send any toolUse block.
+            val structured = calls.isNotEmpty() && calls.all { it.id != null }
+            if (text.isNotBlank() || structured) {
+                llmMessages += LlmMessage(
+                    "assistant", text,
+                    toolUses = if (structured) nativeToolCalls else null
+                )
             }
 
             if (calls.isEmpty()) {
@@ -368,11 +431,19 @@ class AgentRunner(
 
             // --- Execute the calls of this turn, in order. ---
             val results = StringBuilder()
+            // Per-call results in call order, for the structured Bedrock
+            // feedback (Phase 4): each entry pairs the call with the text
+            // its toolResult block must carry. A write/edit proposal pauses
+            // the turn, so it never gets an entry — and the feedback below
+            // never runs for that turn.
+            val callResults = mutableListOf<Pair<ParsedToolCall, String>>()
             var pausedForApproval = false
             for (call in calls) {
                 val rule = toolRule(call.name)
                 if (rule == "deny") {
-                    results.appendLine("[${call.name}] Denied by your tool permission rules.")
+                    val line = "[${call.name}] Denied by your tool permission rules."
+                    results.appendLine(line)
+                    callResults += call to line
                     continue
                 }
                 when (call.name) {
@@ -381,7 +452,9 @@ class AgentRunner(
                         // for the user's Approve on the diff card.
                         val proposal = toolCallToProposal(call)
                         if (proposal == null) {
-                            results.appendLine("[${call.name}] Invalid arguments — need a path.")
+                            val line = "[${call.name}] Invalid arguments — need a path."
+                            results.appendLine(line)
+                            callResults += call to line
                             continue
                         }
                         val old = if (proposal.action == "edit") project.readText(proposal.path) else null
@@ -392,7 +465,9 @@ class AgentRunner(
                     else -> {
                         val tool = tools.firstOrNull { it.name == call.name }
                         if (tool == null) {
-                            results.appendLine("[${call.name}] Unknown tool.")
+                            val line = "[${call.name}] Unknown tool."
+                            results.appendLine(line)
+                            callResults += call to line
                             continue
                         }
                         val outcome = tool.run(call.args, toolContext)
@@ -407,7 +482,9 @@ class AgentRunner(
                                 result = resultText
                             )
                         )
-                        results.appendLine("[${call.name}] $resultText")
+                        val line = "[${call.name}] $resultText"
+                        results.appendLine(line)
+                        callResults += call to line
                     }
                 }
             }
@@ -416,7 +493,21 @@ class AgentRunner(
                 return@flow
             }
             // Feed the tool results back and let the model take the next step.
-            llmMessages += LlmMessage("tool", "Tool results:\n$results")
+            // Bedrock (Phase 4): when every call carried an id, the results
+            // go back as a structured user message paired by toolUseId;
+            // otherwise the plain combined text is sent, exactly as before.
+            // (The size check is a safety net: a turn that paused for
+            // approval never reaches this line.)
+            if (structured && callResults.size == calls.size) {
+                llmMessages += LlmMessage(
+                    "user", "Tool results:\n$results",
+                    toolResults = callResults.map { (call, result) ->
+                        ToolResultFeedback(call.id!!, result)
+                    }
+                )
+            } else {
+                llmMessages += LlmMessage("tool", "Tool results:\n$results")
+            }
         }
         emit(AgentEvent.Error("Stopped after $MAX_STEPS tool steps — send a message to continue."))
         emit(AgentEvent.Done)

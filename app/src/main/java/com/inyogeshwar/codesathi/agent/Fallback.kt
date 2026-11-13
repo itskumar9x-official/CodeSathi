@@ -90,6 +90,18 @@ class FallbackEngine(
     ): List<FallbackAttempt> {
         if (!covered.add("${provider.id}/$modelId")) return emptyList()
         if (provider.local) return listOf(FallbackAttempt(provider, modelId, null, null))
+        if (provider.kind == "bedrock") {
+            // Bedrock has one credential set (not a key list): a single
+            // keyless attempt while the credential exists, none without
+            // it. The synthetic key id "aws" lets exhaustion mark this
+            // model until midnight like any other provider's key — the
+            // attempt carries no key value, so nothing secret is stored
+            // or logged with it.
+            if (!keys.hasAwsCredential()) return emptyList()
+            val exhaustedKey = "${provider.id}|$modelId|aws"
+            if (prefs.exhaustedMap()[exhaustedKey] != null) return emptyList()
+            return listOf(FallbackAttempt(provider, modelId, null, "aws"))
+        }
         val exhausted = prefs.exhaustedMap()
         val ids = keys.getKeyIds(provider.id)
         val values = keys.getKeyValues(provider.id)
@@ -118,7 +130,9 @@ class FallbackEngine(
         }.groupBy({ "${it.first}/${it.second}" }, { it.third })
         for ((modelKey, exhaustedIds) in byModel) {
             val providerId = modelKey.substringBefore("/")
-            val allIds = keys.getKeyIds(providerId)
+            // Bedrock's only "key id" is the synthetic "aws" (see
+            // attemptsForModel); every other provider uses its real ids.
+            val allIds = if (providerId == "bedrock") listOf("aws") else keys.getKeyIds(providerId)
             if (allIds.isNotEmpty() && exhaustedIds.toSet().containsAll(allIds.toSet())) {
                 out += modelKey
             }

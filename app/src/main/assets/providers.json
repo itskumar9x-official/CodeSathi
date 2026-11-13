@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "CodeSathi provider catalog (Phase 2 Step 2 + live-check pass 2026-11-12), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Live-check: every remote base URL was probed with GET {baseUrl}/models without auth (200/401/403 = reachable); 6 dead/duplicate entries were removed (Lambda, Predibase, MonsterAPI, Inflection, Gradient AI, Petals), 10 base URLs were corrected, and 62 providers were added. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. Still uncertain: LangDB (new host api.langdb.ai returned 503 when probed) and Galadriel (probe blocked by this machine's egress proxy; URL corrected from official docs). Azure OpenAI (replace YOUR-RESOURCE with your resource name) and AWS Bedrock (needs SigV4 signing, not a plain API key) still need a fix before first use. CrofAI's /v1/models returns an HTML page without a key; it returns JSON with a key.",
+  "note": "CodeSathi provider catalog (Phase 2 Step 2 + live-check pass 2026-11-12), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Live-check: every remote base URL was probed with GET {baseUrl}/models without auth (200/401/403 = reachable); 6 dead/duplicate entries were removed (Lambda, Predibase, MonsterAPI, Inflection, Gradient AI, Petals), 10 base URLs were corrected, and 62 providers were added. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. LangDB and Galadriel were both removed in Phase 4 (see below). Azure OpenAI and AWS Bedrock were fixed in Phase 4 (see below). CrofAI's /v1/models returns an HTML page without a key; it returns JSON with a key. Phase 4 catalog fixes (2026-11-13): LangDB removed — api.langdb.ai returned 503 ('service not available yet') on /models, /v1/models and / on both 2026-11-12 and 2026-11-13, although langdb.ai and the docs are alive; the correct form is project-scoped (https://api.langdb.ai/{projectId}/v1), which this flat catalog cannot express. Galadriel removed — api.galadriel.com completes TLS then sends an empty reply on /v1/verified/models and /v1/chat/completions, and an independent provider sweep (Oct 2026) lists its inference API as discontinued; galadriel.com itself still answers. Azure OpenAI fixed: kind 'azure', baseUrl template https://{resource}.openai.azure.com, resource name typed in the provider card, deployment URL with api-version 2024-10-21. AWS Bedrock fixed: kind 'bedrock', SigV4-signed Converse API with access key id + secret + region from the provider card. Catalog is now 206 providers.",
   "providers": [
     {
       "id": "anthropic",
@@ -365,21 +365,23 @@
     {
       "id": "azure-openai",
       "name": "Azure OpenAI",
-      "kind": "openai",
-      "baseUrl": "https://YOUR-RESOURCE.openai.azure.com/openai/v1",
+      "kind": "azure",
+      "baseUrl": "https://{resource}.openai.azure.com",
       "models": [
         "gpt-4o",
         "gpt-5"
-      ]
+      ],
+      "note": "Set your Azure resource name in the provider card (Providers → Azure OpenAI) — the app builds https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21, and the model id you pick is the deployment name. The API key is your Azure OpenAI key, sent as the api-key header."
     },
     {
       "id": "bedrock",
       "name": "AWS Bedrock",
-      "kind": "openai",
-      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "kind": "bedrock",
+      "baseUrl": "https://bedrock-runtime.{region}.amazonaws.com",
       "models": [
         "anthropic.claude-sonnet-4-5"
-      ]
+      ],
+      "note": "Needs an AWS access key id, secret access key and region (Providers → AWS Bedrock) — requests are signed with SigV4 and sent to the Converse API; a plain API key does not work. The model id you pick is the Bedrock model id (or an inference-profile id such as us.anthropic.claude-sonnet-4-5). Bedrock has no /models list, so type any model id by hand."
     },
     {
       "id": "aleph-alpha",
@@ -926,15 +928,6 @@
       ]
     },
     {
-      "id": "langdb",
-      "name": "LangDB",
-      "kind": "openai",
-      "baseUrl": "https://api.langdb.ai",
-      "models": [
-        "gpt-4o"
-      ]
-    },
-    {
       "id": "prime-intellect",
       "name": "Prime Intellect",
       "kind": "openai",
@@ -1096,13 +1089,6 @@
       "name": "CompactifAI",
       "kind": "openai",
       "baseUrl": "https://api.compactif.ai/v1",
-      "models": []
-    },
-    {
-      "id": "galadriel",
-      "name": "Galadriel",
-      "kind": "openai",
-      "baseUrl": "https://api.galadriel.com/v1/verified",
       "models": []
     },
     {

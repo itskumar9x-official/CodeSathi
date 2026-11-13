@@ -1,5 +1,7 @@
 package com.inyogeshwar.codesathi.agent
 
+import com.inyogeshwar.codesathi.data.AZURE_API_VERSION
+import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Provider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -15,13 +17,44 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /** One chat message in the provider's wire format. */
-data class LlmMessage(val role: String, val content: String)
+data class LlmMessage(
+    val role: String,
+    val content: String,
+    /**
+     * Tool calls the assistant made in this message (Bedrock only).
+     * Bedrock's Converse API pairs each tool result with the toolUse id
+     * it answers, so the ids must travel with the message. Every other
+     * provider ignores these fields.
+     */
+    val toolUses: List<LlmToolCall>? = null,
+    /**
+     * Tool results this message carries (Bedrock only): one per toolUse
+     * the previous assistant message made, in the same order.
+     */
+    val toolResults: List<ToolResultFeedback>? = null
+)
 
 /** One tool call the model asked for (OpenAI `tool_calls` shape). */
 data class LlmToolCall(
     val name: String,
     /** Raw JSON arguments object as a string (may be partial while streaming). */
-    val argumentsJson: String
+    val argumentsJson: String,
+    /**
+     * The id the provider assigned to this call (Bedrock Converse
+     * `toolUseId`, or the OpenAI tool-call id when present). Null for
+     * fenced ```tool calls, which carry no id.
+     */
+    val id: String? = null
+)
+
+/**
+ * One tool result fed back to the model (Bedrock Converse `toolResult`
+ * block). [toolUseId] must equal the [LlmToolCall.id] it answers.
+ */
+data class ToolResultFeedback(
+    val toolUseId: String,
+    /** The tool's output text. */
+    val content: String
 )
 
 /** Events from one streamed chat turn. Tool calls arrive after the text. */
@@ -41,6 +74,23 @@ sealed interface ChatStreamEvent {
  *   [requestBody]).
  * - Anthropic providers: POST {baseUrl}/messages with
  *   `anthropic-version: 2023-06-01` and `x-api-key`, SSE.
+ * - Azure OpenAI providers (Phase 4): POST
+ *   https://{resource}.openai.azure.com/openai/deployments/{deployment}/
+ *   chat/completions?api-version=[AZURE_API_VERSION], with the `api-key`
+ *   header (never Bearer). The deployment name is the model id the user
+ *   picked; the resource name comes from [streamChatEvents]'s
+ *   [azureResourceName] argument. A blank resource name throws before any
+ *   request is made, so a placeholder host can never go out on the wire.
+ * - AWS Bedrock providers (Phase 4): POST
+ *   https://bedrock-runtime.{region}.amazonaws.com/model/{modelId}/converse
+ *   with SigV4 signing ([BedrockSigner], hand-rolled — no AWS SDK) and
+ *   the Converse API body (messages / system / inferenceConfig). The
+ *   credentials come from [streamChatEvents]'s [awsCredentials] argument.
+ *   Converse is NON-STREAMING here: the whole reply arrives at once and
+ *   is emitted as a single [ChatStreamEvent.Text] (plus any
+ *   [ChatStreamEvent.ToolCall] events) — see [emitBedrockConverse].
+ *   The reasoning-effort picker does nothing for Bedrock (Converse has
+ *   no effort field).
  * - Local providers (Ollama / LM Studio) work the same way with no key.
  * Streaming is best-effort: if the provider answers with plain JSON
  * instead of SSE, the single response is returned as one chunk, and any
@@ -63,9 +113,11 @@ class LlmClient {
         modelId: String,
         apiKey: String?,
         messages: List<LlmMessage>,
-        reasoningEffort: String? = null
+        reasoningEffort: String? = null,
+        azureResourceName: String? = null,
+        awsCredentials: KeyStore.AwsCredentials? = null
     ): Flow<String> = flow {
-        streamChatEvents(provider, modelId, apiKey, messages, reasoningEffort).collect { event ->
+        streamChatEvents(provider, modelId, apiKey, messages, reasoningEffort, azureResourceName, awsCredentials).collect { event ->
             if (event is ChatStreamEvent.Text) emit(event.chunk)
         }
     }
@@ -74,15 +126,23 @@ class LlmClient {
      * Stream one turn as text chunks plus any tool calls the model made.
      * Tool calls are emitted after the text of the turn, in call order.
      * Throws [LlmException] on HTTP errors.
+     * Bedrock turns are non-streaming (see the class KDoc): the reply
+     * arrives whole and is emitted as one text chunk.
      */
     fun streamChatEvents(
         provider: Provider,
         modelId: String,
         apiKey: String?,
         messages: List<LlmMessage>,
-        reasoningEffort: String? = null
+        reasoningEffort: String? = null,
+        azureResourceName: String? = null,
+        awsCredentials: KeyStore.AwsCredentials? = null
     ): Flow<ChatStreamEvent> = flow {
-        val url = URL(chatUrl(provider))
+        if (provider.kind == "bedrock") {
+            emitBedrockConverse(provider, modelId, messages, awsCredentials, this)
+            return@flow
+        }
+        val url = URL(chatUrl(provider, modelId, azureResourceName))
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 30_000
@@ -93,6 +153,9 @@ class LlmClient {
             if (provider.kind == "anthropic") {
                 setRequestProperty("anthropic-version", "2023-06-01")
                 setRequestProperty("x-api-key", apiKey.orEmpty())
+            } else if (provider.kind == "azure") {
+                // Azure API keys go in the `api-key` header, never Bearer.
+                if (!apiKey.isNullOrBlank()) setRequestProperty("api-key", apiKey)
             } else if (!apiKey.isNullOrBlank()) {
                 setRequestProperty("Authorization", "Bearer $apiKey")
             }
@@ -116,9 +179,156 @@ class LlmClient {
         }
     }
 
-    private fun chatUrl(provider: Provider): String {
+    private fun chatUrl(provider: Provider, modelId: String, azureResourceName: String?): String {
         val base = provider.baseUrl.trimEnd('/')
-        return if (provider.kind == "anthropic") "$base/messages" else "$base/chat/completions"
+        return when (provider.kind) {
+            "anthropic" -> "$base/messages"
+            "azure" -> {
+                // The resource name is the only thing that can build this
+                // URL. A blank name throws here — before any request is
+                // made — so a URL with a placeholder host can never go out.
+                val resource = azureResourceName?.trim()?.takeIf { it.isNotBlank() }
+                    ?: throw LlmException("Azure resource name is not set. Set it in Providers → Azure OpenAI first.")
+                "https://$resource.openai.azure.com/openai/deployments/$modelId/chat/completions?api-version=$AZURE_API_VERSION"
+            }
+            else -> "$base/chat/completions"
+        }
+    }
+
+    /**
+     * One Bedrock Converse turn (Phase 4). Non-streaming: the whole reply
+     * is read, then emitted as one text chunk plus any tool calls — the
+     * same [ChatStreamEvent] shape the streaming providers use, so the
+     * agent loop, fallback and compaction need no Bedrock special case.
+     * The request is SigV4-signed ([BedrockSigner]); a missing credential
+     * throws before any request is made. A 429 from Bedrock (throttling)
+     * carries the code through [LlmException], so the existing
+     * [classifyLimitError] maps it to RATE — no new failure kind.
+     */
+    private suspend fun emitBedrockConverse(
+        provider: Provider,
+        modelId: String,
+        messages: List<LlmMessage>,
+        awsCredentials: KeyStore.AwsCredentials?,
+        collector: kotlinx.coroutines.flow.FlowCollector<ChatStreamEvent>
+    ) {
+        withContext(Dispatchers.IO) {
+            val creds = awsCredentials
+                ?: throw LlmException("AWS credentials are not set. Add your access key id, secret access key and region in Providers → AWS Bedrock first.")
+            val region = creds.region.trim().ifBlank { "us-east-1" }
+            val host = "bedrock-runtime.$region.amazonaws.com"
+            val path = BedrockSigner.conversePath(modelId)
+            val body = bedrockRequestBody(messages)
+            val signed = BedrockSigner.sign(creds.copy(region = region), host, path, body)
+            val conn = (URL("https://$host$path").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 30_000
+                readTimeout = 120_000
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "CodeSathi/1.0 (CodeSathi; Android)")
+                setRequestProperty("X-Amz-Date", signed.amzDate)
+                setRequestProperty("X-Amz-Content-Sha256", signed.payloadHash)
+                setRequestProperty("Authorization", signed.authorization)
+                doOutput = true
+            }
+            try {
+                conn.outputStream.bufferedWriter().use { it.write(body) }
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    val err = conn.errorStream?.bufferedReader()?.readText().orEmpty()
+                    throw LlmException(
+                        "Bedrock error HTTP $code: ${err.take(300)}",
+                        httpCode = code,
+                        body = err
+                    )
+                }
+                val raw = conn.inputStream.bufferedReader().readText()
+                val parsed = parseBedrockConverse(raw)
+                parsed.first?.let { collector.emit(ChatStreamEvent.Text(it)) }
+                parsed.second.forEach { collector.emit(ChatStreamEvent.ToolCall(it)) }
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    /**
+     * The Converse request body: {"messages":[…],"system":[…],
+     * "inferenceConfig":{"maxTokens":4096}}. The model id is NOT in the
+     * body — it is in the URL path. Roles: "system" messages become the
+     * top-level `system` list; "assistant" stays assistant; anything else
+     * ("user", and the legacy "tool" feedback message) becomes a user
+     * message. An assistant message with [LlmMessage.toolUses] carries a
+     * `toolUse` block per call; a user message with
+     * [LlmMessage.toolResults] carries a `toolResult` block per result,
+     * each paired by toolUseId. A toolUse without an id is skipped —
+     * Bedrock cannot answer a result for it, and the plain-text feedback
+     * still carries the outcome (see AgentRunner).
+     */
+    private fun bedrockRequestBody(messages: List<LlmMessage>): String {
+        val system = messages.firstOrNull { it.role == "system" }?.content
+        val systemPart = if (system != null) """, "system":[{"text":"${escape(system)}"}]""" else ""
+        val rest = messages.filter { it.role != "system" }.joinToString(",") { m ->
+            val role = if (m.role == "assistant") "assistant" else "user"
+            val blocks = StringBuilder()
+            if (m.content.isNotBlank()) blocks.append("""{"text":"${escape(m.content)}"}""")
+            m.toolUses?.forEach { call ->
+                val id = call.id ?: return@forEach
+                if (blocks.isNotEmpty()) blocks.append(",")
+                blocks.append(
+                    """{"toolUse":{"toolUseId":"${escape(id)}","name":"${escape(call.name)}","input":${safeJsonObject(call.argumentsJson)}}}"""
+                )
+            }
+            m.toolResults?.forEach { result ->
+                if (blocks.isNotEmpty()) blocks.append(",")
+                blocks.append(
+                    """{"toolResult":{"toolUseId":"${escape(result.toolUseId)}","content":{"text":"${escape(result.content)}"}}}"""
+                )
+            }
+            """{"role":"$role","content":[${blocks}]}"""
+        }
+        return """{"messages":[$rest],"inferenceConfig":{"maxTokens":4096}$systemPart}"""
+    }
+
+    /** Parse a Converse response: (text, tool calls). */
+    private fun parseBedrockConverse(body: String): Pair<String?, List<LlmToolCall>> {
+        return try {
+            val el = json.parseToJsonElement(body).jsonObject
+            val content = el["output"]?.jsonObject
+                ?.get("message")?.jsonObject
+                ?.get("content")?.jsonArray
+                ?: return null to emptyList()
+            var text: String? = null
+            val calls = mutableListOf<LlmToolCall>()
+            for (block in content) {
+                val obj = block.jsonObject
+                obj["text"]?.jsonPrimitive?.contentOrNull?.let { t ->
+                    text = if (text == null) t else "$text$t"
+                }
+                obj["toolUse"]?.jsonObject?.let { tu ->
+                    val id = tu["toolUseId"]?.jsonPrimitive?.contentOrNull ?: return@let
+                    val name = tu["name"]?.jsonPrimitive?.contentOrNull ?: return@let
+                    val input = tu["input"]?.jsonObject
+                    calls += LlmToolCall(name, input?.toString() ?: "{}", id)
+                }
+            }
+            text to calls
+        } catch (_: Exception) {
+            null to emptyList()
+        }
+    }
+
+    /**
+     * A JSON object string, or "{}" when the input is not a JSON object.
+     * The Converse body must stay valid JSON even if a model's tool
+     * arguments arrived malformed.
+     */
+    private fun safeJsonObject(raw: String): String = try {
+        json.parseToJsonElement(raw).jsonObject
+        raw
+    } catch (_: Exception) {
+        "{}"
     }
 
     /**
@@ -136,6 +346,8 @@ class LlmClient {
      * normal [LlmException] path — no new error handling. Note:
      * Anthropic recommends a large max_tokens at high effort; this
      * client still sends max_tokens 4096.
+     * Bedrock never reaches this function — it has its own body
+     * ([bedrockRequestBody]) and no effort field.
      */
     private fun requestBody(
         provider: Provider,

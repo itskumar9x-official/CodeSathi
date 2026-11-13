@@ -77,6 +77,7 @@ class PreferencesStore(private val context: Context) {
         private val COMMANDS = stringPreferencesKey("commands_json")
         private val COMMAND_DEFAULTS_SEEDED = booleanPreferencesKey("commands_defaults_seeded")
         private val REASONING_EFFORT = stringPreferencesKey("reasoning_effort_json")
+        private val AZURE_RESOURCE_NAMES = stringPreferencesKey("azure_resource_names_json")
         private val SKILL_ENABLED = stringPreferencesKey("skill_enabled_json")
         private val VOICE_OUTPUT = booleanPreferencesKey("voice_output_enabled")
         private val REMOTE_ENABLED = booleanPreferencesKey("remote_enabled")
@@ -93,6 +94,15 @@ class PreferencesStore(private val context: Context) {
 
         /** The only values [setReasoningEffort] stores; anything else is dropped. */
         val VALID_EFFORTS = setOf(EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH)
+
+        /**
+         * Azure resource names (Phase 4): 3–24 chars, lowercase letters /
+         * digits / hyphens, starting and ending with a letter or digit.
+         * Azure's own naming rule — enforced on save and on read.
+         */
+        fun isValidAzureResourceName(name: String): Boolean =
+            name.length in 3..24 &&
+                name.matches(Regex("^[a-z0-9]([a-z0-9-]{1,22}[a-z0-9])?$"))
 
         /** Per-tool permission rule: "allow" | "ask" | "deny". */
         const val RULE_ALLOW = "allow"
@@ -394,6 +404,44 @@ class PreferencesStore(private val context: Context) {
             return
         }
         context.dataStore.edit { it[REASONING_EFFORT] = Json.encodeToString<Map<String, String>>(current) }
+    }
+
+    // ---- Azure OpenAI resource name (Phase 4) ----
+
+    /**
+     * Azure OpenAI resource name per provider id ("azure-openai" → "myresource").
+     * The resource name is NOT a secret — it is part of the URL — so plain
+     * DataStore storage is fine. Only values matching Azure's naming rules
+     * are ever stored; anything else is dropped on read, so a corrupt entry
+     * can never reach a request URL.
+     */
+    val azureResourceNames: Flow<Map<String, String>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[AZURE_RESOURCE_NAMES] ?: return@map emptyMap()
+        try {
+            Json.decodeFromString<Map<String, String>>(raw)
+                .filterValues { isValidAzureResourceName(it) }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    /** The stored Azure resource name for one provider, or null when unset. */
+    suspend fun azureResourceName(providerId: String): String? =
+        azureResourceNames.first()[providerId]
+
+    /**
+     * Set the Azure resource name for one provider. Returns false when the
+     * name does not match Azure's naming rules (nothing is stored then).
+     * [name] is trimmed and lowercased first — Azure resource names are
+     * lowercase-only.
+     */
+    suspend fun setAzureResourceName(providerId: String, name: String): Boolean {
+        val value = name.trim().lowercase()
+        if (!isValidAzureResourceName(value)) return false
+        val current = azureResourceNames.first().toMutableMap()
+        current[providerId] = value
+        context.dataStore.edit { it[AZURE_RESOURCE_NAMES] = Json.encodeToString<Map<String, String>>(current) }
+        return true
     }
 
     // ---- Fallback chain (Phase 2, Step 1) ----

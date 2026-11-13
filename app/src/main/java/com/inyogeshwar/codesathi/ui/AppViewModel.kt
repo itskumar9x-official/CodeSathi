@@ -238,11 +238,8 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         val provider = provider(session.providerId)
             ?: return RemoteTurnResult(reply = "", error = "Unknown provider ${session.providerId}.")
         val apiKey = keys.getKey(session.providerId)
-        if (!provider.local && apiKey.isNullOrBlank()) {
-            return RemoteTurnResult(
-                reply = "",
-                error = "Add a provider API key first (Providers → ${provider.name})."
-            )
+        missingCredentialMessage(provider, apiKey)?.let { message ->
+            return RemoteTurnResult(reply = "", error = message)
         }
         isRunning = true
         lastError = null
@@ -494,6 +491,53 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         keys.removeKey(providerId, keyId)
         keysVersion++
         refreshExhausted()
+    }
+
+    // ---- Azure OpenAI resource name (Phase 4) ----
+
+    /** "providerId" → resource name, from DataStore. */
+    val azureResourceNames: StateFlow<Map<String, String>> =
+        prefs.azureResourceNames.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap()
+        )
+
+    /**
+     * Save the Azure resource name for one provider. Returns false when
+     * the name does not match Azure's naming rules (nothing is stored);
+     * the screen shows a plain note in that case. The DataStore write
+     * itself happens in the scope.
+     */
+    fun saveAzureResourceName(providerId: String, name: String): Boolean {
+        if (!PreferencesStore.isValidAzureResourceName(name.trim().lowercase())) return false
+        viewModelScope.launch { prefs.setAzureResourceName(providerId, name) }
+        return true
+    }
+
+    // ---- AWS Bedrock credentials (Phase 4) ----
+
+    /** Masked AWS access key id for the Bedrock provider card, or null when unset. */
+    fun awsAccessKeyIdMasked(): String? = keys.awsAccessKeyIdMasked()
+
+    /** Stored AWS region for the Bedrock provider card (us-east-1 when unset). */
+    fun awsRegion(): String = keys.getAwsRegion()
+
+    fun hasAwsCredential(): Boolean = keys.hasAwsCredential()
+
+    /**
+     * Save the AWS credential set for Bedrock. Returns false when the
+     * access key id or the secret is blank (nothing is stored); the
+     * screen shows a plain note in that case.
+     */
+    fun saveAwsCredential(accessKeyId: String, secretAccessKey: String, region: String): Boolean {
+        if (!keys.saveAwsCredential(accessKeyId, secretAccessKey, region)) return false
+        keysVersion++
+        return true
+    }
+
+    /** Delete the AWS credential set for Bedrock. */
+    fun removeAwsCredential() {
+        keys.removeAwsCredential()
+        keysVersion++
     }
 
     // ---- Reasoning effort per model (Phase 3, Step 2) ----
@@ -880,7 +924,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         viewModelScope.launch {
             fetchingProviderId = provider.id
             try {
-                val result = providerRepository.refreshModels(provider, keys.getKey(provider.id))
+                val result = providerRepository.refreshModels(
+                    provider,
+                    keys.getKey(provider.id),
+                    azureResourceName = if (provider.kind == "azure") prefs.azureResourceName(provider.id) else null
+                )
                 if (result.models.isNotEmpty()) {
                     fetchedModels = fetchedModels + (provider.id to result.models)
                 }
@@ -1093,8 +1141,8 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             lastError = "Unknown provider ${session.providerId}. Pick a model in Providers."
             return
         }
-        if (!provider.local && apiKey.isNullOrBlank()) {
-            lastError = "Add a provider API key first (Providers → ${provider.name})."
+        missingCredentialMessage(provider, apiKey)?.let { message ->
+            lastError = message
             return
         }
         isRunning = true
@@ -1128,6 +1176,21 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
      * One agent turn (Plan or Build). Shared by [sendMessage] and the
      * post-approval resume in [resumeBuild].
      */
+    /**
+     * Null when this provider can be called; otherwise the plain message
+     * to show instead of starting a turn. Bedrock (Phase 4) has no API
+     * key — it needs the AWS credential set; every other remote provider
+     * needs at least one key; local providers need nothing.
+     */
+    private fun missingCredentialMessage(provider: Provider, apiKey: String?): String? {
+        if (provider.local) return null
+        if (provider.kind == "bedrock") {
+            return if (keys.hasAwsCredential()) null
+            else "Add your AWS access key id, secret access key and region first (Providers → AWS Bedrock)."
+        }
+        return if (apiKey.isNullOrBlank()) "Add a provider API key first (Providers → ${provider.name})." else null
+    }
+
     private suspend fun runAgentTurn(
         session: Session,
         provider: Provider,
@@ -1136,6 +1199,14 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         userMessage: String,
         context: Context
     ) {
+        // Azure (Phase 4): without a resource name there is no URL to
+        // call — stop here with a plain message instead of sending a
+        // request to a placeholder host. (LlmClient throws too, as a
+        // second layer, if any other caller forgets this check.)
+        if (provider.kind == "azure" && prefs.azureResourceName(provider.id).isNullOrBlank()) {
+            lastError = "Set your Azure resource name first (Providers → Azure OpenAI)."
+            return
+        }
         val project = SafProject(context, Uri.parse(session.projectUri))
         // MCP tools for this turn: fetch any missing enabled-server lists
         // first, then hand the built-ins + MCP tools + skill tool to the
@@ -1146,7 +1217,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             llm, v1Tools(project) + mcpTools() + skillTools(), fallbackEngine,
             // Reasoning effort (Phase 3, Step 2): looked up per attempt
             // inside the runner, for the model actually being called.
-            effortFor = { providerId, modelId -> prefs.reasoningEffort(providerId, modelId) }
+            effortFor = { providerId, modelId -> prefs.reasoningEffort(providerId, modelId) },
+            // Azure resource name (Phase 4): same per-attempt lookup.
+            azureResourceFor = { providerId -> prefs.azureResourceName(providerId) },
+            // AWS credentials (Phase 4): same per-attempt lookup.
+            awsCredentialsFor = { keys.awsCredentials() }
         )
         val toolContext = ToolContext(
             readOnly = session.agentMode == "plan",
@@ -1194,7 +1269,7 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         if (isRunning) return
         val provider = provider(session.providerId) ?: return
         val apiKey = keys.getKey(session.providerId)
-        if (!provider.local && apiKey.isNullOrBlank()) return
+        if (missingCredentialMessage(provider, apiKey) != null) return
         isRunning = true
         runJob = viewModelScope.launch {
             try {
@@ -1335,7 +1410,12 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         history: List<Message>
     ): SessionSummary? {
         if (provider == null) return null
-        if (!provider.local && apiKey.isNullOrBlank()) return null
+        // Azure without a resource name cannot be called — fall through
+        // to the local summary instead of failing the turn.
+        if (provider.kind == "azure" && prefs.azureResourceName(provider.id).isNullOrBlank()) return null
+        // Bedrock without its credential set cannot be called either.
+        if (provider.kind == "bedrock" && !keys.hasAwsCredential()) return null
+        if (!provider.local && provider.kind != "bedrock" && apiKey.isNullOrBlank()) return null
         val (covered, _) = Compaction.splitForSummary(history)
         if (covered.isEmpty()) return null
         val coveredText = covered.joinToString("\n\n") { "${it.role}: ${it.text.take(4000)}" }
@@ -1345,7 +1425,9 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 provider,
                 session.modelId,
                 apiKey,
-                listOf(LlmMessage("user", Compaction.summaryPrompt(coveredText)))
+                listOf(LlmMessage("user", Compaction.summaryPrompt(coveredText))),
+                azureResourceName = if (provider.kind == "azure") prefs.azureResourceName(provider.id) else null,
+                awsCredentials = if (provider.kind == "bedrock") keys.awsCredentials() else null
             ).collect { reply.append(it) }
             val text = reply.toString().trim()
             if (text.isBlank()) return null
