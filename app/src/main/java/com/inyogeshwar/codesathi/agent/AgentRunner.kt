@@ -93,6 +93,10 @@ private data class ParsedToolCall(val name: String, val args: Map<String, String
  * [AgentEvent.FallbackSwitched] so the chat can say what changed. A
  * turn is only retried when nothing was emitted yet, so a reply is
  * never shown twice. Non-limit errors fail the turn as before.
+ * Reasoning effort (Phase 3, Step 2): each attempt looks up the effort
+ * for its OWN provider + model, so a fallback switch sends the new
+ * model's effort (or nothing, when that model is at "default") —
+ * the first attempt's effort is never reused for another model.
  *
  * MCP tools (Phase 2, Step 3): tools whose names start with "mcp:" are
  * listed in the Build system prompt and dispatched through the same
@@ -109,7 +113,15 @@ private data class ParsedToolCall(val name: String, val args: Map<String, String
 class AgentRunner(
     private val llm: LlmClient,
     private val tools: List<Tool>,
-    private val fallback: FallbackEngine? = null
+    private val fallback: FallbackEngine? = null,
+    /**
+     * Reasoning effort for one (provider, model), or null when the user
+     * left it at "default". Looked up fresh for EVERY attempt — a
+     * fallback switch to another model must send that model's effort,
+     * never the first attempt's. Null means no effort is ever sent
+     * (the plain client path, e.g. the approve-only runner).
+     */
+    private val effortFor: (suspend (providerId: String, modelId: String) -> String?)? = null
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -210,7 +222,10 @@ class AgentRunner(
         for ((index, attempt) in attempts.withIndex()) {
             val full = StringBuilder()
             try {
-                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages).collect { chunk ->
+                // Effort is looked up for THIS attempt's model, so a
+                // fallback switch sends the new model's effort (or none).
+                val effort = effortFor?.invoke(attempt.provider.id, attempt.modelId)
+                llm.streamChat(attempt.provider, attempt.modelId, attempt.apiKey, messages, effort).collect { chunk ->
                     full.append(chunk)
                     emit(AgentEvent.TextChunk(chunk))
                 }
@@ -284,7 +299,10 @@ class AgentRunner(
                 turnText.clear()
                 nativeCalls.clear()
                 try {
-                    llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, llmMessages).collect { event ->
+                    // Effort is looked up for THIS attempt's model, so a
+                    // fallback switch sends the new model's effort (or none).
+                    val effort = effortFor?.invoke(attempt.provider.id, attempt.modelId)
+                    llm.streamChatEvents(attempt.provider, attempt.modelId, attempt.apiKey, llmMessages, effort).collect { event ->
                         when (event) {
                             is ChatStreamEvent.Text -> {
                                 turnText.append(event.chunk)

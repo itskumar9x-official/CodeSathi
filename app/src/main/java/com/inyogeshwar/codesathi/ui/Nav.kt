@@ -11,7 +11,9 @@ sealed class Screen(val route: String) {
     object Providers : Screen("providers")
     object Mcp : Screen("mcp")
     object Skills : Screen("skills")
+    object Commands : Screen("commands")
     object Terminal : Screen("terminal")
     object Remote : Screen("remote")
     object Git : Screen("git")
+    object Editor : Screen("editor")
 }

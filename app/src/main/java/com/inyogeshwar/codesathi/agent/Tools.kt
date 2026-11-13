@@ -64,6 +64,13 @@ class SafProject(private val context: Context, private val treeUri: Uri) {
             ?.bufferedReader().use { it?.readText() }
     }
 
+    /** Raw bytes of a file, or null when it cannot be read. The editor
+     *  uses this to sniff binary files before trying to decode text. */
+    fun readBytes(relativePath: String): ByteArray? {
+        val file = find(relativePath) ?: return null
+        return context.contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
+    }
+
     /** Creates parent folders as needed, then writes (or overwrites) the file. */
     fun writeText(relativePath: String, content: String): Boolean {
         val parts = relativePath.trim('/').split('/').filter { it.isNotBlank() }
@@ -95,7 +102,20 @@ class SafProject(private val context: Context, private val treeUri: Uri) {
         val dir = if (relativeDir.isBlank()) root else find(relativeDir)
         return dir?.listFiles().orEmpty().mapNotNull { it.name }
     }
+
+    /** Top-level entries of a folder, with their kind — the editor's file
+     *  list. Directories are listed but cannot be opened (a fuller tree
+     *  browser is Phase 3, Step 5). */
+    fun listEntries(relativeDir: String = ""): List<SafEntry> {
+        val dir = if (relativeDir.isBlank()) root else find(relativeDir)
+        return dir?.listFiles().orEmpty().mapNotNull { file ->
+            file.name?.let { SafEntry(it, file.isDirectory) }
+        }
+    }
 }
+
+/** One entry in a project folder listing (see [SafProject.listEntries]). */
+data class SafEntry(val name: String, val isDirectory: Boolean)
 
 class ReadTool(private val project: SafProject) : Tool {
     override val name = "read"

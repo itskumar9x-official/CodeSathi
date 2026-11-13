@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -54,6 +55,10 @@ import com.inyogeshwar.codesathi.ui.AppViewModel
  * id can be typed in by hand instead.
  * Fallback order: when a model's limit is reached, CodeSathi first tries
  * another key of the same model, then walks this list top to bottom.
+ * Reasoning effort (Phase 3, Step 2): each model row has Default / Low /
+ * Medium / High chips — the choice is stored per provider + model and
+ * sent when set: `reasoning_effort` to OpenAI-kind providers,
+ * `output_config.effort` to Anthropic-kind providers.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,6 +69,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     var keySavedNote by remember { mutableStateOf<String?>(null) }
     val favourites by viewModel.favourites.collectAsState()
     val fallbackChain by viewModel.fallbackChain.collectAsState()
+    // Reasoning effort per model (Phase 3, Step 2): "providerId/modelId" → low/medium/high.
+    val efforts by viewModel.reasoningEfforts.collectAsState()
     val exhaustedModelKeys = viewModel.exhaustedModelKeys
     // Read for subscription only: KeyStore is not a Flow, so the key lists
     // below are re-read whenever this version bumps (add / delete key).
@@ -157,6 +164,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                         provider = provider,
                         modelId = model,
                         starred = favourites.any { it.modelKey == provider.modelKey(model) },
+                        effort = efforts[provider.modelKey(model)],
+                        onSetEffort = { viewModel.setReasoningEffort(provider.id, model, it) },
                         onStar = { viewModel.toggleFavourite(provider.id, model) },
                         onSelect = {
                             val switched = viewModel.useModel(provider.id, model)
@@ -182,6 +191,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                             provider = provider,
                             modelId = fav.modelId,
                             starred = true,
+                            effort = efforts[provider.modelKey(fav.modelId)],
+                            onSetEffort = { viewModel.setReasoningEffort(fav.providerId, fav.modelId, it) },
                             onStar = { viewModel.toggleFavourite(fav.providerId, fav.modelId) },
                             onSelect = {
                                 val switched = viewModel.useModel(fav.providerId, fav.modelId)
@@ -218,6 +229,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                     },
                     apiKeys = viewModel.apiKeys(provider.id),
                     favourites = favourites,
+                    efforts = efforts,
+                    onSetEffort = { model, effort -> viewModel.setReasoningEffort(provider.id, model, effort) },
                     onStar = { model -> viewModel.toggleFavourite(provider.id, model) },
                     onAddFallback = { model ->
                         viewModel.addFallbackEntry(provider.id, model)
@@ -253,16 +266,25 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                     "Keys are stored encrypted (EncryptedSharedPreferences) and are never put in providers.json or sent anywhere except the provider you chose.",
                     style = MaterialTheme.typography.bodySmall
                 )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Reasoning effort (Default / Low / Medium / High) is set per model above and sent only when set. OpenAI-kind providers get it as reasoning_effort; Anthropic-kind providers get it as output_config.effort (verified from Anthropic's own docs — supported on Claude 4.5+ / 5.x models). Default sends nothing.",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ModelRow(
     provider: Provider,
     modelId: String,
     starred: Boolean,
+    effort: String? = null,
+    /** Null when the picker is not shown for this row. */
+    onSetEffort: ((String?) -> Unit)? = null,
     onStar: () -> Unit,
     onSelect: () -> Unit,
     onAddFallback: () -> Unit
@@ -271,6 +293,18 @@ private fun ModelRow(
         Column(modifier = Modifier.weight(1f)) {
             Text("${provider.name} / $modelId", style = MaterialTheme.typography.bodyMedium)
             if (provider.local) Text("Runs on this device (no key needed)", style = MaterialTheme.typography.bodySmall)
+            // Reasoning effort (Phase 3, Step 2): per-model low / medium /
+            // high, or Default (unset — nothing is sent). Shown for every
+            // provider: OpenAI-kind sends `reasoning_effort`, Anthropic-kind
+            // sends `output_config.effort` (verified from Anthropic's docs).
+            if (onSetEffort != null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    EffortChip(label = "Default", selected = effort == null, onClick = { onSetEffort(null) })
+                    EffortChip(label = "Low", selected = effort == "low", onClick = { onSetEffort("low") })
+                    EffortChip(label = "Medium", selected = effort == "medium", onClick = { onSetEffort("medium") })
+                    EffortChip(label = "High", selected = effort == "high", onClick = { onSetEffort("high") })
+                }
+            }
         }
         IconButton(onClick = onStar) {
             Icon(
@@ -285,6 +319,17 @@ private fun ModelRow(
     }
 }
 
+/** One small effort chip (Default / Low / Medium / High) in a model row. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EffortChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label, style = MaterialTheme.typography.labelSmall) }
+    )
+}
+
 @Composable
 private fun ProviderCard(
     provider: Provider,
@@ -297,6 +342,9 @@ private fun ProviderCard(
     onRemoveKey: (String) -> Unit,
     apiKeys: List<com.inyogeshwar.codesathi.data.KeyStore.KeyDisplay>,
     favourites: List<com.inyogeshwar.codesathi.data.FavouriteModel>,
+    efforts: Map<String, String>,
+    /** (modelId, effort) — effort null means back to Default. */
+    onSetEffort: (String, String?) -> Unit,
     onStar: (String) -> Unit,
     onAddFallback: (String) -> Unit,
     onSelectModel: (String) -> Unit,
@@ -357,6 +405,8 @@ private fun ProviderCard(
                         provider = provider,
                         modelId = model,
                         starred = favourites.any { it.modelKey == provider.modelKey(model) },
+                        effort = efforts[provider.modelKey(model)],
+                        onSetEffort = { onSetEffort(model, it) },
                         onStar = { onStar(model) },
                         onSelect = { onSelectModel(model) },
                         onAddFallback = { onAddFallback(model) }
@@ -385,6 +435,8 @@ private fun ProviderCard(
                         provider = provider,
                         modelId = model,
                         starred = favourites.any { it.modelKey == provider.modelKey(model) },
+                        effort = efforts[provider.modelKey(model)],
+                        onSetEffort = { onSetEffort(model, it) },
                         onStar = { onStar(model) },
                         onSelect = { onSelectModel(model) },
                         onAddFallback = { onAddFallback(model) }

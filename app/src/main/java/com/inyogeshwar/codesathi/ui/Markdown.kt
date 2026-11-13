@@ -221,8 +221,15 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                                 Icon(Icons.Filled.ContentCopy, contentDescription = "Copy code")
                             }
                         }
+                        // Phase 3, Step 5: same hand-rolled highlighter
+                        // as the diff card, keyed off the fence's
+                        // language tag; unknown languages stay plain.
+                        // Computed once per block, not per recomposition.
+                        val highlighted = remember(block.code, block.language) {
+                            highlightCode(block.code, languageForName(block.language))
+                        }
                         Text(
-                            text = block.code,
+                            text = highlighted,
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodySmall
                         )

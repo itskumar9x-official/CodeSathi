@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import com.inyogeshwar.codesathi.agent.TerminalFolder
 import com.inyogeshwar.codesathi.agent.TerminalLine
 import com.inyogeshwar.codesathi.agent.TerminalLineKind
+import com.inyogeshwar.codesathi.agent.hasAllFilesAccess
 import com.inyogeshwar.codesathi.ui.TerminalViewModel
 
 /**
@@ -160,9 +161,19 @@ fun TerminalScreen(viewModel: TerminalViewModel, onBack: () -> Unit) {
                         }
                     }
                     Spacer(Modifier.height(4.dp))
+                    // Phase 3, Step 4: say plainly whether the shell has
+                    // raw-filesystem access, and what to do when it does
+                    // not — a SAF grant alone can make file-touching
+                    // commands print "Permission denied".
                     Text(
-                        "Commands run with the app's own permissions — they can read " +
-                            "and change files in this folder.",
+                        if (hasAllFilesAccess()) {
+                            "All-files access is on — commands can read and " +
+                                "change files in this folder directly."
+                        } else {
+                            "Commands run with the app's own permissions. " +
+                                "File-touching commands may print \"Permission denied\" — " +
+                                "turning on all-files access (Home → Storage access) can fix that."
+                        },
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

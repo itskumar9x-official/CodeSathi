@@ -32,6 +32,22 @@ data class McpServer(
 )
 
 /**
+ * One user-defined slash command (Phase 3, Step 1). Typing "/[name]"
+ * in chat expands to [prompt] before the message reaches the model.
+ * [prompt] may contain "{input}" — the text typed after the command
+ * name replaces it; otherwise the text is appended after the prompt.
+ * Commands hold no secrets, so plain DataStore storage is fine.
+ */
+@Serializable
+data class CustomCommand(
+    val id: String,
+    val name: String,
+    val prompt: String,
+    val description: String = "",
+    val enabled: Boolean = true
+)
+
+/**
  * Why a key stopped working, and when it may be tried again.
  * `kind` is "QUOTA" (HTTP 402, or a body mentioning quota) or "RATE"
  * (plain HTTP 429). `untilMillis` is the start of the next local day —
@@ -58,6 +74,9 @@ class PreferencesStore(private val context: Context) {
         private val EXHAUSTED = stringPreferencesKey("exhausted_json")
         private val MCP_SERVERS = stringPreferencesKey("mcp_servers_json")
         private val MCP_DEFAULTS_SEEDED = booleanPreferencesKey("mcp_defaults_seeded")
+        private val COMMANDS = stringPreferencesKey("commands_json")
+        private val COMMAND_DEFAULTS_SEEDED = booleanPreferencesKey("commands_defaults_seeded")
+        private val REASONING_EFFORT = stringPreferencesKey("reasoning_effort_json")
         private val SKILL_ENABLED = stringPreferencesKey("skill_enabled_json")
         private val VOICE_OUTPUT = booleanPreferencesKey("voice_output_enabled")
         private val REMOTE_ENABLED = booleanPreferencesKey("remote_enabled")
@@ -66,6 +85,14 @@ class PreferencesStore(private val context: Context) {
          *  the user enables it and adds their own key when they want it.
          *  No key is bundled with the app. */
         const val EXA_MCP_URL = "https://mcp.exa.ai/mcp"
+
+        /** Reasoning-effort values (Phase 3, Step 2): "low" | "medium" | "high". */
+        const val EFFORT_LOW = "low"
+        const val EFFORT_MEDIUM = "medium"
+        const val EFFORT_HIGH = "high"
+
+        /** The only values [setReasoningEffort] stores; anything else is dropped. */
+        val VALID_EFFORTS = setOf(EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH)
 
         /** Per-tool permission rule: "allow" | "ask" | "deny". */
         const val RULE_ALLOW = "allow"
@@ -240,6 +267,133 @@ class PreferencesStore(private val context: Context) {
             if (it.id == serverId) it.copy(enabled = enabled) else it
         }
         context.dataStore.edit { it[MCP_SERVERS] = Json.encodeToString<List<McpServer>>(current) }
+    }
+
+    // ---- Custom commands (Phase 3, Step 1) ----
+
+    val customCommands: Flow<List<CustomCommand>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[COMMANDS] ?: return@map emptyList()
+        try {
+            Json.decodeFromString<List<CustomCommand>>(raw)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Seed the two built-in example commands once. Never overwrites a
+     * list the user already has — if commands exist, this only marks
+     * the seeding done. The user can edit or delete both examples.
+     */
+    suspend fun ensureDefaultCommands() {
+        val prefs = context.dataStore.data.first()
+        if (prefs[COMMAND_DEFAULTS_SEEDED] == true) return
+        val existing = try {
+            prefs[COMMANDS]?.let { Json.decodeFromString<List<CustomCommand>>(it) }.orEmpty()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        context.dataStore.edit {
+            if (existing.isEmpty()) {
+                it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(
+                    listOf(
+                        CustomCommand(
+                            id = "review-code",
+                            name = "review-code",
+                            prompt = "Review the code in this project carefully. Look for bugs, " +
+                                "security problems, and places where the code is hard to read or " +
+                                "maintain. For each problem, name the file, explain what is wrong " +
+                                "in plain words, and suggest a concrete fix. End with a short list " +
+                                "of the most important fixes first. If I named a specific file or " +
+                                "area, focus the review on that: {input}",
+                            description = "Review the project code for bugs, security issues and readability.",
+                            enabled = true
+                        ),
+                        CustomCommand(
+                            id = "write-tests",
+                            name = "write-tests",
+                            prompt = "Write tests for the code I mention. Use the testing style " +
+                                "already used in this project if there is one; otherwise use the " +
+                                "standard test setup for the language. Cover the main behaviour and " +
+                                "the edge cases, and keep each test short and focused on one thing. " +
+                                "If I did not name any code, pick the most important untested part " +
+                                "of the project and say which part you chose. " +
+                                "The code or area to test: {input}",
+                            description = "Write tests for the code you name.",
+                            enabled = true
+                        )
+                    )
+                )
+            }
+            it[COMMAND_DEFAULTS_SEEDED] = true
+        }
+    }
+
+    /** Add a command; a command with the same id replaces the old one. */
+    suspend fun addCustomCommand(command: CustomCommand) {
+        val current = customCommands.first().filterNot { it.id == command.id } + command
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
+    }
+
+    /** Replace a command by id (used for edits); no-op when the id is unknown. */
+    suspend fun updateCustomCommand(command: CustomCommand) {
+        val current = customCommands.first()
+        if (current.none { it.id == command.id }) return
+        val updated = current.map { if (it.id == command.id) command else it }
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(updated) }
+    }
+
+    suspend fun removeCustomCommand(commandId: String) {
+        val current = customCommands.first().filterNot { it.id == commandId }
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
+    }
+
+    suspend fun setCustomCommandEnabled(commandId: String, enabled: Boolean) {
+        val current = customCommands.first().map {
+            if (it.id == commandId) it.copy(enabled = enabled) else it
+        }
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
+    }
+
+    // ---- Reasoning effort per model (Phase 3, Step 2) ----
+
+    /**
+     * "providerId/modelId" → "low" | "medium" | "high", same JSON-map
+     * pattern as [toolRules] / [skillEnabled]. No entry means "default":
+     * the app sends no effort field at all for that model. Only values
+     * in [VALID_EFFORTS] are ever stored; anything else is dropped on
+     * read, so a corrupt entry can never reach a provider request.
+     */
+    val reasoningEfforts: Flow<Map<String, String>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[REASONING_EFFORT] ?: return@map emptyMap()
+        try {
+            Json.decodeFromString<Map<String, String>>(raw)
+                .filterValues { it in VALID_EFFORTS }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    /** The stored effort for one model, or null when it is unset (default). */
+    suspend fun reasoningEffort(providerId: String, modelId: String): String? =
+        reasoningEfforts.first()["$providerId/$modelId"]
+
+    /**
+     * Set the effort for one model. [effort] is "low" | "medium" |
+     * "high", or null to go back to "default" (the entry is removed, so
+     * no effort is sent). Any other value is ignored.
+     */
+    suspend fun setReasoningEffort(providerId: String, modelId: String, effort: String?) {
+        val current = reasoningEfforts.first().toMutableMap()
+        val key = "$providerId/$modelId"
+        if (effort == null) {
+            current.remove(key)
+        } else if (effort in VALID_EFFORTS) {
+            current[key] = effort
+        } else {
+            return
+        }
+        context.dataStore.edit { it[REASONING_EFFORT] = Json.encodeToString<Map<String, String>>(current) }
     }
 
     // ---- Fallback chain (Phase 2, Step 1) ----

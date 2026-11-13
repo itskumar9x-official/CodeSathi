@@ -35,6 +35,10 @@ sealed interface ChatStreamEvent {
  * Written for CodeSathi — no third-party HTTP library.
  *
  * - OpenAI-compatible providers: POST {baseUrl}/chat/completions, SSE.
+ *   When the user set a reasoning effort for the model, it is sent as
+ *   `reasoning_effort` ("low" | "medium" | "high"); unset means nothing
+ *   is sent. Anthropic providers never get an effort field (see
+ *   [requestBody]).
  * - Anthropic providers: POST {baseUrl}/messages with
  *   `anthropic-version: 2023-06-01` and `x-api-key`, SSE.
  * - Local providers (Ollama / LM Studio) work the same way with no key.
@@ -51,14 +55,17 @@ class LlmClient {
      * callers must catch and show the error, never fake a reply.
      * Tool calls in the reply are ignored here; use [streamChatEvents]
      * when the caller needs them.
+     * [reasoningEffort] is "low" | "medium" | "high" when the user set an
+     * effort for this model, null for the default (nothing is sent).
      */
     fun streamChat(
         provider: Provider,
         modelId: String,
         apiKey: String?,
-        messages: List<LlmMessage>
+        messages: List<LlmMessage>,
+        reasoningEffort: String? = null
     ): Flow<String> = flow {
-        streamChatEvents(provider, modelId, apiKey, messages).collect { event ->
+        streamChatEvents(provider, modelId, apiKey, messages, reasoningEffort).collect { event ->
             if (event is ChatStreamEvent.Text) emit(event.chunk)
         }
     }
@@ -72,7 +79,8 @@ class LlmClient {
         provider: Provider,
         modelId: String,
         apiKey: String?,
-        messages: List<LlmMessage>
+        messages: List<LlmMessage>,
+        reasoningEffort: String? = null
     ): Flow<ChatStreamEvent> = flow {
         val url = URL(chatUrl(provider))
         val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -91,7 +99,7 @@ class LlmClient {
             doOutput = true
         }
         try {
-            val body = requestBody(provider, modelId, messages)
+            val body = requestBody(provider, modelId, messages, reasoningEffort)
             conn.outputStream.bufferedWriter().use { it.write(body) }
             val code = conn.responseCode
             if (code !in 200..299) {
@@ -113,7 +121,28 @@ class LlmClient {
         return if (provider.kind == "anthropic") "$base/messages" else "$base/chat/completions"
     }
 
-    private fun requestBody(provider: Provider, modelId: String, messages: List<LlmMessage>): String {
+    /**
+     * Build the request body. [reasoningEffort] is sent ONLY when set
+     * ("low" | "medium" | "high"): to OpenAI-kind providers as
+     * `reasoning_effort` in /chat/completions, and to Anthropic-kind
+     * providers as `output_config.effort` in /messages — verified
+     * against Anthropic's own docs (platform.claude.com/docs/en/
+     * build-with-claude/effort, Nov 2026): the field is
+     * `output_config.effort`, levels low/medium/high/xhigh/max. Only
+     * low/medium/high are ever sent (the picker offers those).
+     * Anthropic lists effort for Claude 4.5+ / 5.x models; an older
+     * model that does not support it answers 400. A model that does
+     * not support the field answers 400, which surfaces through the
+     * normal [LlmException] path — no new error handling. Note:
+     * Anthropic recommends a large max_tokens at high effort; this
+     * client still sends max_tokens 4096.
+     */
+    private fun requestBody(
+        provider: Provider,
+        modelId: String,
+        messages: List<LlmMessage>,
+        reasoningEffort: String? = null
+    ): String {
         val msgs = messages.joinToString(",") { m ->
             val role = escape(m.role)
             val content = escape(m.content)
@@ -124,10 +153,26 @@ class LlmClient {
             val rest = messages.filter { it.role != "system" }
                 .joinToString(",") { m -> """{"role":"${escape(m.role)}","content":"${escape(m.content)}"}""" }
             val systemPart = if (system != null) ",\"system\":\"${escape(system)}\"" else ""
-            """{"model":"${escape(modelId)}","max_tokens":4096,"stream":true$systemPart,"messages":[$rest]}"""
+            // Anthropic effort (verified, see KDoc above): only a valid,
+            // user-set effort is sent; "default" (null) sends nothing.
+            val effortPart = if (reasoningEffort in VALID_REASONING_EFFORTS) {
+                ",\"output_config\":{\"effort\":\"$reasoningEffort\"}"
+            } else ""
+            """{"model":"${escape(modelId)}","max_tokens":4096,"stream":true$systemPart$effortPart,"messages":[$rest]}"""
         } else {
-            """{"model":"${escape(modelId)}","stream":true,"messages":[$msgs]}"""
+            // Only a valid, user-set effort is sent; "default" (null) and
+            // any unexpected value send nothing, so the request is exactly
+            // what an unset model would have sent.
+            val effortPart = if (reasoningEffort in VALID_REASONING_EFFORTS) {
+                ",\"reasoning_effort\":\"$reasoningEffort\""
+            } else ""
+            """{"model":"${escape(modelId)}","stream":true$effortPart,"messages":[$msgs]}"""
         }
+    }
+
+    companion object {
+        /** The only effort values ever sent to a provider. */
+        private val VALID_REASONING_EFFORTS = setOf("low", "medium", "high")
     }
 
     /**

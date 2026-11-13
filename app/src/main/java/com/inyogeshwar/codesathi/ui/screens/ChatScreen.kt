@@ -95,6 +95,14 @@ fun ChatScreen(
             .map { info -> mcpToolName(server.id, info.name) }
     }
 
+    // Custom commands (Phase 3, Step 1): while the input starts with "/"
+    // and has no space yet, suggest enabled commands matching what is typed.
+    val commands by viewModel.customCommands.collectAsState()
+    val commandSuggestions = if (input.startsWith("/") && !input.contains(" ")) {
+        val prefix = input.removePrefix("/").lowercase()
+        commands.filter { it.enabled && it.name.startsWith(prefix) }.take(5)
+    } else emptyList()
+
     // Voice (Phase 2, Step 5): mic input + voice-output toggle.
     val voiceOutputEnabled by viewModel.voiceOutputEnabled.collectAsState()
     var listening by remember { mutableStateOf(false) }
@@ -167,6 +175,9 @@ fun ChatScreen(
     val provider = viewModel.provider(session.providerId)
     val needsKey = provider != null && !provider.local && !viewModel.hasApiKey(session.providerId)
     val tokenEstimate = viewModel.tokenEstimate(messages)
+    // Reasoning effort for this session's model (Phase 3, Step 2), if set.
+    val efforts by viewModel.reasoningEfforts.collectAsState()
+    val effort = efforts["${session.providerId}/${session.modelId}"]
 
     Scaffold(
         topBar = {
@@ -243,7 +254,9 @@ fun ChatScreen(
                 )
             }
             Text(
-                "Model: ${session.providerId} / ${session.modelId}  •  ${TokenCounter.formatApproximate(tokenEstimate)}",
+                "Model: ${session.providerId} / ${session.modelId}" +
+                    (if (effort != null) "  •  Effort: $effort" else "") +
+                    "  •  ${TokenCounter.formatApproximate(tokenEstimate)}",
                 style = MaterialTheme.typography.bodySmall
             )
             if (viewModel.summarisedBanner) {
@@ -341,6 +354,19 @@ fun ChatScreen(
                 Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
             }
 
+            // Command suggestions: tap one to complete "/name " in the input.
+            if (commandSuggestions.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    commandSuggestions.forEach { cmd ->
+                        OutlinedButton(onClick = { input = "/${cmd.name} " }) {
+                            Text("/${cmd.name}")
+                        }
+                    }
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -395,7 +421,7 @@ fun ChatScreen(
             }
             if (messages.isEmpty() && !needsKey) {
                 Text(
-                    "What do you want to build today? Try: “Build a single-file portfolio website for Yogeshwar Kumar”.",
+                    "What do you want to build today? Try: “Build a single-file portfolio website for Yogeshwar Kumar”. Type / to see your custom commands.",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(top = 8.dp)
                 )
@@ -511,36 +537,6 @@ private fun PlanCard(
                 "Nothing is written to disk until you approve.",
                 style = MaterialTheme.typography.bodySmall
             )
-        }
-    }
-}
-
-@Composable
-private fun DiffCard(
-    proposal: com.inyogeshwar.codesathi.agent.PlannedFile,
-    oldContent: String?,
-    onApprove: () -> Unit,
-    onReject: () -> Unit
-) {
-    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Column(Modifier.padding(12.dp)) {
-            Text(
-                if (proposal.action == "create") "New file: ${proposal.path}" else "Edit: ${proposal.path}",
-                style = MaterialTheme.typography.titleMedium
-            )
-            if (proposal.action == "edit") {
-                Text("Old:", style = MaterialTheme.typography.labelMedium)
-                Text(oldContent?.take(600) ?: "(old content unavailable)", style = MaterialTheme.typography.bodySmall)
-                Text("New snippet:", style = MaterialTheme.typography.labelMedium)
-                Text(proposal.newSnippet?.take(600).orEmpty(), style = MaterialTheme.typography.bodySmall)
-            } else {
-                Text("New file content (first 600 chars):", style = MaterialTheme.typography.labelMedium)
-                Text(proposal.newContent?.take(600).orEmpty(), style = MaterialTheme.typography.bodySmall)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                Button(onClick = onApprove) { Text("Approve") }
-                OutlinedButton(onClick = onReject) { Text("Reject") }
-            }
         }
     }
 }

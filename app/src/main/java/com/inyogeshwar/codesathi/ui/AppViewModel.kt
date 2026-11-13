@@ -30,6 +30,7 @@ import com.inyogeshwar.codesathi.agent.Tool
 import com.inyogeshwar.codesathi.agent.ToolContext
 import com.inyogeshwar.codesathi.agent.mcpToolsFor
 import com.inyogeshwar.codesathi.agent.v1Tools
+import com.inyogeshwar.codesathi.data.CustomCommand
 import com.inyogeshwar.codesathi.data.FallbackEntry
 import com.inyogeshwar.codesathi.data.FavouriteModel
 import com.inyogeshwar.codesathi.data.KeyStore
@@ -253,8 +254,12 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 Message(sessionId = session.id, role = "user", text = trimmed, createdAt = System.currentTimeMillis())
             )
             db.sessionDao().touch(session.id, System.currentTimeMillis())
-            val history = db.messageDao().getMessages(session.id)
-            runAgentTurn(session, provider, apiKey, history, trimmed, context)
+            val history = db.messageDao().getMessages(sessionId)
+            // Slash command (Phase 3, Step 1): the stored message stays
+            // as the user typed it; only the text sent to the model is
+            // expanded. Works in Plan and Build alike.
+            val expanded = expandCommand(trimmed)
+            runAgentTurn(session, provider, apiKey, history, expanded, context)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -318,6 +323,8 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         }
         // Seed the pre-filled (disabled) Exa MCP entry once.
         viewModelScope.launch { prefs.ensureDefaultServers() }
+        // Seed the two built-in example slash commands once.
+        viewModelScope.launch { prefs.ensureDefaultCommands() }
         // Seed the built-in skills into getFilesDir()/skills/ once.
         viewModelScope.launch {
             skillStore.ensureSeeded()
@@ -377,6 +384,51 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             clearPickedFolder()
         }
         return id
+    }
+
+    /** Outcome note for the last [createSessionFromFolderUri] call:
+     *  whether the subfolder's persistable grant was saved, or — when
+     *  it could not be — that the session may stop working after a
+     *  restart. The editor shows this note instead of pretending. */
+    var subfolderGrantNote by mutableStateOf<String?>(null)
+        private set
+
+    /**
+     * Create a session from a folder URI the app did not get from the
+     * system picker (Phase 3, Step 5 — "new session from a subfolder"
+     * in the editor tree). Reuses the normal new-session path: the URI
+     * goes through [onFolderPicked] (persistable grant) and then
+     * [createSession], so the session gets the default model, Plan
+     * mode, and becomes the last session exactly like a picked folder.
+     * Returns the new session id, or null when no session was made.
+     *
+     * Honest limit: taking a persistable grant on a subfolder tree URI
+     * can fail (the grant lives on the parent tree) — when it does,
+     * the session is still created from the URI, which works right now
+     * under the parent folder's grant, and [subfolderGrantNote] says
+     * plainly that the permission may not survive a restart, so the
+     * user can re-choose the folder from Home if it ever stops working.
+     */
+    fun createSessionFromFolderUri(context: Context, treeUri: Uri, name: String): String? {
+        val picked = try {
+            onFolderPicked(context, treeUri)
+        } catch (_: Exception) {
+            null
+        }
+        subfolderGrantNote = if (picked != null) {
+            "Session “$name” created — the folder permission was saved, so it survives restarts."
+        } else {
+            "Session “$name” created, but its folder permission could not be saved — " +
+                "it may stop working after a restart. Re-choose the folder from Home if it does."
+        }
+        if (picked == null) {
+            // No persistable grant, but the tree URI is usable right now
+            // under the parent folder's grant: record it directly so the
+            // session is created instead of failing outright.
+            pickedFolderUri = treeUri
+            pickedFolderName = name
+        }
+        return createSession(name)
     }
 
     private var cachedDefault: Pair<String, String>? = null
@@ -443,6 +495,23 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         keysVersion++
         refreshExhausted()
     }
+
+    // ---- Reasoning effort per model (Phase 3, Step 2) ----
+
+    /** "providerId/modelId" → "low" | "medium" | "high", from DataStore. */
+    val reasoningEfforts: StateFlow<Map<String, String>> =
+        prefs.reasoningEfforts.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap()
+        )
+
+    /** Set the effort for one model; null goes back to "default" (unset). */
+    fun setReasoningEffort(providerId: String, modelId: String, effort: String?) {
+        viewModelScope.launch { prefs.setReasoningEffort(providerId, modelId, effort) }
+    }
+
+    /** The stored effort for one model, or null when it is unset (default). */
+    suspend fun reasoningEffort(providerId: String, modelId: String): String? =
+        prefs.reasoningEffort(providerId, modelId)
 
     // ---- Fallback chain (Phase 2, Step 1) ----
 
@@ -656,6 +725,132 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         skillError = null
     }
 
+    // ---- Custom commands (Phase 3, Step 1) ----
+
+    /** User-defined slash commands, from DataStore. */
+    val customCommands: StateFlow<List<CustomCommand>> =
+        prefs.customCommands.stateIn(
+            viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList()
+        )
+
+    /** One-line note / error from the last commands action, for the Commands screen. */
+    var commandNote by mutableStateOf<String?>(null)
+        private set
+    var commandError by mutableStateOf<String?>(null)
+        private set
+
+    /** A command name is lowercase letters, digits and hyphens only. */
+    private fun isValidCommandName(name: String): Boolean =
+        name.isNotEmpty() && name.all { it == '-' || it.isDigit() || it.isLowerCase() }
+
+    /** Add a command. The name becomes the id; duplicates and bad names are refused.
+     *  Returns true when the command was accepted (false = validation error set). */
+    fun createCommand(name: String, description: String, prompt: String): Boolean {
+        val cleanName = name.trim().lowercase()
+        if (!isValidCommandName(cleanName)) {
+            commandError = "Command names use lowercase letters, digits and hyphens only (e.g. review-code)."
+            commandNote = null
+            return false
+        }
+        if (prompt.isBlank()) {
+            commandError = "Give the command a prompt template."
+            commandNote = null
+            return false
+        }
+        if (customCommands.value.any { it.name == cleanName }) {
+            commandError = "A command named “/$cleanName” already exists — pick another name."
+            commandNote = null
+            return false
+        }
+        val command = CustomCommand(
+            id = cleanName + "-" + UUID.randomUUID().toString().take(8),
+            name = cleanName,
+            prompt = prompt.trim(),
+            description = description.trim(),
+            enabled = true
+        )
+        viewModelScope.launch {
+            prefs.addCustomCommand(command)
+            commandNote = "Command “/$cleanName” added and enabled."
+            commandError = null
+        }
+        return true
+    }
+
+    /** Save an edited command (name, description, prompt). Renames are
+     *  refused when the new name is invalid or already taken by another command.
+     *  Returns true when the edit was accepted (false = validation error set). */
+    fun saveCommand(command: CustomCommand): Boolean {
+        val cleanName = command.name.trim().lowercase()
+        if (!isValidCommandName(cleanName)) {
+            commandError = "Command names use lowercase letters, digits and hyphens only (e.g. review-code)."
+            commandNote = null
+            return false
+        }
+        if (command.prompt.isBlank()) {
+            commandError = "Give the command a prompt template."
+            commandNote = null
+            return false
+        }
+        if (customCommands.value.any { it.id != command.id && it.name == cleanName }) {
+            commandError = "A command named “/$cleanName” already exists — pick another name."
+            commandNote = null
+            return false
+        }
+        viewModelScope.launch {
+            prefs.updateCustomCommand(command.copy(name = cleanName))
+            commandNote = "Command “/$cleanName” saved."
+            commandError = null
+        }
+        return true
+    }
+
+    fun deleteCommand(commandId: String) {
+        viewModelScope.launch {
+            prefs.removeCustomCommand(commandId)
+            commandNote = "Command deleted."
+            commandError = null
+        }
+    }
+
+    fun setCommandEnabled(commandId: String, enabled: Boolean) {
+        viewModelScope.launch { prefs.setCustomCommandEnabled(commandId, enabled) }
+    }
+
+    fun dismissCommandMessage() {
+        commandNote = null
+        commandError = null
+    }
+
+    /**
+     * Expand a chat message that starts with "/name".
+     *
+     * - "/name some text" → the command's prompt, with "{input}" replaced
+     *   by "some text" when the prompt contains it, otherwise the prompt
+     *   followed by the text on a new line. "/name" alone → the prompt.
+     * - Unknown names, disabled commands, and messages not starting with
+     *   "/" pass through unchanged — the chat never breaks on a slash.
+     * The raw message is what gets stored in the chat history; only the
+     * text sent to the model is expanded.
+     */
+    suspend fun expandCommand(text: String): String {
+        val trimmed = text.trim()
+        if (!trimmed.startsWith("/")) return trimmed
+        val afterSlash = trimmed.removePrefix("/")
+        val name = afterSlash.substringBefore(" ").lowercase()
+        if (name.isEmpty()) return trimmed
+        val args = afterSlash.substringAfter(" ", "").trim()
+        val command = prefs.customCommands.first()
+            .firstOrNull { it.enabled && it.name == name } ?: return trimmed
+        return if ("{input}" in command.prompt) {
+            command.prompt.replace("{input}", args)
+        } else if (args.isNotEmpty()) {
+            "${command.prompt}\n\n$args"
+        } else {
+            command.prompt
+        }
+    }
+
     fun toggleFavourite(providerId: String, modelId: String) {
         val key = "$providerId/$modelId"
         viewModelScope.launch {
@@ -784,7 +979,59 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         }
     }
 
-    fun approveProposal(session: Session, context: Context) {
+    /**
+     * Editor save (Phase 3, Step 3): turn the editor's text into the SAME
+     * [PlannedFile] proposal the agent's writes use, so the file is only
+     * written when the user taps Approve on the diff card — there is no
+     * second write path. Returns an error message, or null when the
+     * proposal is ready and waiting for approval.
+     *
+     * - Plan mode refuses: the editor never writes in Plan mode.
+     * - A proposal already waiting (agent's or editor's) refuses: one
+     *   approval at a time.
+     * - "edit" carries the whole old file as [PlannedFile.oldSnippet]
+     *   and the whole new text as [PlannedFile.newSnippet], so
+     *   [AgentRunner.applyFileProposal] replaces the file only when the
+     *   disk still holds that old text — an agent change made meanwhile
+     *   fails the write instead of being silently overwritten.
+     * - An empty / missing file on disk becomes "create" (full overwrite),
+     *   because an "edit" with an empty old snippet would corrupt the
+     *   file (`String.replace("", …)` inserts at every position).
+     */
+    fun proposeEditorSave(session: Session, path: String, newContent: String, context: Context): String? {
+        if (session.agentMode == "plan") {
+            return "Plan mode is read-only — switch to Build in Chat to save changes."
+        }
+        if (pendingProposal != null) {
+            return "Another file change is waiting for approval — approve or reject it first."
+        }
+        val project = SafProject(context, Uri.parse(session.projectUri))
+        val old = project.readText(path)
+        pendingProposal = if (old.isNullOrEmpty()) {
+            PlannedFile(path = path, action = "create", newContent = newContent)
+        } else {
+            PlannedFile(path = path, action = "edit", oldSnippet = old, newSnippet = newContent)
+        }
+        pendingProposalOld = old
+        return null
+    }
+
+    /**
+     * Approve the pending proposal and write the file (agent's or
+     * editor's — both are the same [PlannedFile]).
+     *
+     * [resumeAgent] is true for agent proposals: after a verified write
+     * the Build loop resumes with a continuation message. Editor saves
+     * pass false — there is no agent turn to resume. [onApplied] reports
+     * whether the write succeeded, so the editor can clear its dirty
+     * marker (or keep it and show the error).
+     */
+    fun approveProposal(
+        session: Session,
+        context: Context,
+        resumeAgent: Boolean = true,
+        onApplied: ((Boolean) -> Unit)? = null
+    ) {
         val proposal = pendingProposal ?: return
         pendingProposal = null
         pendingProposalOld = null
@@ -803,13 +1050,19 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
             db.sessionDao().touch(session.id, System.currentTimeMillis())
             // The loop paused for approval — resume it so the agent keeps
             // working toward the goal instead of stopping after one file.
+            // Editor saves (resumeAgent = false) have no turn to resume.
             if (event is AgentEvent.Verified) {
-                resumeBuild(
-                    session,
-                    context,
-                    "User approved and applied the change to ${proposal.path}. " +
-                        "Continue working toward the goal; use tools as needed and finish with a short summary."
-                )
+                onApplied?.invoke(true)
+                if (resumeAgent) {
+                    resumeBuild(
+                        session,
+                        context,
+                        "User approved and applied the change to ${proposal.path}. " +
+                            "Continue working toward the goal; use tools as needed and finish with a short summary."
+                    )
+                }
+            } else {
+                onApplied?.invoke(false)
             }
         }
     }
@@ -856,7 +1109,11 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
                 )
                 db.sessionDao().touch(session.id, System.currentTimeMillis())
                 val history = db.messageDao().getMessages(session.id)
-                runAgentTurn(session, provider, apiKey, history, trimmed, context)
+                // Slash command (Phase 3, Step 1): the stored message stays
+                // as the user typed it; only the text sent to the model is
+                // expanded. Works in Plan and Build alike.
+                val expanded = expandCommand(trimmed)
+                runAgentTurn(session, provider, apiKey, history, expanded, context)
             } catch (e: Exception) {
                 if (e !is kotlinx.coroutines.CancellationException) {
                     lastError = e.message ?: "Agent run failed."
@@ -885,7 +1142,12 @@ class AppViewModel(private val app: CodeSathiApp) : ViewModel() {
         // same runner. The enabled skills are also listed in the Build
         // system prompt, so the model knows what it can call.
         ensureMcpToolsLoaded()
-        val runner = AgentRunner(llm, v1Tools(project) + mcpTools() + skillTools(), fallbackEngine)
+        val runner = AgentRunner(
+            llm, v1Tools(project) + mcpTools() + skillTools(), fallbackEngine,
+            // Reasoning effort (Phase 3, Step 2): looked up per attempt
+            // inside the runner, for the model actually being called.
+            effortFor = { providerId, modelId -> prefs.reasoningEffort(providerId, modelId) }
+        )
         val toolContext = ToolContext(
             readOnly = session.agentMode == "plan",
             projectUri = Uri.parse(session.projectUri),

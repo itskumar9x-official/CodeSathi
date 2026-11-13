@@ -1,9 +1,12 @@
 package com.inyogeshwar.codesathi.agent
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.Settings
 import java.io.File
 
 /**
@@ -16,6 +19,64 @@ import java.io.File
  * the terminal falls back to the app's private files dir — never
  * silently running in the wrong folder.
  */
+
+/**
+ * Phase 3, Step 4 — all-files access (MANAGE_EXTERNAL_STORAGE).
+ *
+ * A SAF tree grant lets the app read/write inside the picked folder
+ * through the DocumentsProvider, but it gives the child shell and
+ * JGit NO raw-filesystem access: `sh` and JGit work on real
+ * `java.io.File` paths, so without this permission they can hit
+ * "Permission denied" on the resolved project path even though the
+ * folder exists. With all-files access granted, the same raw-path
+ * code just works — nothing is re-implemented for it.
+ *
+ * Nothing here depends on the permission: when it is not granted,
+ * everything keeps working exactly as before via SAF, and the
+ * terminal / Git / editor only say the grant *may* help where that
+ * is honestly true (see the "Folder not found" reason below). The
+ * permission is never requested at runtime — it can only be granted
+ * from system Settings ([openAllFilesAccessSettings], tap-only).
+ */
+
+/** True on Android 11+ (API 30+), where the permission exists at all. */
+fun isAllFilesAccessSupported(): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
+/**
+ * True when the app currently holds all-files access. False on
+ * Android 10 and older, and false until the user grants it in
+ * system Settings on Android 11+.
+ */
+fun hasAllFilesAccess(): Boolean =
+    isAllFilesAccessSupported() && Environment.isExternalStorageManager()
+
+/**
+ * Open the system screen where the user can grant (or revoke)
+ * all-files access for THIS app. Call only from a tap — never
+ * unprompted, never at startup. Falls back to the general
+ * all-files-access list if this app's page cannot be opened.
+ */
+@Suppress("DEPRECATION")
+fun openAllFilesAccessSettings(context: Context) {
+    if (!isAllFilesAccessSupported()) return
+    val appPage = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+        data = Uri.parse("package:${context.packageName}")
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    if (appPage.resolveActivity(context.packageManager) != null) {
+        context.startActivity(appPage)
+        return
+    }
+    // General list as a fallback — only when it resolves, so a tap
+    // here can never crash the app on a device without the screen.
+    val listPage = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    if (listPage.resolveActivity(context.packageManager) != null) {
+        context.startActivity(listPage)
+    }
+}
 
 /** One line in the terminal history. */
 enum class TerminalLineKind { COMMAND, OUTPUT, STATUS }
@@ -93,9 +154,17 @@ fun resolveTerminalFolder(
     val root = Environment.getExternalStorageDirectory()
     val dir = if (relative.isBlank()) root else File(root, relative)
     if (!dir.isDirectory) {
+        // Without all-files access the app may be unable to SEE a
+        // folder that really exists — that is the one unresolved case
+        // where the grant can honestly help, so say so (hedged: the
+        // folder may also genuinely have been moved or deleted).
+        val hint = if (!hasAllFilesAccess()) {
+            " Without all-files access the app may not be able to see " +
+                "this folder even though it exists — see \"Storage access\" on Home."
+        } else ""
         return TerminalFolder.Unresolved(
             folderName,
-            "Folder not found at ${dir.absolutePath} — it may have been moved or deleted.",
+            "Folder not found at ${dir.absolutePath} — it may have been moved or deleted.$hint",
             fallbackDir
         )
     }

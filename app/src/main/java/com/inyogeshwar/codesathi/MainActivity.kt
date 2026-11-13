@@ -13,10 +13,13 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.inyogeshwar.codesathi.ui.AppViewModel
+import com.inyogeshwar.codesathi.ui.EditorViewModel
 import com.inyogeshwar.codesathi.ui.GitViewModel
 import com.inyogeshwar.codesathi.ui.Screen
 import com.inyogeshwar.codesathi.ui.TerminalViewModel
 import com.inyogeshwar.codesathi.ui.screens.ChatScreen
+import com.inyogeshwar.codesathi.ui.screens.CommandsScreen
+import com.inyogeshwar.codesathi.ui.screens.EditorScreen
 import com.inyogeshwar.codesathi.ui.screens.GitScreen
 import com.inyogeshwar.codesathi.ui.screens.HomeScreen
 import com.inyogeshwar.codesathi.ui.screens.McpScreen
@@ -61,9 +64,11 @@ class MainActivity : ComponentActivity() {
                                 onProviders = { nav.navigate(Screen.Providers.route) },
                                 onMcp = { nav.navigate(Screen.Mcp.route) },
                                 onSkills = { nav.navigate(Screen.Skills.route) },
+                                onCommands = { nav.navigate(Screen.Commands.route) },
                                 onTerminal = { nav.navigate(Screen.Terminal.route) },
                                 onRemote = { nav.navigate(Screen.Remote.route) },
-                                onGit = { nav.navigate(Screen.Git.route) }
+                                onGit = { nav.navigate(Screen.Git.route) },
+                                onEditor = { nav.navigate(Screen.Editor.route) }
                             )
                         }
                         composable(Screen.NewSession.route) {
@@ -103,6 +108,12 @@ class MainActivity : ComponentActivity() {
                                 onBack = { nav.popBackStack() }
                             )
                         }
+                        composable(Screen.Commands.route) {
+                            CommandsScreen(
+                                viewModel = vm,
+                                onBack = { nav.popBackStack() }
+                            )
+                        }
                         composable(Screen.Remote.route) {
                             RemoteScreen(
                                 viewModel = vm,
@@ -125,6 +136,17 @@ class MainActivity : ComponentActivity() {
                             GitScreen(
                                 viewModel = gitVm,
                                 onBack = { nav.popBackStack() }
+                            )
+                        }
+                        composable(Screen.Editor.route) {
+                            val editorVm: EditorViewModel = viewModel(
+                                factory = EditorViewModel.factory(app)
+                            )
+                            EditorScreen(
+                                viewModel = editorVm,
+                                appViewModel = vm,
+                                onBack = { nav.popBackStack() },
+                                onOpenSession = { id -> nav.navigate(Screen.Chat.route(id)) }
                             )
                         }
                     }
