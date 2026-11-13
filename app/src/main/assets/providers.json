@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "CodeSathi provider catalog (Phase 2 Step 2), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. Some entries could not be fully verified from this machine (no live API checks): providers with an empty model list, Azure OpenAI (replace YOUR-RESOURCE with your resource name) and AWS Bedrock (needs SigV4 signing, not a plain API key) may need a small fix before first use.",
+  "note": "CodeSathi provider catalog (Phase 2 Step 2 + live-check pass 2026-11-12), written fresh for this app from public knowledge and verified provider docs. No API keys are stored here. Live-check: every remote base URL was probed with GET {baseUrl}/models without auth (200/401/403 = reachable); 6 dead/duplicate entries were removed (Lambda, Predibase, MonsterAPI, Inflection, Gradient AI, Petals), 10 base URLs were corrected, and 62 providers were added. Model lists are starting examples; the app refreshes them from GET {baseUrl}/models when the provider supports it, and a model id can always be typed in by hand. Still uncertain: LangDB (new host api.langdb.ai returned 503 when probed) and Galadriel (probe blocked by this machine's egress proxy; URL corrected from official docs). Azure OpenAI (replace YOUR-RESOURCE with your resource name) and AWS Bedrock (needs SigV4 signing, not a plain API key) still need a fix before first use. CrofAI's /v1/models returns an HTML page without a key; it returns JSON with a key.",
   "providers": [
     {
       "id": "anthropic",
@@ -206,7 +206,7 @@
       "id": "minimax",
       "name": "MiniMax",
       "kind": "openai",
-      "baseUrl": "https://api.minimax.com/v1",
+      "baseUrl": "https://api.minimax.io/v1",
       "models": [
         "MiniMax-M2"
       ]
@@ -394,18 +394,11 @@
       "id": "maritalk",
       "name": "Maritaca AI",
       "kind": "openai",
-      "baseUrl": "https://api.maritalk.ai/v1",
+      "baseUrl": "https://chat.maritaca.ai/api",
       "models": [
-        "sabia-3"
-      ]
-    },
-    {
-      "id": "inflection",
-      "name": "Inflection AI",
-      "kind": "openai",
-      "baseUrl": "https://api.inflection.ai/v1",
-      "models": [
-        "inflection-3-pi"
+        "sabia-4",
+        "sabia-4-thinking",
+        "S5"
       ]
     },
     {
@@ -584,11 +577,8 @@
       "id": "hyperbolic",
       "name": "Hyperbolic",
       "kind": "openai",
-      "baseUrl": "https://api.hyperbolic.xyz/v1",
-      "models": [
-        "meta-llama/Llama-3.3-70B-Instruct",
-        "deepseek-ai/DeepSeek-R1"
-      ]
+      "baseUrl": "https://api.hyperbolic.ai/inference/v1",
+      "models": []
     },
     {
       "id": "featherless",
@@ -709,7 +699,7 @@
       "id": "gmi-cloud",
       "name": "GMI Cloud",
       "kind": "openai",
-      "baseUrl": "https://api.gmi.cloud/v1",
+      "baseUrl": "https://api.gmi-serving.com/v1",
       "models": [
         "meta-llama/Llama-3.3-70B-Instruct"
       ]
@@ -721,15 +711,6 @@
       "baseUrl": "https://api.inference.net/v1",
       "models": [
         "meta-llama/Llama-3.3-70B-Instruct"
-      ]
-    },
-    {
-      "id": "lambda",
-      "name": "Lambda",
-      "kind": "openai",
-      "baseUrl": "https://api.lambdalabs.com/v1",
-      "models": [
-        "llama-4-maverick-17b-128e-instruct-fp8"
       ]
     },
     {
@@ -806,15 +787,6 @@
       ]
     },
     {
-      "id": "predibase",
-      "name": "Predibase",
-      "kind": "openai",
-      "baseUrl": "https://serving.app.predibase.com/v1",
-      "models": [
-        "llama-3-1-8b-instruct"
-      ]
-    },
-    {
       "id": "pinecone",
       "name": "Pinecone",
       "kind": "openai",
@@ -862,15 +834,6 @@
       ]
     },
     {
-      "id": "monsterapi",
-      "name": "MonsterAPI",
-      "kind": "openai",
-      "baseUrl": "https://llm.monsterapi.ai/v1",
-      "models": [
-        "meta-llama/Llama-3.3-70B-Instruct"
-      ]
-    },
-    {
       "id": "deepbricks",
       "name": "DeepBricks",
       "kind": "openai",
@@ -910,9 +873,20 @@
       "id": "nextbit",
       "name": "Nextbit",
       "kind": "openai",
-      "baseUrl": "https://api.nextbit.io/v1",
+      "baseUrl": "https://api.nextbit256.com/v1",
       "models": [
-        "meta-llama/Llama-3.3-70B-Instruct"
+        "alia-salamandra:40b",
+        "deepseek:v4.1-flash",
+        "deepseek:v4-flash-0731",
+        "deepseek:v4-pro",
+        "deepseek:v4-pro-0813",
+        "gemma-2:27b-it",
+        "gemma3:12b-it",
+        "gemma3:27b",
+        "gemma4:26b-a4b",
+        "gemma4:31b",
+        "glm:5.3-flash",
+        "qwen3:14b"
       ]
     },
     {
@@ -928,7 +902,7 @@
       "id": "aibadgr",
       "name": "AIBadgr",
       "kind": "openai",
-      "baseUrl": "https://api.aibadgr.com/v1",
+      "baseUrl": "https://aibadgr.com/v1",
       "models": [
         "meta-llama/Llama-3.3-70B-Instruct"
       ]
@@ -955,7 +929,7 @@
       "id": "langdb",
       "name": "LangDB",
       "kind": "openai",
-      "baseUrl": "https://api.us-east-1.langdb.ai",
+      "baseUrl": "https://api.langdb.ai",
       "models": [
         "gpt-4o"
       ]
@@ -1055,8 +1029,12 @@
       "id": "dahl",
       "name": "Dahl Inference",
       "kind": "openai",
-      "baseUrl": "https://api.dahl.ai/v1",
-      "models": []
+      "baseUrl": "https://inference.dahl.global/v1",
+      "models": [
+        "MiniMaxAI/MiniMax-M2.7",
+        "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "zai-org/GLM-5.3-Flash"
+      ]
     },
     {
       "id": "grokified",
@@ -1082,8 +1060,12 @@
       "id": "nous",
       "name": "Nous Research",
       "kind": "openai",
-      "baseUrl": "https://api.nousresearch.com/v1",
-      "models": []
+      "baseUrl": "https://inference-api.nousresearch.com/v1",
+      "models": [
+        "Hermes-4.3-36B",
+        "Hermes-4-70B",
+        "Hermes-4-405B"
+      ]
     },
     {
       "id": "hetzner",
@@ -1120,14 +1102,7 @@
       "id": "galadriel",
       "name": "Galadriel",
       "kind": "openai",
-      "baseUrl": "https://api.galadriel.com/v1",
-      "models": []
-    },
-    {
-      "id": "gradientai",
-      "name": "Gradient AI",
-      "kind": "openai",
-      "baseUrl": "https://api.gradient.ai/api/v1",
+      "baseUrl": "https://api.galadriel.com/v1/verified",
       "models": []
     },
     {
@@ -1135,13 +1110,6 @@
       "name": "Heroku Inference",
       "kind": "openai",
       "baseUrl": "https://us.inference.heroku.com/v1",
-      "models": []
-    },
-    {
-      "id": "petals",
-      "name": "Petals",
-      "kind": "openai",
-      "baseUrl": "https://api.petals.dev/v1",
       "models": []
     },
     {
@@ -1420,6 +1388,529 @@
       "name": "FastChat (local)",
       "kind": "openai",
       "baseUrl": "http://127.0.0.1:8000/v1",
+      "models": [
+        "local-model"
+      ],
+      "local": true
+    },
+    {
+      "id": "agnes-ai",
+      "name": "Agnes AI",
+      "kind": "openai",
+      "baseUrl": "https://apihub.agnes-ai.com/v1",
+      "models": []
+    },
+    {
+      "id": "moark",
+      "name": "Moark",
+      "kind": "openai",
+      "baseUrl": "https://api.moark.com/v1",
+      "models": [
+        "MiniMax-M3.1-Flash",
+        "kimi-k3.1-pro",
+        "DeepSeek-V4.1-Flash-1017",
+        "GLM-5.3-Flash"
+      ]
+    },
+    {
+      "id": "hashference",
+      "name": "Hashference",
+      "kind": "openai",
+      "baseUrl": "https://hashference.com/v1",
+      "models": [
+        "hashference-glm-5-3",
+        "deepseek-v4-1-flash",
+        "anthropic-claude-sonnet-5.5"
+      ]
+    },
+    {
+      "id": "aivory",
+      "name": "Aivory",
+      "kind": "openai",
+      "baseUrl": "https://smart.aivory.net/v1",
+      "models": [
+        "aion-2.0",
+        "claude-sonnet-5.5",
+        "deepseek-v4-pro"
+      ]
+    },
+    {
+      "id": "replicate",
+      "name": "Replicate",
+      "kind": "openai",
+      "baseUrl": "https://api.replicate.com/v1",
+      "models": []
+    },
+    {
+      "id": "nararouter",
+      "name": "NaraRouter",
+      "kind": "openai",
+      "baseUrl": "https://router.bynara.id/v1",
+      "models": []
+    },
+    {
+      "id": "xkiro",
+      "name": "xKiro",
+      "kind": "openai",
+      "baseUrl": "https://api.xkiro.com/v1",
+      "models": [
+        "google/gemini-3.6-flash"
+      ]
+    },
+    {
+      "id": "api-airforce",
+      "name": "API Airforce",
+      "kind": "openai",
+      "baseUrl": "https://api.airforce/v1",
+      "models": []
+    },
+    {
+      "id": "nativeport",
+      "name": "NativePort",
+      "kind": "openai",
+      "baseUrl": "https://api.nativeport.ai/inference/v1",
+      "models": []
+    },
+    {
+      "id": "aircloud",
+      "name": "Aircloud",
+      "kind": "openai",
+      "baseUrl": "https://api.aircloud.dev/v1",
+      "models": []
+    },
+    {
+      "id": "raindragon",
+      "name": "RainDragon",
+      "kind": "openai",
+      "baseUrl": "https://inference.raindragon.ai/v1",
+      "models": [
+        "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-31B-it"
+      ]
+    },
+    {
+      "id": "sakana",
+      "name": "Sakana AI",
+      "kind": "openai",
+      "baseUrl": "https://api.sakana.ai/v1",
+      "models": [
+        "fugu",
+        "fugu-ultra-20260615"
+      ]
+    },
+    {
+      "id": "tinker",
+      "name": "Tinker",
+      "kind": "openai",
+      "baseUrl": "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+      "models": [
+        "thinkingmachines/Inkling-2-Small:peft:262144:sampling-nvfp4"
+      ]
+    },
+    {
+      "id": "synap",
+      "name": "Synap",
+      "kind": "openai",
+      "baseUrl": "https://synap.linkrra.com/v1",
+      "models": [
+        "synap-v1",
+        "qwen3-coder-30b"
+      ]
+    },
+    {
+      "id": "radium",
+      "name": "Radium",
+      "kind": "openai",
+      "baseUrl": "https://api.radium.cloud/v1",
+      "models": [
+        "clarke-1.0",
+        "hal-1.0"
+      ]
+    },
+    {
+      "id": "runbios",
+      "name": "Run BiOS",
+      "kind": "openai",
+      "baseUrl": "https://api.runbios.ai/v1",
+      "models": [
+        "anthropic/claude-haiku-5-5"
+      ]
+    },
+    {
+      "id": "opencode-zen",
+      "name": "OpenCode Zen",
+      "kind": "openai",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "models": [
+        "big-pickle",
+        "mimo-v2.6-flash-free",
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free"
+      ]
+    },
+    {
+      "id": "longcat",
+      "name": "LongCat",
+      "kind": "openai",
+      "baseUrl": "https://api.longcat.ai/openai/v1",
+      "models": [
+        "LongCat-2.5",
+        "LongCat-2.5-Preview"
+      ]
+    },
+    {
+      "id": "fastrouter",
+      "name": "FastRouter",
+      "kind": "openai",
+      "baseUrl": "https://api.fastrouter.ai/v1",
+      "models": [
+        "fastrouter/auto",
+        "anthropic/claude-opus-5.5",
+        "anthropic/claude-sonnet-5.5",
+        "google/gemini-4-carbon",
+        "moonshotai/kimi-k3.1-pro"
+      ]
+    },
+    {
+      "id": "ant-ling",
+      "name": "Ant Ling",
+      "kind": "openai",
+      "baseUrl": "https://api.ant-ling.com/v1",
+      "models": []
+    },
+    {
+      "id": "aifast",
+      "name": "AIFast Link",
+      "kind": "openai",
+      "baseUrl": "https://www.aifast.link/v1",
+      "models": []
+    },
+    {
+      "id": "tokenrouter",
+      "name": "TokenRouter",
+      "kind": "openai",
+      "baseUrl": "https://api.tokenrouter.com/v1",
+      "models": [
+        "nemotron-3-nano-omni"
+      ]
+    },
+    {
+      "id": "anyapi",
+      "name": "AnyAPI",
+      "kind": "openai",
+      "baseUrl": "https://api.anyapi.ai/v1",
+      "models": []
+    },
+    {
+      "id": "orcarouter",
+      "name": "OrcaRouter",
+      "kind": "openai",
+      "baseUrl": "https://api.orcarouter.ai/v1",
+      "models": [
+        "orcarouter/pod",
+        "orcarouter/free",
+        "orcarouter/fusion"
+      ]
+    },
+    {
+      "id": "unorouter",
+      "name": "UnoRouter",
+      "kind": "openai",
+      "baseUrl": "https://api.unorouter.com/v1",
+      "models": [
+        "gpt-oss-120b:free",
+        "deepseek-v4.1-flash-1017:free",
+        "gemini-3.8-flash:free"
+      ]
+    },
+    {
+      "id": "anonrouter",
+      "name": "AnonRouter",
+      "kind": "openai",
+      "baseUrl": "https://api.anonrouter.ai/v1",
+      "models": []
+    },
+    {
+      "id": "synthetic",
+      "name": "Synthetic",
+      "kind": "openai",
+      "baseUrl": "https://api.synthetic.new/v1",
+      "models": [
+        "syn:large:text",
+        "syn:small:text",
+        "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"
+      ]
+    },
+    {
+      "id": "kantro",
+      "name": "Kantro",
+      "kind": "openai",
+      "baseUrl": "https://kantro.dev/v1",
+      "models": []
+    },
+    {
+      "id": "openmodel",
+      "name": "OpenModel",
+      "kind": "openai",
+      "baseUrl": "https://api.openmodel.ai/v1",
+      "models": []
+    },
+    {
+      "id": "whale-api",
+      "name": "Whale API",
+      "kind": "openai",
+      "baseUrl": "https://open.xiaojingai.com/v1",
+      "models": []
+    },
+    {
+      "id": "avian",
+      "name": "Avian",
+      "kind": "openai",
+      "baseUrl": "https://api.avian.io/v1",
+      "models": [
+        "deepseek/deepseek-v4.1-flash"
+      ]
+    },
+    {
+      "id": "crofai",
+      "name": "CrofAI",
+      "kind": "openai",
+      "baseUrl": "https://crof.ai/v1",
+      "models": []
+    },
+    {
+      "id": "soruxgpt",
+      "name": "SoruxGPT",
+      "kind": "openai",
+      "baseUrl": "https://api.soruxgpt.com/v1",
+      "models": []
+    },
+    {
+      "id": "cutaihub",
+      "name": "CutAIHub",
+      "kind": "openai",
+      "baseUrl": "https://api.cutaihub.com/v1",
+      "models": []
+    },
+    {
+      "id": "martian",
+      "name": "Martian",
+      "kind": "openai",
+      "baseUrl": "https://api.withmartian.com/v1",
+      "models": [
+        "aion-labs/aion-2.0"
+      ]
+    },
+    {
+      "id": "neuralwatt",
+      "name": "Neuralwatt",
+      "kind": "openai",
+      "baseUrl": "https://api.neuralwatt.com/v1",
+      "models": [
+        "qwen-3.8-27b"
+      ]
+    },
+    {
+      "id": "omniocto",
+      "name": "Omni Octo",
+      "kind": "openai",
+      "baseUrl": "https://api.omniocto.com/v1",
+      "models": []
+    },
+    {
+      "id": "stali",
+      "name": "Stali",
+      "kind": "openai",
+      "baseUrl": "https://api.stali.vn/v1",
+      "models": []
+    },
+    {
+      "id": "abacus",
+      "name": "Abacus RouteLLM",
+      "kind": "openai",
+      "baseUrl": "https://routellm.abacus.ai/v1",
+      "models": [
+        "route-llm-code"
+      ]
+    },
+    {
+      "id": "above",
+      "name": "Above.dev",
+      "kind": "openai",
+      "baseUrl": "https://api.above.dev/v1",
+      "models": [
+        "deepseek-v4.1-flash"
+      ]
+    },
+    {
+      "id": "ai-router",
+      "name": "AI-ROUTER",
+      "kind": "openai",
+      "baseUrl": "https://api.ai-router.dev/v1",
+      "models": []
+    },
+    {
+      "id": "aixy",
+      "name": "Aixy",
+      "kind": "openai",
+      "baseUrl": "https://api.aixy-gateway.com/v1",
+      "models": []
+    },
+    {
+      "id": "aki",
+      "name": "AKI.IO",
+      "kind": "openai",
+      "baseUrl": "https://aki.io/v1",
+      "models": []
+    },
+    {
+      "id": "ambient",
+      "name": "Ambient",
+      "kind": "openai",
+      "baseUrl": "https://api.ambient.xyz/v1",
+      "models": [
+        "z-ai/glm-5.2"
+      ]
+    },
+    {
+      "id": "amd",
+      "name": "AMD Radeon AI",
+      "kind": "openai",
+      "baseUrl": "https://developer.amd.com.cn/radeon/api/v1",
+      "models": []
+    },
+    {
+      "id": "arcee",
+      "name": "Arcee AI",
+      "kind": "openai",
+      "baseUrl": "https://api.arcee.ai/api/v1",
+      "models": []
+    },
+    {
+      "id": "auriko",
+      "name": "Auriko",
+      "kind": "openai",
+      "baseUrl": "https://api.auriko.ai/v1",
+      "models": []
+    },
+    {
+      "id": "bailing",
+      "name": "Bailing",
+      "kind": "openai",
+      "baseUrl": "https://api.tbox.cn/api/llm/v1",
+      "models": []
+    },
+    {
+      "id": "bee",
+      "name": "Bee by HEOSSI",
+      "kind": "openai",
+      "baseUrl": "https://api.bee.heossi.com/bee",
+      "models": [
+        "bee-cell"
+      ]
+    },
+    {
+      "id": "berget",
+      "name": "Berget.AI",
+      "kind": "openai",
+      "baseUrl": "https://api.berget.ai/v1",
+      "models": [
+        "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+      ]
+    },
+    {
+      "id": "blueclaw",
+      "name": "Blue Claw",
+      "kind": "openai",
+      "baseUrl": "https://openai.blueclaw.network/v1",
+      "models": []
+    },
+    {
+      "id": "bothub",
+      "name": "Bothub",
+      "kind": "openai",
+      "baseUrl": "https://openai.bothub.ru/v1",
+      "models": []
+    },
+    {
+      "id": "boundless",
+      "name": "Boundless",
+      "kind": "openai",
+      "baseUrl": "https://api.inference.boundless.network/v1",
+      "models": []
+    },
+    {
+      "id": "charm-hyper",
+      "name": "Charm Hyper",
+      "kind": "openai",
+      "baseUrl": "https://hyper.charm.land/v1",
+      "models": [
+        "prism"
+      ]
+    },
+    {
+      "id": "claudinio",
+      "name": "Claudinio",
+      "kind": "openai",
+      "baseUrl": "https://api.claudin.io/v1",
+      "models": []
+    },
+    {
+      "id": "clinepass",
+      "name": "ClinePass",
+      "kind": "openai",
+      "baseUrl": "https://api.cline.bot/api/v1",
+      "models": [
+        "baidu/ernie-5.5-flash-preview:free"
+      ]
+    },
+    {
+      "id": "cloudferro",
+      "name": "CloudFerro Sherlock",
+      "kind": "openai",
+      "baseUrl": "https://api-sherlock.cloudferro.com/openai/v1",
+      "models": []
+    },
+    {
+      "id": "commandcode",
+      "name": "CommandCode",
+      "kind": "openai",
+      "baseUrl": "https://api.commandcode.ai/provider/v1",
+      "models": [
+        "claude-sonnet-5-5"
+      ]
+    },
+    {
+      "id": "coralbricks",
+      "name": "CoralBricks",
+      "kind": "openai",
+      "baseUrl": "https://inference.coralbricks.ai/v1",
+      "models": []
+    },
+    {
+      "id": "cortecs",
+      "name": "Cortecs",
+      "kind": "openai",
+      "baseUrl": "https://api.cortecs.ai/v1",
+      "models": [
+        "gemini-4-carbon"
+      ]
+    },
+    {
+      "id": "open-webui",
+      "name": "Open WebUI (local)",
+      "kind": "openai",
+      "baseUrl": "http://127.0.0.1:8080/openai/v1",
+      "models": [
+        "local-model"
+      ],
+      "local": true
+    },
+    {
+      "id": "llama-swap",
+      "name": "llama-swap (local)",
+      "kind": "openai",
+      "baseUrl": "http://127.0.0.1:8080/v1",
       "models": [
         "local-model"
       ],
