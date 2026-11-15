@@ -17,7 +17,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.SdStorage
@@ -40,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -50,6 +50,7 @@ import com.inyogeshwar.codesathi.agent.isAllFilesAccessSupported
 import com.inyogeshwar.codesathi.agent.openAllFilesAccessSettings
 import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.ui.AppViewModel
+import com.inyogeshwar.codesathi.ui.theme.ClozedCard
 import com.inyogeshwar.codesathi.ui.theme.LocalSathiStatus
 import com.inyogeshwar.codesathi.ui.theme.Pill
 import com.inyogeshwar.codesathi.ui.theme.SathiCard
@@ -208,10 +209,13 @@ internal fun StorageAccessCard(modifier: Modifier = Modifier) {
 }
 
 /**
- * One session in a list. Tapping opens it, or — when its folder grant
- * is gone — opens the system folder picker to re-choose it.
- * [showActions] adds pin / rename / delete (Phase 5, Step 4) behind a
- * "⋮" menu; the pin state stays visible as an icon.
+ * One session in a list, Phase 8 restyle (Clozed card shape): light-blue
+ * circle avatar with the title's initial letter, bold title, grey
+ * subtitle "folder · provider/model · updated", ⋮ menu for pin / rename /
+ * delete. Tapping opens it, or — when its folder grant is gone — opens
+ * the system folder picker to re-choose it. The pin state stays visible
+ * as an icon; the dot on the avatar shows whether the folder is
+ * reachable (teal) or not (red).
  */
 @Composable
 internal fun SessionRow(
@@ -231,19 +235,23 @@ internal fun SessionRow(
     var menuOpen by remember { mutableStateOf(false) }
     val status = LocalSathiStatus.current
 
-    SathiCard(
+    ClozedCard(
         modifier = modifier.fillMaxWidth(),
-        contentPadding = 14.dp,
         onClick = { if (available) onOpen() else picker.launch(null) }
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // Folder badge with a status dot: teal = folder reachable, red = unavailable.
+            // Light-blue circle avatar with the initial letter, plus a
+            // status dot: teal = folder reachable, red = unavailable.
             Box {
                 Box(
-                    Modifier.size(42.dp).background(MaterialTheme.colorScheme.primaryContainer, MaterialTheme.shapes.medium),
+                    Modifier.size(48.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Filled.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                    Text(
+                        session.title.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
                 }
                 Box(
                     Modifier
@@ -265,19 +273,14 @@ internal fun SessionRow(
                         Spacer(Modifier.width(4.dp))
                     }
                     Text(
-                        session.title, style = MaterialTheme.typography.titleMedium,
+                        session.title,
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                         maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
                 }
                 Text(
-                    "${session.folderName}  ·  ${relativeTime(session.updatedAt)}",
+                    "${session.folderName} · ${session.providerId}/${session.modelId} · ${relativeTime(session.updatedAt)}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    "${session.providerId} / ${session.modelId}",
-                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1, overflow = TextOverflow.Ellipsis
                 )

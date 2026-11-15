@@ -1,11 +1,9 @@
 package com.inyogeshwar.codesathi.ui.screens
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -16,6 +14,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.inyogeshwar.codesathi.ui.highlightCode
 import com.inyogeshwar.codesathi.ui.languageForPath
+import com.inyogeshwar.codesathi.ui.theme.ClozedCard
 
 /**
  * Diff card: Approve / Reject before any write.
@@ -52,25 +51,24 @@ fun DiffCard(
     val newContentDisplay = proposal.newContent?.take(600).orEmpty()
     val newContentHighlighted = remember(newContentDisplay, language) { highlightCode(newContentDisplay, language) }
 
-    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Column(Modifier.padding(12.dp)) {
-            Text(
-                if (proposal.action == "create") "New file: ${proposal.path}" else "Edit: ${proposal.path}",
-                style = MaterialTheme.typography.titleMedium
-            )
-            if (proposal.action == "edit") {
-                Text("Old:", style = MaterialTheme.typography.labelMedium)
-                Text(oldHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                Text("New snippet:", style = MaterialTheme.typography.labelMedium)
-                Text(newSnippetHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-            } else {
-                Text("New file content (first 600 chars):", style = MaterialTheme.typography.labelMedium)
-                Text(newContentHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-            }
-            Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                Button(onClick = onApprove) { Text("Approve") }
-                OutlinedButton(onClick = onReject) { Text("Reject") }
-            }
+    // Phase 8: same card, Clozed's large-radius grey section shape.
+    ClozedCard(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Text(
+            if (proposal.action == "create") "New file: ${proposal.path}" else "Edit: ${proposal.path}",
+            style = MaterialTheme.typography.titleMedium
+        )
+        if (proposal.action == "edit") {
+            Text("Old:", style = MaterialTheme.typography.labelMedium)
+            Text(oldHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+            Text("New snippet:", style = MaterialTheme.typography.labelMedium)
+            Text(newSnippetHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+        } else {
+            Text("New file content (first 600 chars):", style = MaterialTheme.typography.labelMedium)
+            Text(newContentHighlighted, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+        }
+        Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+            Button(onClick = onApprove) { Text("Approve") }
+            OutlinedButton(onClick = onReject) { Text("Reject") }
         }
     }
 }

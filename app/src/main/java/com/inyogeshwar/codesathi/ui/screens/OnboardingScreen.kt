@@ -1,14 +1,8 @@
 package com.inyogeshwar.codesathi.ui.screens
 
 import android.net.Uri
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,104 +14,76 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.automirrored.filled.Rule
-import androidx.compose.material.icons.filled.SdStorage
-import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import com.inyogeshwar.codesathi.R
+import com.inyogeshwar.codesathi.remote.RemoteServer
+import com.inyogeshwar.codesathi.remote.RemoteService
 import com.inyogeshwar.codesathi.ui.AppViewModel
-import com.inyogeshwar.codesathi.ui.theme.LocalSathiStatus
-import com.inyogeshwar.codesathi.ui.theme.SathiCard
+import com.inyogeshwar.codesathi.ui.theme.ClozedCard
+import com.inyogeshwar.codesathi.ui.theme.ClozedInfoCard
+import com.inyogeshwar.codesathi.ui.theme.ClozedSegmentedControl
+import com.inyogeshwar.codesathi.ui.theme.Pill
 import com.inyogeshwar.codesathi.ui.theme.SathiMark
-import kotlinx.coroutines.launch
-
-private const val PAGE_WELCOME = 0
-private const val PAGE_PRIVACY = 1
-private const val PAGE_PERMISSIONS = 2
-private const val PAGE_READY = 3
 
 /**
- * v1.2 multi-page onboarding: Welcome → Keys stay on device →
- * Permissions (folder grant) → Ready. Shown once.
+ * Phase 8 onboarding, in Clozed's layout (centred logo, big title,
+ * On-device / Remote toggle, info card, folder PICKER button, storage
+ * pill, big Start button) with CodeSathi's own strings and Sathi Spark
+ * branding.
  *
  * The folder step is unchanged from v1.1: the button opens the SYSTEM
  * folder picker (OpenDocumentTree) and [AppViewModel.onFolderPicked]
- * takes the persistable read+write grant and stores the URI exactly as
- * before; [AppViewModel.completeOnboarding] is called right after a
- * successful pick, as before. There is deliberately NO path text field.
+ * takes the persistable read+write grant; [AppViewModel.completeOnboarding]
+ * is called when Start (or "Add a provider API key") is tapped. There is
+ * deliberately NO path text field. The folder is optional here, as in
+ * Clozed — if none is picked, one is chosen when the first session is
+ * created.
  *
- * The Ready page only exists once a folder is chosen, so the pager can
- * never be swiped past the permission step without a grant. "Skip"
- * jumps straight to that step.
+ * Remote is CodeSathi's real remote mode, which runs the other way round
+ * from Clozed's: this phone IS the server (port 8080), and another device
+ * on the same Wi-Fi opens this phone's address in a browser. There is no
+ * connect-to-a-server client mode to offer, so the Remote tab shows this
+ * phone's own server address (read-only), the server password, and a
+ * Connect button that really starts the server.
  *
  * [onDone] gets true when the user asked to add a provider key next.
  */
 @Composable
 fun OnboardingScreen(viewModel: AppViewModel, onDone: (openProviders: Boolean) -> Unit) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var error by remember { mutableStateOf<String?>(null) }
-    val folderChosen = viewModel.pickedFolderUri != null
-    val pageCount = if (folderChosen) 4 else 3
-    // Read the state inside the lambda so the pager sees the Ready page appear.
-    val pager = rememberPagerState(pageCount = { if (viewModel.pickedFolderUri != null) 4 else 3 })
+    var mode by remember { mutableStateOf(0) } // 0 = On-device, 1 = Remote
 
-    val picker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? ->
-        if (uri == null) {
-            error = "No folder chosen. Pick a folder to continue."
-            return@rememberLauncherForActivityResult
-        }
-        val name = viewModel.onFolderPicked(context, uri)
-        if (name == null) {
-            error = "Could not use this folder. Try another one."
-        } else {
-            error = null
-            viewModel.completeOnboarding()
-        }
-    }
-
-    // After a successful pick the Ready page appears; move to it.
-    LaunchedEffect(folderChosen) {
-        if (folderChosen && pager.currentPage == PAGE_PERMISSIONS) {
-            pager.animateScrollToPage(PAGE_READY)
-        }
-    }
-    // Back walks the pages before it leaves the app.
-    BackHandler(enabled = pager.currentPage > 0) {
-        scope.launch { pager.animateScrollToPage(pager.currentPage - 1) }
+    // Completing onboarding is the same whichever button finishes it.
+    val finish: (Boolean) -> Unit = { openProviders ->
+        viewModel.completeOnboarding()
+        onDone(openProviders)
     }
 
     Column(
@@ -125,235 +91,248 @@ fun OnboardingScreen(viewModel: AppViewModel, onDone: (openProviders: Boolean) -
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 28.dp, vertical = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Top row: small lockup + Skip.
-        Row(
-            Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+        Spacer(Modifier.height(24.dp))
+        SathiMark(size = 96.dp, tile = true)
+        Spacer(Modifier.height(28.dp))
+        Text(
+            "CodeSathi",
+            style = MaterialTheme.typography.headlineLarge.copy(fontWeight = FontWeight.Bold),
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Your AI coding partner, running on your phone.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(24.dp))
+        ClozedSegmentedControl(
+            options = listOf("On-device", "Remote"),
+            selected = mode,
+            onSelect = { mode = it },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(20.dp))
+        if (mode == 0) {
+            OnDeviceSection(viewModel)
+        } else {
+            RemoteSection(viewModel)
+        }
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = { finish(false) },
+            modifier = Modifier.fillMaxWidth().height(52.dp)
+        ) { Text("Start coding") }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { finish(true) },
+            modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
-            Spacer(Modifier.weight(1f))
-            if (pager.currentPage < PAGE_PERMISSIONS) {
-                TextButton(onClick = { scope.launch { pager.animateScrollToPage(PAGE_PERMISSIONS) } }) {
-                    Text("Skip")
-                }
-            }
+            Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Add a provider API key")
         }
+        Spacer(Modifier.height(16.dp))
+    }
+}
 
-        HorizontalPager(
-            state = pager,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            verticalAlignment = Alignment.Top
-        ) { page ->
-            Column(
-                Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 28.dp)
-            ) {
-                when (page) {
-                    PAGE_WELCOME -> WelcomePage()
-                    PAGE_PRIVACY -> PrivacyPage()
-                    PAGE_PERMISSIONS -> PermissionsPage(
-                        folderName = if (folderChosen) viewModel.pickedFolderName else null,
-                        error = error
-                    )
-                    else -> ReadyPage(viewModel.pickedFolderName)
-                }
-            }
+/** On-device mode: info card, folder picker button, storage pill. */
+@Composable
+private fun OnDeviceSection(viewModel: AppViewModel) {
+    val context = LocalContext.current
+    var error by remember { mutableStateOf<String?>(null) }
+    val folderChosen = viewModel.pickedFolderUri != null
+    val folderName = viewModel.pickedFolderName
+
+    val picker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri == null) {
+            error = "No folder chosen — pick one above, or choose it when you start your first session."
+            return@rememberLauncherForActivityResult
         }
+        val name = viewModel.onFolderPicked(context, uri)
+        if (name == null) {
+            error = "Could not use this folder. Try another one."
+        } else {
+            error = null
+        }
+    }
 
-        // Bottom: page dots + primary action.
-        Column(Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 20.dp)) {
-            PageDots(count = 4, current = pager.currentPage, reachable = pageCount)
-            Spacer(Modifier.height(20.dp))
-            when (pager.currentPage) {
-                PAGE_PERMISSIONS -> {
-                    if (!folderChosen) {
-                        Button(
-                            onClick = {
-                                // Persistable read+write grant is requested by the contract itself.
-                                picker.launch(null)
-                            },
-                            modifier = Modifier.fillMaxWidth().height(52.dp)
-                        ) {
-                            Icon(Icons.Filled.Folder, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(stringResource(R.string.allow_file_access))
-                        }
-                    } else {
-                        Button(
-                            onClick = { scope.launch { pager.animateScrollToPage(PAGE_READY) } },
-                            modifier = Modifier.fillMaxWidth().height(52.dp)
-                        ) { Text("Continue") }
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = { picker.launch(null) },
-                            modifier = Modifier.fillMaxWidth().height(48.dp)
-                        ) { Text("Choose a different folder") }
-                    }
-                }
-                PAGE_READY -> {
-                    Button(
-                        onClick = { onDone(false) },
-                        modifier = Modifier.fillMaxWidth().height(52.dp)
-                    ) { Text("Start coding") }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = { onDone(true) },
-                        modifier = Modifier.fillMaxWidth().height(48.dp)
-                    ) {
-                        Icon(Icons.Filled.Key, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text("Add a provider API key")
-                    }
-                }
-                else -> Button(
-                    onClick = { scope.launch { pager.animateScrollToPage(pager.currentPage + 1) } },
-                    modifier = Modifier.fillMaxWidth().height(52.dp)
-                ) { Text("Next") }
-            }
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        ClozedInfoCard(
+            title = "On-device agent",
+            text = "The agent runs on this phone, inside your project folder. " +
+                "Add one provider API key to start chatting — your key stays " +
+                "encrypted on this device, and with an on-device model nothing " +
+                "leaves the phone at all.",
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = { picker.launch(null) },
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = MaterialTheme.shapes.extraLarge,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+            )
+        ) {
+            Icon(Icons.Filled.Folder, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(if (folderChosen) "Folder: $folderName — change" else "Choose project folder")
+        }
+        Spacer(Modifier.height(12.dp))
+        Pill(
+            text = if (folderChosen) "Folder access: ON ✓" else "No folder chosen yet",
+            container = if (folderChosen) MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.surfaceContainerHighest,
+            content = if (folderChosen) MaterialTheme.colorScheme.onPrimaryContainer
+            else MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (!folderChosen) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "No folder yet? You can pick one when you start your first session.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+        }
+        error?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
 
+/**
+ * Remote mode — CodeSathi's real direction: this phone runs the server
+ * (port 8080) and another device on the same Wi-Fi opens this phone's
+ * address in a browser. The URL field shows this phone's own address
+ * (read-only), the password is the server password, and Connect really
+ * starts the server. There is no connect-to-a-server client mode.
+ */
 @Composable
-private fun WelcomePage() {
-    Spacer(Modifier.height(24.dp))
-    SathiMark(size = 96.dp, tile = true)
-    Spacer(Modifier.height(28.dp))
-    Text(stringResource(R.string.onboarding_title), style = MaterialTheme.typography.headlineMedium)
-    Spacer(Modifier.height(12.dp))
-    Text(
-        "Ek AI coding agent jo aapke phone par, aapke project folder mein kaam karta hai.",
-        style = MaterialTheme.typography.bodyLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    Spacer(Modifier.height(24.dp))
-    FeatureRow(Icons.AutoMirrored.Filled.Rule, "Plan first, then build", "Plan mode is read-only. Files change only after you approve a plan and each diff.")
-    FeatureRow(Icons.Filled.Terminal, "Editor, terminal and Git", "Edit files, run commands and commit/push over HTTPS — all on the phone.")
-    FeatureRow(Icons.Filled.Key, "Your provider, your key", "Bring a key for the provider you like, or run an on-device model.")
-}
+private fun RemoteSection(viewModel: AppViewModel) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val remoteEnabled by viewModel.remoteEnabled.collectAsState()
+    var wifiIp by remember { mutableStateOf(RemoteServer.wifiIpAddress()) }
+    var password by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var note by remember { mutableStateOf<String?>(null) }
+    var copied by remember { mutableStateOf(false) }
+    val serverUrl = wifiIp?.let { "http://$it:${RemoteServer.PORT}" }.orEmpty()
 
-@Composable
-private fun PrivacyPage() {
-    Spacer(Modifier.height(24.dp))
-    IconBadge(Icons.Filled.Lock)
-    Spacer(Modifier.height(28.dp))
-    Text("Your keys stay on this device", style = MaterialTheme.typography.headlineMedium)
-    Spacer(Modifier.height(12.dp))
-    Text(
-        "API keys are stored encrypted (Android Keystore-backed) on this phone only. They are never stored unencrypted, and session backups never include them.",
-        style = MaterialTheme.typography.bodyLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    Spacer(Modifier.height(24.dp))
-    FeatureRow(Icons.Filled.Key, "Talks only to the provider you pick", "Your messages, and the file contents the agent reads for a task, go to that provider to get an answer.")
-    FeatureRow(Icons.Filled.PhoneAndroid, "On-device option", "With a local model, chats never leave the phone.")
-    FeatureRow(Icons.Filled.Folder, "No uploads of your folder", "CodeSathi does not upload your project anywhere. Remote and Sync work only if you turn them on.")
-}
-
-@Composable
-private fun PermissionsPage(folderName: String?, error: String?) {
-    Spacer(Modifier.height(24.dp))
-    IconBadge(Icons.Filled.Folder)
-    Spacer(Modifier.height(28.dp))
-    Text("Choose your project folder", style = MaterialTheme.typography.headlineMedium)
-    Spacer(Modifier.height(12.dp))
-    Text(
-        stringResource(R.string.onboarding_body),
-        style = MaterialTheme.typography.bodyLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    Spacer(Modifier.height(20.dp))
-    if (folderName != null) {
-        SathiCard(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primaryContainer) {
+    Column(Modifier.fillMaxWidth()) {
+        ClozedInfoCard(
+            title = "This phone is the server",
+            text = "Remote works the other way round here: this phone runs the " +
+                "server, and another device on the same Wi-Fi opens the address " +
+                "below in a browser, types the password, and chats. Set a " +
+                "password, tap Connect, and share the address with the other device.",
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(16.dp))
+        OutlinedTextField(
+            value = serverUrl,
+            onValueChange = {},
+            label = { Text("Server URL") },
+            placeholder = { Text("Connect to Wi-Fi to see the address") },
+            leadingIcon = { Icon(Icons.Filled.Link, contentDescription = null) },
+            readOnly = true,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            label = { Text("Server password (min. 4 characters)") },
+            placeholder = { Text("Type a password") },
+            leadingIcon = { Icon(Icons.Filled.Lock, contentDescription = null) },
+            visualTransformation = PasswordVisualTransformation(),
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(12.dp))
+        Button(
+            onClick = {
+                if (password.isNotBlank()) {
+                    if (!viewModel.setRemotePassword(password)) {
+                        error = "Password must be at least 4 characters."
+                        note = null
+                        return@Button
+                    }
+                    password = ""
+                    note = "Password saved on this device only."
+                }
+                if (!viewModel.hasRemotePassword()) {
+                    error = "Set a password first — the server will not start without one."
+                    note = null
+                    return@Button
+                }
+                RemoteService.start(context)
+                wifiIp = RemoteServer.wifiIpAddress()
+                error = null
+                note = "Server starting — open the address above on the other device."
+            },
+            modifier = Modifier.fillMaxWidth().height(52.dp)
+        ) { Text("Connect") }
+        error?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+        }
+        note?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(it, style = MaterialTheme.typography.bodyMedium)
+        }
+        Spacer(Modifier.height(16.dp))
+        ClozedCard(modifier = Modifier.fillMaxWidth()) {
+            Text("Server details", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                Spacer(Modifier.width(12.dp))
-                Column {
-                    Text("Access granted", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                    Text("Chosen folder: $folderName", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                }
+                Text(
+                    if (serverUrl.isNotBlank()) serverUrl
+                    else "No Wi-Fi address found — connect this phone to the same Wi-Fi as the other device.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                TextButton(
+                    onClick = {
+                        if (serverUrl.isNotBlank()) {
+                            clipboard.setText(AnnotatedString(serverUrl))
+                            copied = true
+                        }
+                    },
+                    enabled = serverUrl.isNotBlank()
+                ) { Text(if (copied) "Copied" else "Copy") }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (remoteEnabled) "Server: running — see the notification to stop it"
+                else "Server: stopped",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            TextButton(onClick = { wifiIp = RemoteServer.wifiIpAddress() }) {
+                Text("Refresh address")
             }
         }
-        Spacer(Modifier.height(16.dp))
-    }
-    error?.let {
-        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(16.dp))
-    }
-    Text("Asked later, only when you use them", style = MaterialTheme.typography.titleSmall)
-    Spacer(Modifier.height(8.dp))
-    FeatureRow(Icons.Filled.Mic, "Microphone", "When you first tap the mic for voice input.")
-    FeatureRow(Icons.Filled.Notifications, "Notifications", "When you start Remote mode (Android 13+).")
-    FeatureRow(Icons.Filled.SdStorage, "All-files access (optional)", "Only from Settings, if you want the terminal and Git on real files.")
-}
-
-@Composable
-private fun ReadyPage(folderName: String) {
-    Spacer(Modifier.height(24.dp))
-    SathiMark(size = 96.dp, tile = true)
-    Spacer(Modifier.height(28.dp))
-    Text("Sab set hai!", style = MaterialTheme.typography.headlineMedium)
-    Spacer(Modifier.height(12.dp))
-    Text(
-        "Folder “$folderName” is ready. Add a provider API key (or pick an on-device model), then start your first session.",
-        style = MaterialTheme.typography.bodyLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-}
-
-@Composable
-private fun IconBadge(icon: ImageVector) {
-    Box(
-        Modifier
-            .size(80.dp)
-            .background(MaterialTheme.colorScheme.primaryContainer, MaterialTheme.shapes.extraLarge),
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(36.dp))
-    }
-}
-
-@Composable
-private fun FeatureRow(icon: ImageVector, title: String, body: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.Top) {
-        Box(
-            Modifier.size(36.dp).background(MaterialTheme.colorScheme.surfaceContainerHighest, CircleShape),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-        }
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleSmall)
-            Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-}
-
-@Composable
-private fun PageDots(count: Int, current: Int, reachable: Int) {
-    val live = LocalSathiStatus.current.live
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-        repeat(count) { i ->
-            val selected = i == current
-            val width by animateDpAsState(if (selected) 22.dp else 8.dp, label = "dotW")
-            val color by animateColorAsState(
-                when {
-                    selected -> MaterialTheme.colorScheme.primary
-                    i < reachable -> MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                    else -> MaterialTheme.colorScheme.outlineVariant
-                },
-                label = "dotC"
-            )
-            Box(
-                Modifier
-                    .padding(horizontal = 4.dp)
-                    .height(8.dp)
-                    .width(width)
-                    .background(if (selected && i == PAGE_READY) live else color, CircleShape)
-            )
-        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "LAN only, plain HTTP — only use it on Wi-Fi you trust. Chat only: " +
+                "no remote file browsing or terminal, and a file change still waits " +
+                "for your approval on this phone.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }

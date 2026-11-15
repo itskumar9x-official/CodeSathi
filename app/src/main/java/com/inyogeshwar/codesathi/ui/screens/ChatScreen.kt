@@ -5,7 +5,13 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,13 +27,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -43,6 +53,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -54,9 +65,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -69,7 +83,7 @@ import com.inyogeshwar.codesathi.agent.decodeImageNames
 import com.inyogeshwar.codesathi.agent.mcpToolName
 import com.inyogeshwar.codesathi.agent.supportsPdfUpload
 import com.inyogeshwar.codesathi.data.Message
-import com.inyogeshwar.codesathi.data.PermissionRule
+import com.inyogeshwar.codesathi.agent.PermissionRule
 import com.inyogeshwar.codesathi.data.PreferencesStore
 import com.inyogeshwar.codesathi.data.TokenCounter
 import com.inyogeshwar.codesathi.data.supportsVision
@@ -91,8 +105,10 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import com.inyogeshwar.codesathi.ui.theme.BouncingDots
+import com.inyogeshwar.codesathi.ui.theme.ClozedCard
 import com.inyogeshwar.codesathi.ui.theme.Pill
 import com.inyogeshwar.codesathi.ui.theme.SathiCodeType
+import com.inyogeshwar.codesathi.ui.theme.SathiColors
 import com.inyogeshwar.codesathi.ui.theme.SathiMark
 import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
@@ -100,20 +116,27 @@ import com.inyogeshwar.codesathi.ui.theme.TopBarTitle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.util.UUID
 
 /**
- * Chat screen (Steps 2 + 3, same screen).
+ * Chat screen (Phase 8 — Clozed layout, CodeSathi's own strings).
  *
- * - Plan | Build toggle at the top; Plan is the default for a new session.
- * - Plan mode shows a "Plan mode — read-only" chip; writes are disabled in
- *   code (AgentRunner + tools), not just in the prompt.
+ * Header: back arrow, session title, model pill + agent pill + token
+ * counter, gear → Settings. The Plan | Build toggle row is gone;
+ * mode switching lives in the agent pill's "Choose agent" sheet.
+ * Plan is the default for a new session and stays read-only in code
+ * (AgentRunner + tools), not just in the prompt.
  * - A plan ends in a pinned summary card: Approve & switch to Build /
  *   Edit plan / Discard. Nothing is written before Approve.
  * - In Build, a proposed file change shows a diff card with Approve /
  *   Reject BEFORE any write happens.
  * - If no API key / model is set, the screen shows "Add a provider API key
  *   first" instead of pretending to work.
+ * - Tool messages render as expandable cards (green ✓, teal tool name,
+ *   input / output boxes). Assistant replies end with a small mono
+ *   model label. The composer is a light-grey rounded bar with a "+"
+ *   menu, mic, model chip, token estimate and Send / Stop.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -121,7 +144,8 @@ fun ChatScreen(
     viewModel: AppViewModel,
     sessionId: String,
     onProviders: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onSettings: () -> Unit
 ) {
     val context = LocalContext.current
     val sessions by viewModel.sessions.collectAsState()
@@ -131,6 +155,9 @@ fun ChatScreen(
     var menuOpen by remember { mutableStateOf(false) }
     var showSummary by remember { mutableStateOf(false) }
     var showToolRules by remember { mutableStateOf(false) }
+    var showAgentSheet by remember { mutableStateOf(false) }
+    var showModelSheet by remember { mutableStateOf(false) }
+    var plusMenuOpen by remember { mutableStateOf(false) }
     val toolRules by viewModel.toolRules.collectAsState()
     // Approval mode + glob rules (Phase 7, Step B2): shown in the same
     // Tool permissions dialog as the per-tool rules.
@@ -263,6 +290,22 @@ fun ChatScreen(
     val efforts by viewModel.reasoningEfforts.collectAsState()
     val effort = if (provider?.kind == "local") null else efforts["${session.providerId}/${session.modelId}"]
 
+    if (showAgentSheet) {
+        ChooseAgentSheet(
+            viewModel = viewModel,
+            session = session,
+            onDismiss = { showAgentSheet = false }
+        )
+    }
+    if (showModelSheet) {
+        ChooseModelSheet(
+            viewModel = viewModel,
+            session = session,
+            onDismiss = { showModelSheet = false },
+            onProviders = onProviders
+        )
+    }
+
     SathiScaffold(
         topBar = {
             SathiTopBar(
@@ -318,26 +361,54 @@ fun ChatScreen(
                         )
                     }
                     }
+                    IconButton(onClick = onSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
                 }
             )
         }
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-            // Mode toggle (Plan | Build) + read-only chip. Switching modes
-            // never writes files; it only flips the flag.
+            // Model + agent pills and the token counter (Phase 8).
+            // Tapping the model pill opens the model sheet; tapping the
+            // agent pill opens the agent sheet. Mode switching never
+            // writes files; it only flips the flag (setMode).
             Row(
                 modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                ModeToggle(
-                    isPlan = isPlan,
-                    onSelect = { plan -> viewModel.setMode(session, if (plan) "plan" else "build") }
+                Pill(
+                    text = session.modelId,
+                    onClick = { showModelSheet = true },
+                    leading = {
+                        Icon(
+                            Icons.Filled.ExpandMore,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    modifier = Modifier.weight(1f, fill = false)
                 )
                 Pill(
-                    if (isPlan) "Plan mode — read-only" else "Build mode",
+                    text = if (isPlan) "Plan" else "Build",
+                    onClick = { showAgentSheet = true },
                     container = if (isPlan) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.tertiaryContainer,
-                    content = if (isPlan) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onTertiaryContainer
+                    content = if (isPlan) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onTertiaryContainer,
+                    leading = {
+                        Icon(
+                            Icons.Filled.ExpandMore,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    TokenCounter.formatApproximate(tokenEstimate),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
                 )
             }
             if (viewModel.summarisedBanner) {
@@ -422,9 +493,9 @@ fun ChatScreen(
                 if (viewModel.isRunning) {
                     item(key = "working") { WorkingIndicator(startedAt = viewModel.runStartedAt) }
                 }
-                items(reversed, key = { it.id }) { msg -> MessageBubble(msg) }
+                items(reversed, key = { it.id }) { msg -> MessageBubble(msg, session.modelId) }
                 if (messages.isEmpty() && !needsKey) {
-                    item(key = "empty") { EmptyChatHint() }
+                    item(key = "empty") { EmptyChatHint(onSuggestion = { input = it }) }
                 }
             }
 
@@ -578,12 +649,59 @@ fun ChatScreen(
                     }
                 }
             }
-            // Card composer: text on top; attach, mic, model chip, token
-            // estimate and Send / Stop underneath.
+            // "+" menu (Phase 8): a small popup above the composer with
+            // the two real attach actions. There is no "copy from
+            // another project" feature, so no such row is offered.
+            if (plusMenuOpen) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                    shadowElevation = 2.dp
+                ) {
+                    Column {
+                        TextButton(
+                            onClick = { plusMenuOpen = false; imagePickerLauncher.launch("image/*") },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null)
+                                Spacer(Modifier.width(12.dp))
+                                Text("Attach image", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                        TextButton(
+                            onClick = { plusMenuOpen = false; filePickerLauncher.launch("*/*") },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.AttachFile, contentDescription = null)
+                                Spacer(Modifier.width(12.dp))
+                                Text("Attach file", style = MaterialTheme.typography.bodyMedium)
+                            }
+                        }
+                    }
+                }
+            }
+            // Thin segmented progress bar above the composer while a
+            // turn runs. The segments fill in sequence; no percentage
+            // is shown, because no real progress fraction exists.
+            if (viewModel.isRunning) {
+                SegmentedProgressBar()
+            }
+            // Rounded composer bar: "+" menu, text, mic, model chip,
+            // token estimate and Send / Stop underneath the text.
             Surface(
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                shape = MaterialTheme.shapes.extraLarge,
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                shape = RoundedCornerShape(28.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                 shadowElevation = 2.dp
             ) {
@@ -605,21 +723,12 @@ fun ChatScreen(
                         )
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Attach image: system picker (images), up to 3 per message.
+                        // "+" opens the attach menu above the composer.
                         IconButton(
-                            onClick = { imagePickerLauncher.launch("image/*") },
+                            onClick = { plusMenuOpen = !plusMenuOpen },
                             enabled = !viewModel.isRunning
                         ) {
-                            Icon(Icons.Filled.AddPhotoAlternate, contentDescription = "Attach image")
-                        }
-                        // Attach file: system picker (any file), up to 3 per message.
-                        // PDFs go as raw bytes, text files are inlined; images
-                        // picked here are skipped (use the image button).
-                        IconButton(
-                            onClick = { filePickerLauncher.launch("*/*") },
-                            enabled = !viewModel.isRunning
-                        ) {
-                            Icon(Icons.Filled.AttachFile, contentDescription = "Attach file")
+                            Icon(Icons.Filled.Add, contentDescription = "More options")
                         }
                         // Mic: tap to dictate into the input field; tap again to stop.
                         // While listening the icon changes and turns red.
@@ -632,10 +741,10 @@ fun ChatScreen(
                             )
                         }
                         // Model chip: the session's model (+ reasoning effort);
-                        // tap to switch it in Providers.
+                        // tap to switch it in the model sheet.
                         Pill(
                             text = session.modelId + (if (effort != null) " · $effort" else ""),
-                            onClick = onProviders,
+                            onClick = { showModelSheet = true },
                             modifier = Modifier.weight(1f, fill = false)
                         )
                         Spacer(Modifier.weight(1f))
@@ -657,13 +766,21 @@ fun ChatScreen(
                                 Icon(Icons.Filled.Stop, contentDescription = "Stop")
                             }
                         } else {
-                            FilledIconButton(onClick = {
-                                val text = input
-                                // Only clear the input when the message was
-                                // actually sent — a vision refusal keeps the text
-                                // (and the staged images) in place.
-                                if (viewModel.sendMessage(session, text, context)) input = ""
-                            }) {
+                            FilledIconButton(
+                                onClick = {
+                                    val text = input
+                                    // Only clear the input when the message was
+                                    // actually sent — a vision refusal keeps the text
+                                    // (and the staged images) in place.
+                                    if (viewModel.sendMessage(session, text, context)) input = ""
+                                },
+                                colors = IconButtonDefaults.filledIconButtonColors(
+                                    containerColor = if (input.isBlank()) MaterialTheme.colorScheme.surfaceContainerHigh
+                                    else MaterialTheme.colorScheme.primary,
+                                    contentColor = if (input.isBlank()) MaterialTheme.colorScheme.onSurfaceVariant
+                                    else MaterialTheme.colorScheme.onPrimary
+                                )
+                            ) {
                                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                             }
                         }
@@ -692,8 +809,38 @@ fun ChatScreen(
     }
 }
 
+/** Thin segmented bar that fills in sequence while a turn runs. */
 @Composable
-private fun MessageBubble(msg: Message) {
+private fun SegmentedProgressBar() {
+    val transition = rememberInfiniteTransition(label = "composerProgress")
+    val progress by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1400), RepeatMode.Restart),
+        label = "progress"
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        repeat(5) { index ->
+            val fill = (progress * 5f - index).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier.weight(1f).height(3.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxWidth(fill).height(3.dp)
+                        .background(MaterialTheme.colorScheme.primary)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(msg: Message, modelLabel: String) {
     // Attached images (Phase 6, Step 2): thumbnails above the message
     // text, so a screenshot stays visible in the history.
     val imageNames = remember(msg.imagesJson) { decodeImageNames(msg.imagesJson) }
@@ -741,22 +888,7 @@ private fun MessageBubble(msg: Message) {
                 }
             }
         }
-        "tool" -> Surface(
-            shape = MaterialTheme.shapes.medium,
-            color = MaterialTheme.colorScheme.surfaceContainer,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                Text(
-                    "Tool",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                images()
-                Text(msg.text, style = SathiCodeType.small, color = MaterialTheme.colorScheme.onSurface)
-            }
-        }
+        "tool" -> ToolCard(msg = msg, images = images)
         else -> Column(Modifier.fillMaxWidth()) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 4.dp)) {
                 SathiMark(size = 18.dp, decorative = true)
@@ -776,6 +908,182 @@ private fun MessageBubble(msg: Message) {
                     MarkdownText(msg.text)
                 }
             }
+            // Small mono model label under the reply, as in Clozed.
+            Text(
+                modelLabel,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp, start = 4.dp)
+            )
+        }
+    }
+}
+
+/** A parsed tool message, or null when the message is not a tool call. */
+private data class ToolParsed(
+    val name: String,
+    val target: String?,
+    val input: String?,
+    val output: String
+)
+
+/**
+ * Parse a "tool" message into a tool card. Two shapes exist:
+ * - [Message.toolJson] when present: {"name"/"tool", "args"/"input",
+ *   "result"/"output"} — the args object also yields the target
+ *   (path / command / query / dir / name).
+ * - The text the runner actually stores today: "[tool] result"
+ *   (see AppViewModel's ToolRan handling, which inserts tool
+ *   messages with no toolJson). The target is then unknown, so the
+ *   collapsed line shows the first line of the output instead.
+ * Returns null for tool-role notices that are not tool calls at all
+ * ("Plan approved…", "Switched to…"), which keep the plain rendering.
+ */
+private fun parseToolMessage(msg: Message): ToolParsed? {
+    msg.toolJson?.let { raw ->
+        try {
+            val json = JSONObject(raw)
+            val name = json.optString("name").ifBlank { json.optString("tool") }
+            if (name.isNotBlank()) {
+                val args = json.optJSONObject("args") ?: json.optJSONObject("input")
+                val input = args?.toString(2)
+                    ?: json.optString("args").ifBlank { null }
+                    ?: json.optString("input").ifBlank { null }
+                val output = json.optString("result").ifBlank { json.optString("output") }
+                val target = args?.let {
+                    it.optString("path")
+                        .ifBlank { it.optString("command") }
+                        .ifBlank { it.optString("query") }
+                        .ifBlank { it.optString("dir") }
+                        .ifBlank { it.optString("name") }
+                        .ifBlank { null }
+                }
+                return ToolParsed(name, target, input, output)
+            }
+        } catch (_: Exception) {
+            // Fall through to the text form below.
+        }
+    }
+    val match = Regex("^\\[([^\\]]+)\\]\\s*(.*)$", RegexOption.DOT_MATCHES_ALL)
+        .matchEntire(msg.text.trim()) ?: return null
+    val name = match.groupValues[1].trim()
+    if (name.isBlank()) return null
+    return ToolParsed(name, null, null, match.groupValues[2])
+}
+
+/**
+ * Expandable tool card (Phase 8): green ✓ + teal tool name +
+ * truncated target (or first output line) + chevron. Expanded, it
+ * shows the input as a white mono JSON box and the output as a
+ * white box. Messages that do not parse as a tool call keep the
+ * previous plain rendering. Nothing about execution changes.
+ */
+@Composable
+private fun ToolCard(msg: Message, images: @Composable () -> Unit) {
+    val parsed = remember(msg.toolJson, msg.text) { parseToolMessage(msg) }
+    if (parsed == null) {
+        Surface(
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Text(
+                    "Tool",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                images()
+                Text(msg.text, style = SathiCodeType.small, color = MaterialTheme.colorScheme.onSurface)
+            }
+        }
+        return
+    }
+    var expanded by remember(msg.id) { mutableStateOf(false) }
+    val collapsedLine = parsed.target
+        ?: parsed.output.lineSequence().firstOrNull()?.trim().orEmpty()
+    Surface(
+        onClick = { expanded = !expanded },
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            images()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "✓",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color(0xFF15803D)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    parsed.name,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = SathiColors.TealDeep,
+                    maxLines = 1
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    collapsedLine,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(
+                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (expanded) "Collapse" else "Expand"
+                )
+            }
+            if (expanded) {
+                parsed.input?.let { inputJson ->
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "input",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    ) {
+                        Text(
+                            inputJson.take(2000),
+                            style = SathiCodeType.small,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "output",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Text(
+                        parsed.output.take(2000),
+                        style = SathiCodeType.small,
+                        fontFamily = FontFamily.Monospace,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+            }
         }
     }
 }
@@ -784,6 +1092,10 @@ private fun MessageBubble(msg: Message) {
  * Shown at the bottom of the chat while a turn runs: the softly
  * breathing mark, bouncing dots and the real seconds since the run
  * started ([AppViewModel.runStartedAt]), ticking once a second.
+ *
+ * The status word stays "Working": the runner / ViewModel expose no
+ * live phase (thinking vs. reading files vs. checking), so the more
+ * specific Clozed words would be guesses, not what is happening.
  */
 @Composable
 private fun WorkingIndicator(startedAt: Long) {
@@ -801,7 +1113,7 @@ private fun WorkingIndicator(startedAt: Long) {
     ) {
         SathiMark(size = 20.dp, working = true, decorative = true)
         Spacer(Modifier.width(8.dp))
-        Text("Working", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text("Working", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(8.dp))
         BouncingDots()
         Spacer(Modifier.width(8.dp))
@@ -816,48 +1128,31 @@ private fun WorkingIndicator(startedAt: Long) {
 internal fun formatElapsed(seconds: Long): String =
     if (seconds < 60) "${seconds}s" else "${seconds / 60}m ${(seconds % 60).toString().padStart(2, '0')}s"
 
+/** Empty state: logo, question, subtitle, and suggestion pills that fill the input. */
 @Composable
-private fun EmptyChatHint() {
+private fun EmptyChatHint(onSuggestion: (String) -> Unit) {
     Column(
         Modifier.fillMaxWidth().padding(vertical = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         SathiMark(size = 56.dp, tile = true, decorative = true)
-        Spacer(Modifier.height(14.dp))
-        Text("What do you want to build today?", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(6.dp))
+        Text("What do you want to build today?", style = MaterialTheme.typography.titleMedium)
         Text(
             "Try: “Build a single-file portfolio website for Yogeshwar Kumar”. Type / to see your custom commands.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
-    }
-}
-
-/** Plan | Build segmented pill. */
-@Composable
-private fun ModeToggle(isPlan: Boolean, onSelect: (plan: Boolean) -> Unit) {
-    Surface(
-        shape = MaterialTheme.shapes.extraLarge,
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
-    ) {
-        Row(Modifier.padding(3.dp)) {
-            listOf(true to "Plan", false to "Build").forEach { (plan, label) ->
-                val selected = plan == isPlan
-                Surface(
-                    onClick = { if (!selected) onSelect(plan) },
-                    shape = MaterialTheme.shapes.extraLarge,
-                    color = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                    contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
-                ) {
-                    Text(
-                        label,
-                        style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
-                    )
-                }
+        Spacer(Modifier.height(6.dp))
+        listOf("Explain this project", "Find and fix bugs", "Write tests", "/init").forEach { label ->
+            OutlinedButton(
+                onClick = { onSuggestion(label) },
+                shape = MaterialTheme.shapes.extraLarge,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(label)
             }
         }
     }
@@ -1034,27 +1329,25 @@ private fun PlanCard(
     onEdit: () -> Unit,
     onDiscard: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-        Column(Modifier.padding(12.dp)) {
-            Text("Plan: ${plan.goal}", style = MaterialTheme.typography.titleMedium)
-            Text("Files to create / edit:", style = MaterialTheme.typography.labelMedium)
-            plan.files.forEach { f -> Text("• ${f.action}: ${f.path}") }
-            Text("Steps:", style = MaterialTheme.typography.labelMedium)
-            plan.steps.forEachIndexed { i, s -> Text("${i + 1}. $s") }
-            if (plan.risks.isNotEmpty()) {
-                Text("Risks:", style = MaterialTheme.typography.labelMedium)
-                plan.risks.forEach { r -> Text("• $r") }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                Button(onClick = onApprove) { Text("Approve & switch to Build") }
-                OutlinedButton(onClick = onEdit) { Text("Edit plan") }
-                OutlinedButton(onClick = onDiscard) { Text("Discard") }
-            }
-            Text(
-                "Nothing is written to disk until you approve.",
-                style = MaterialTheme.typography.bodySmall
-            )
+    ClozedCard(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Text("Plan: ${plan.goal}", style = MaterialTheme.typography.titleMedium)
+        Text("Files to create / edit:", style = MaterialTheme.typography.labelMedium)
+        plan.files.forEach { f -> Text("• ${f.action}: ${f.path}") }
+        Text("Steps:", style = MaterialTheme.typography.labelMedium)
+        plan.steps.forEachIndexed { i, s -> Text("${i + 1}. $s") }
+        if (plan.risks.isNotEmpty()) {
+            Text("Risks:", style = MaterialTheme.typography.labelMedium)
+            plan.risks.forEach { r -> Text("• $r") }
         }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+            Button(onClick = onApprove) { Text("Approve & switch to Build") }
+            OutlinedButton(onClick = onEdit) { Text("Edit plan") }
+            OutlinedButton(onClick = onDiscard) { Text("Discard") }
+        }
+        Text(
+            "Nothing is written to disk until you approve.",
+            style = MaterialTheme.typography.bodySmall
+        )
     }
 }
 

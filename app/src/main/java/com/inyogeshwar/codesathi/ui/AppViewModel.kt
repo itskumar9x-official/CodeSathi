@@ -77,7 +77,7 @@ import com.inyogeshwar.codesathi.data.BackupImportResult
 import com.inyogeshwar.codesathi.data.BackupParseResult
 import com.inyogeshwar.codesathi.data.MAX_BACKUP_BYTES
 import com.inyogeshwar.codesathi.data.Message
-import com.inyogeshwar.codesathi.data.PermissionRule
+import com.inyogeshwar.codesathi.agent.PermissionRule
 import com.inyogeshwar.codesathi.data.SessionBackup
 import com.inyogeshwar.codesathi.data.SessionBackupData
 import com.inyogeshwar.codesathi.data.SyncMergeResult
