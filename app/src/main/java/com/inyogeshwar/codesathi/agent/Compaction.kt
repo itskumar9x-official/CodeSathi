@@ -1,6 +1,8 @@
 package com.inyogeshwar.codesathi.agent
 
+import com.inyogeshwar.codesathi.data.FallbackEntry
 import com.inyogeshwar.codesathi.data.Message
+import com.inyogeshwar.codesathi.data.ModelContext
 import com.inyogeshwar.codesathi.data.TokenCounter
 
 /**
@@ -25,6 +27,38 @@ object Compaction {
     /** Tokens of the most recent conversation kept verbatim beside a summary. */
     const val KEEP_TOKENS = 15_000
 
+    /**
+     * Tokens kept verbatim beside a summary after a "context too long"
+     * failure (Phase 7, Step B2 — the harder compaction). 5k keeps the
+     * last user message and the last finished step, and no more, so the
+     * retried step fits even in the smallest known window (64k).
+     */
+    const val HARD_KEEP_TOKENS = 5_000
+
+    /**
+     * The context window one turn is measured against (Phase 7,
+     * Step B2 — AgentMT's cap, adapted). The cap is 75% of the
+     * SMALLEST known window among the candidate models for the turn:
+     * the session's model plus every fallback-chain model (those are
+     * the models a turn may actually switch to). A model whose window
+     * is unknown does not shrink the cap — it is skipped, not treated
+     * as zero — and when NO candidate's window is known the fixed
+     * [DEFAULT_CONTEXT_TOKENS] (128k) is used, exactly as before.
+     * The local engine keeps its own 4,096 (see [LocalLlmClient]).
+     * Because [needsPruning] / [needsSummary] are fractions of this
+     * window, capping the window caps the thresholds: with a 64k model
+     * in the chain, tool outputs prune above ~38k tokens and the
+     * summary triggers above 48k, instead of waiting for 96k.
+     */
+    fun effectiveContextTokens(
+        sessionModelId: String,
+        fallbackChain: List<FallbackEntry> = emptyList()
+    ): Int {
+        val windows = (listOf(sessionModelId) + fallbackChain.map { it.modelId })
+            .mapNotNull { ModelContext.knownWindow(it) }
+        return windows.minOrNull() ?: DEFAULT_CONTEXT_TOKENS
+    }
+
     data class Compacted(
         val messagesToSend: List<Message>,
         val summaryMarkdown: String?,
@@ -40,17 +74,47 @@ object Compaction {
 
     /**
      * Split [messages] into (summary, recent tail). The tail is the newest
-     * messages totalling at most [KEEP_TOKENS]; everything older is covered
+     * messages totalling at most [keepTokens]; everything older is covered
      * by the summary.
+     *
+     * Pair boundary (Phase 7, Step B2 — AgentMT's "the kept tail must
+     * never split a tool call/result pair", adapted to OUR storage order):
+     * in Room a turn is stored as its tool messages FIRST and its one
+     * assistant message AFTER them (the assistant text is inserted when
+     * the turn ends), so a tool message's "caller" is the assistant
+     * message that follows it. Walking backwards from the newest message
+     * we meet the assistant message first, so a tail can only split a
+     * pair one way: it keeps an assistant message while the tool
+     * messages of that same turn fell outside the budget. When that
+     * happens the assistant message is dropped from the tail too (it
+     * joins the covered part, so the summary still describes the turn)
+     * — the model never sees an assistant message whose tool results
+     * it was never sent. A tail that starts with a tool message is
+     * fine here: its assistant message is newer, so it is already in
+     * the tail. The loop repeats because dropping one assistant message
+     * can expose the next one in the same position.
      */
-    fun splitForSummary(messages: List<Message>): Pair<List<Message>, List<Message>> {
+    fun splitForSummary(
+        messages: List<Message>,
+        keepTokens: Int = KEEP_TOKENS
+    ): Pair<List<Message>, List<Message>> {
         var kept = 0
         val tail = mutableListOf<Message>()
         for (msg in messages.asReversed()) {
             val cost = TokenCounter.estimateTokens(msg.text)
-            if (tail.isNotEmpty() && kept + cost > KEEP_TOKENS) break
+            if (tail.isNotEmpty() && kept + cost > keepTokens) break
             tail.add(0, msg)
             kept += cost
+        }
+        // Pair boundary: drop a leading assistant message whose turn's
+        // tool messages sit just outside the tail.
+        while (tail.isNotEmpty()) {
+            val first = tail.first()
+            if (first.role != "assistant") break
+            val indexInFull = messages.indexOf(first)
+            if (indexInFull <= 0) break
+            if (messages[indexInFull - 1].role != "tool") break
+            tail.removeAt(0)
         }
         val covered = messages.dropLast(tail.size)
         return covered to tail

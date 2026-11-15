@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -29,9 +30,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TextButton
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -44,6 +46,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import android.net.Uri
+import com.inyogeshwar.codesathi.data.KeyHealth
 import com.inyogeshwar.codesathi.data.Provider
 import com.inyogeshwar.codesathi.ui.AppViewModel
 
@@ -86,11 +89,16 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     }
     val favourites by viewModel.favourites.collectAsState()
     val fallbackChain by viewModel.fallbackChain.collectAsState()
+    // Routing mode + per-key health (Phase 7, Step B1).
+    val routingMode by viewModel.routingMode.collectAsState()
+    val keyHealth by viewModel.keyHealth.collectAsState()
+    var showResetConfirm by remember { mutableStateOf(false) }
     // Reasoning effort per model (Phase 3, Step 2): "providerId/modelId" → low/medium/high.
     val efforts by viewModel.reasoningEfforts.collectAsState()
     // Azure resource names (Phase 4): "providerId" → resource name.
     val azureResourceNames by viewModel.azureResourceNames.collectAsState()
     val exhaustedModelKeys = viewModel.exhaustedModelKeys
+    val exhaustedLabels = viewModel.exhaustedLabels
     // Read for subscription only: KeyStore is not a Flow, so the key lists
     // below are re-read whenever this version bumps (add / delete key).
     @Suppress("UNUSED_VARIABLE")
@@ -102,8 +110,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
             p.name.contains(query, ignoreCase = true) ||
             p.models.any { it.contains(query, ignoreCase = true) }
     }
-    Scaffold(topBar = {
-        TopAppBar(
+    SathiScaffold(topBar = {
+        SathiTopBar(
             title = { Text("Providers & models") },
             navigationIcon = {
                 IconButton(onClick = onBack) {
@@ -127,9 +135,56 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
             item {
                 Text("Fallback order", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    "When a model's limit is reached, CodeSathi first tries another key of the same model, then walks this list top to bottom. A model whose every key is exhausted shows “Limit reached” until midnight.",
+                    "When a model fails, CodeSathi first tries another key of the same model, then walks this list top to bottom. A failed key cools down instead of waiting until midnight: rate limit 1 min, daily quota 1 h, out of credit 6 h, server error 20 s. A key the provider rejected stays skipped until you reset the limit flags.",
                     style = MaterialTheme.typography.bodySmall
                 )
+                // Routing mode (Phase 7, Step B1): pinned stays on the
+                // session's model (rotating only its keys); fallback
+                // walks the chain below. The chain order never changes.
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    FilterChip(
+                        selected = routingMode == "pinned",
+                        onClick = { viewModel.setRoutingMode("pinned") },
+                        label = { Text("Pinned — stay on this model", style = MaterialTheme.typography.labelSmall) }
+                    )
+                    FilterChip(
+                        selected = routingMode != "pinned",
+                        onClick = { viewModel.setRoutingMode("fallback") },
+                        label = { Text("Fallback — use the chain", style = MaterialTheme.typography.labelSmall) }
+                    )
+                }
+                if (routingMode == "pinned") {
+                    Text(
+                        "Pinned: a failed model only rotates to its next key — the fallback list below is not used until you switch back.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { showResetConfirm = true }) {
+                        Text("Reset limit flags")
+                    }
+                }
+                Text(
+                    "Resetting lifts every cooldown and rejected-key flag, so the next turn retries the first key again. A key that is still really limited will simply fail and cool down again.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (showResetConfirm) {
+                    AlertDialog(
+                        onDismissRequest = { showResetConfirm = false },
+                        title = { Text("Reset limit flags?") },
+                        text = { Text("Every cooled-down or rejected key will be tried again on the next turn. This does not delete any key.") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                viewModel.resetAllKeyLimits()
+                                showResetConfirm = false
+                                keySavedNote = "Limit flags reset — cooled-down keys can be tried again."
+                            }) { Text("Reset") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showResetConfirm = false }) { Text("Cancel") }
+                        }
+                    )
+                }
                 if (fallbackChain.isEmpty()) {
                     Text(
                         "No fallback set yet — tap + on any model below to add it.",
@@ -150,7 +205,8 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                             )
                             if (exhausted) {
                                 Text(
-                                    "Limit reached — resets at midnight",
+                                    exhaustedLabels["${entry.providerId}/${entry.modelId}"]
+                                        ?: "Limit reached — cooling down",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.error
                                 )
@@ -247,6 +303,7 @@ fun ProviderPickerScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                         keySavedNote = "Key removed for ${provider.name}."
                     },
                     apiKeys = viewModel.apiKeys(provider.id),
+                    keyHealth = keyHealth,
                     favourites = favourites,
                     efforts = efforts,
                     onSetEffort = { model, effort -> viewModel.setReasoningEffort(provider.id, model, effort) },
@@ -391,6 +448,8 @@ private fun ProviderCard(
     onSaveKey: () -> Unit,
     onRemoveKey: (String) -> Unit,
     apiKeys: List<com.inyogeshwar.codesathi.data.KeyStore.KeyDisplay>,
+    /** Per-key health, keyed by "providerId|modelId|keyId" (Phase 7, Step B1). */
+    keyHealth: Map<String, KeyHealth> = emptyMap(),
     favourites: List<com.inyogeshwar.codesathi.data.FavouriteModel>,
     efforts: Map<String, String>,
     /** (modelId, effort) — effort null means back to Default. */
@@ -664,11 +723,34 @@ private fun ProviderCard(
                         Text("No key saved yet.", style = MaterialTheme.typography.bodySmall)
                     }
                     apiKeys.forEach { stored ->
+                        // Health across this key's models (Phase 7,
+                        // Step B1): a key cools down per model, so the
+                        // row shows its worst state — rejected beats
+                        // cooling down, cooling down beats healthy.
+                        val keyEntries = keyHealth.filterKeys {
+                            it.startsWith("${provider.id}|") && it.endsWith("|${stored.id}")
+                        }.values
+                        val healthText = when {
+                            keyEntries.any { it.status == KeyHealth.STATUS_INVALID } ->
+                                "Key rejected — reset limit flags to try again"
+                            keyEntries.any { it.cooldownUntil > System.currentTimeMillis() } ->
+                                "Cooling down — ${keyEntries.firstNotNullOfOrNull { it.lastError } ?: "try again shortly"}"
+                            else -> null
+                        }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(stored.masked, modifier = Modifier.weight(1f))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(stored.masked)
+                                healthText?.let {
+                                    Text(
+                                        it,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                }
+                            }
                             OutlinedButton(onClick = { onRemoveKey(stored.id) }) { Text("Delete") }
                         }
                     }

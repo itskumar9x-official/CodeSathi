@@ -23,6 +23,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Phase 7, Step B4: Termux bridge. The com.termux.permission is
+         declared so Termux can grant this app its RUN_COMMAND
+         permission; the app never requests it itself — Termux asks when
+         the first command runs. The queries entry lets the app see
+         whether Termux is installed (Android 11+ package visibility). -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
 
     <application
         android:name=".CodeSathiApp"

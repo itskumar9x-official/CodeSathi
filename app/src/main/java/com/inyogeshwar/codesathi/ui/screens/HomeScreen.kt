@@ -3,499 +3,305 @@ package com.inyogeshwar.codesathi.ui.screens
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.BarChart
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Extension
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.PushPin
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.filled.Upload
-import androidx.compose.material.icons.filled.Wifi
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.LifecycleOwner
 import com.inyogeshwar.codesathi.agent.BUILT_IN_TEMPLATES
-import com.inyogeshwar.codesathi.agent.hasAllFilesAccess
-import com.inyogeshwar.codesathi.agent.isAllFilesAccessSupported
-import com.inyogeshwar.codesathi.agent.openAllFilesAccessSettings
-import com.inyogeshwar.codesathi.data.Session
 import com.inyogeshwar.codesathi.ui.AppViewModel
-import java.text.DateFormat
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import com.inyogeshwar.codesathi.ui.theme.LocalBottomBarInset
+import com.inyogeshwar.codesathi.ui.theme.LocalSathiStatus
+import com.inyogeshwar.codesathi.ui.theme.LocalSpacing
+import com.inyogeshwar.codesathi.ui.theme.SathiCard
+import com.inyogeshwar.codesathi.ui.theme.SathiLockup
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
+import com.inyogeshwar.codesathi.ui.theme.SectionHeader
+import com.inyogeshwar.codesathi.ui.theme.TopBarTitle
+import com.inyogeshwar.codesathi.ui.theme.sathiGradient
+import java.util.Calendar
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * v1.2 Home: greeting, quick actions and the most recent sessions.
+ * The full session list (search, pin, rename, delete, backup) is the
+ * Chats tab; every other tool is in the Tools tab.
+ */
 @Composable
 fun HomeScreen(
     viewModel: AppViewModel,
     onOpenSession: (String) -> Unit,
     onNewSession: () -> Unit,
-    onProviders: () -> Unit,
-    onMcp: () -> Unit,
-    onSkills: () -> Unit,
-    onCommands: () -> Unit,
-    onTerminal: () -> Unit,
-    onRemote: () -> Unit,
-    onSync: () -> Unit,
-    onGit: () -> Unit,
+    onAllSessions: () -> Unit,
     onEditor: () -> Unit,
-    onUsage: () -> Unit
+    onTerminal: () -> Unit,
+    onGit: () -> Unit,
+    onProviders: () -> Unit,
+    onTools: () -> Unit
 ) {
-    // Phase 5, Step 4 — session organisation: the Home list reads the
-    // filtered list (search query in the ViewModel), not the full list,
-    // so typing in the search field filters live and clearing it
-    // restores every session.
-    val sessions by viewModel.filteredSessions.collectAsState()
-    val searchQuery = viewModel.sessionSearchQuery
+    val sessions by viewModel.sessions.collectAsState()
     val context = LocalContext.current
-    var menuOpen by remember { mutableStateOf(false) }
-    // Phase 5, Step 4 — which session the rename / delete dialog is
-    // open for, if any. One dialog at a time; both live at this level
-    // (not inside the LazyColumn) so they survive list recomposition.
-    var renameTarget by remember { mutableStateOf<Session?>(null) }
-    var deleteTarget by remember { mutableStateOf<Session?>(null) }
+    val spacing = LocalSpacing.current
+    val bottomInset = LocalBottomBarInset.current
+    val recent = remember(sessions) { sessions.sortedByDescending { it.updatedAt }.take(4) }
+    val last = recent.firstOrNull()
 
-    // Phase 5, Step 3 — session backup & restore. Both use the system
-    // file picker (SAF) only: CreateDocument lets the user choose
-    // where the backup goes, OpenDocument lets them pick a backup to
-    // restore. No new permission, no path text field.
-    val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json")
-    ) { uri: Uri? -> if (uri != null) viewModel.exportSessions(context, uri) }
-    val importLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? -> if (uri != null) viewModel.importSessions(context, uri) }
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("CodeSathi") },
-                actions = {
-                    // Phase 3, Step 5 — overflow menu: eight icons did
-                    // not fit a narrow phone, and Providers (Settings)
-                    // sat last so it clipped first. The four most-used
-                    // destinations stay visible (Editor, Git, Terminal,
-                    // Providers — Providers is always one tap away on
-                    // any screen width); Remote, Skills, Commands and
-                    // MCP live behind the "⋮" menu. No destination was
-                    // removed — all eight stay reachable. Same
-                    // DropdownMenu pattern as the Chat screen's menu.
-                    IconButton(onClick = onEditor) {
-                        Icon(Icons.Filled.Edit, contentDescription = "Editor")
-                    }
-                    IconButton(onClick = onGit) {
-                        Icon(Icons.Filled.AccountTree, contentDescription = "Git")
-                    }
-                    IconButton(onClick = onTerminal) {
-                        Icon(Icons.Filled.Terminal, contentDescription = "Terminal")
-                    }
-                    IconButton(onClick = onProviders) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Providers")
-                    }
-                    IconButton(onClick = { menuOpen = true }) {
-                        Icon(Icons.Filled.MoreVert, contentDescription = "More")
-                    }
-                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Remote mode") },
-                            leadingIcon = { Icon(Icons.Filled.Wifi, contentDescription = null) },
-                            onClick = { menuOpen = false; onRemote() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Sync devices") },
-                            leadingIcon = { Icon(Icons.Filled.Sync, contentDescription = null) },
-                            onClick = { menuOpen = false; onSync() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Skills") },
-                            leadingIcon = { Icon(Icons.Filled.Build, contentDescription = null) },
-                            onClick = { menuOpen = false; onSkills() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Custom commands") },
-                            leadingIcon = { Icon(Icons.Filled.Code, contentDescription = null) },
-                            onClick = { menuOpen = false; onCommands() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("MCP servers") },
-                            leadingIcon = { Icon(Icons.Filled.Extension, contentDescription = null) },
-                            onClick = { menuOpen = false; onMcp() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Usage & cost") },
-                            leadingIcon = { Icon(Icons.Filled.BarChart, contentDescription = null) },
-                            onClick = { menuOpen = false; onUsage() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Backup sessions") },
-                            leadingIcon = { Icon(Icons.Filled.Download, contentDescription = null) },
-                            onClick = {
-                                menuOpen = false
-                                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US)
-                                    .format(Date())
-                                exportLauncher.launch("codesathi-backup-$stamp.json")
-                            }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Restore sessions") },
-                            leadingIcon = { Icon(Icons.Filled.Upload, contentDescription = null) },
-                            onClick = {
-                                menuOpen = false
-                                importLauncher.launch(arrayOf("application/json"))
-                            }
-                        )
-                    }
-                }
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(onClick = onNewSession) {
-                Icon(Icons.Filled.Add, contentDescription = "New session")
-            }
-        }
-    ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
-            Text("Sessions", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(12.dp))
-            // Phase 5, Step 4 — search by title. Filters live as the
-            // user types (Room LIKE query in the ViewModel); the ×
-            // clears it and the full list comes back.
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { viewModel.setSessionSearchQuery(it) },
-                label = { Text("Search sessions") },
-                singleLine = true,
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { viewModel.setSessionSearchQuery("") }) {
-                            Icon(Icons.Filled.Clear, contentDescription = "Clear search")
-                        }
-                    }
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(12.dp))
-            StorageAccessCard()
-            Spacer(Modifier.height(12.dp))
-            // Phase 5, Step 3 — plain result of the last backup/restore.
-            viewModel.backupNote?.let { note ->
-                Text(note, style = MaterialTheme.typography.bodyMedium)
-                Spacer(Modifier.height(12.dp))
-            }
-            viewModel.backupError?.let { error ->
-                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                Spacer(Modifier.height(12.dp))
-            }
-            if (sessions.isEmpty()) {
-                // Phase 5, Step 4 — a search with no matches says so
-                // plainly, instead of a blank screen with no explanation.
-                if (searchQuery.isBlank()) {
-                    Text(
-                        "Abhi koi session nahi hai. Neeche + dabakar pehla session banayein — folder chunenge, path type nahi karna.",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                } else {
-                    Text(
-                        "No sessions match “$searchQuery”.",
-                        style = MaterialTheme.typography.bodyMedium
+    SathiScaffold(topBar = { SathiTopBar(title = { SathiLockup(markSize = 30.dp) }) }) { _ ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = spacing.gutter, end = spacing.gutter, top = spacing.sm, bottom = bottomInset + spacing.lg
+            ),
+            verticalArrangement = Arrangement.spacedBy(spacing.md)
+        ) {
+            // Crash report (Phase 7, Step B3): the app crashed last
+            // time. The report is local only — Copy sends it wherever
+            // the user pastes it, Dismiss deletes it.
+            viewModel.pendingCrash?.let { crash ->
+                item {
+                    CrashCard(
+                        text = crash,
+                        onDismiss = { viewModel.dismissCrashReport() }
                     )
                 }
             }
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(sessions, key = { it.id }) { session ->
+            item {
+                Column(Modifier.padding(bottom = spacing.xs)) {
+                    Text(greeting(), style = MaterialTheme.typography.headlineLarge)
+                    Text(
+                        "Kya banayenge aaj?",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            item { NewSessionHero(onNewSession) }
+            if (last != null) {
+                item {
+                    val available = viewModel.isFolderAvailable(context, last)
+                    ContinueCard(
+                        title = last.title,
+                        subtitle = "${last.folderName}  ·  ${relativeTime(last.updatedAt)}",
+                        onClick = { if (available) onOpenSession(last.id) else onAllSessions() }
+                    )
+                }
+            }
+            item { SectionHeader("Quick actions") }
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(spacing.md)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(spacing.md)) {
+                        QuickCard(Icons.Filled.Edit, "Editor", "Browse & edit files", Modifier.weight(1f), onEditor)
+                        QuickCard(Icons.Filled.Terminal, "Terminal", "Run commands", Modifier.weight(1f), onTerminal)
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(spacing.md)) {
+                        QuickCard(Icons.Filled.AccountTree, "Git", "Commit, push, pull", Modifier.weight(1f), onGit)
+                        QuickCard(Icons.Filled.Key, "Providers", "Models & API keys", Modifier.weight(1f), onProviders)
+                    }
+                }
+            }
+            item {
+                SectionHeader("Recent sessions") {
+                    if (sessions.isNotEmpty()) {
+                        TextButton(onClick = onAllSessions) { Text("See all") }
+                    }
+                }
+            }
+            if (recent.isEmpty()) {
+                item {
+                    SathiCard(Modifier.fillMaxWidth()) {
+                        Text("No sessions yet", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Abhi koi session nahi hai. “New session” dabakar pehla session banayein — folder chunenge, path type nahi karna.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            } else {
+                items(recent, key = { it.id }) { session ->
                     SessionRow(
                         session = session,
                         available = viewModel.isFolderAvailable(context, session),
-                        modelLabel = "${session.providerId} / ${session.modelId}",
                         onOpen = { onOpenSession(session.id) },
                         onRechoose = { uri -> viewModel.rechooseFolder(context, session, uri) },
-                        onTogglePin = { viewModel.setSessionPinned(session.id, !session.pinned) },
-                        onRename = { renameTarget = session },
-                        onDelete = { deleteTarget = session }
+                        showActions = false
                     )
                 }
             }
-        }
-    }
-    // Phase 5, Step 4 — rename and delete dialogs.
-    renameTarget?.let { session ->
-        RenameSessionDialog(
-            session = session,
-            onDismiss = { renameTarget = null },
-            onRename = { title ->
-                if (viewModel.renameSession(session.id, title)) {
-                    renameTarget = null
-                    true
-                } else {
-                    false
+            item {
+                TextButton(onClick = onTools, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Widgets, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("All tools — skills, commands, MCP, remote, sync, usage")
                 }
             }
-        )
-    }
-    deleteTarget?.let { session ->
-        AlertDialog(
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("Delete this session?") },
-            text = {
-                Text(
-                    "“${session.title}” and its messages will be deleted. " +
-                        "This cannot be undone."
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.deleteSession(session.id)
-                        deleteTarget = null
-                    }
-                ) { Text("Delete") }
-            },
-            dismissButton = {
-                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
-            }
-        )
+        }
     }
 }
 
-/**
- * Phase 3, Step 4 — "Storage access" card on Home.
- *
- * All-files access (MANAGE_EXTERNAL_STORAGE) is a special permission:
- * it can only be granted from system Settings, never from a runtime
- * dialog, so this card only OPENS that screen — and only when the
- * user taps it, never unprompted or at startup. The state is re-read
- * on every resume, so coming back from Settings shows the new state
- * without reopening the app.
- *
- * On Android 10 and older the permission does not exist: the card is
- * shown disabled with a one-line explanation instead of being hidden,
- * so the user is not left wondering where it went.
- */
-@Composable
-private fun StorageAccessCard() {
-    val context = LocalContext.current
-    var granted by remember { mutableStateOf(hasAllFilesAccess()) }
-    val lifecycleOwner = context as? LifecycleOwner
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) granted = hasAllFilesAccess()
-        }
-        lifecycleOwner?.lifecycle?.addObserver(observer)
-        onDispose { lifecycleOwner?.lifecycle?.removeObserver(observer) }
+private fun greeting(): String {
+    val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+    return when (hour) {
+        in 5..11 -> "Good morning"
+        in 12..16 -> "Good afternoon"
+        in 17..21 -> "Good evening"
+        else -> "Namaste"
     }
-    val supported = isAllFilesAccessSupported()
+}
 
-    Card(
-        modifier = Modifier.fillMaxWidth().then(
-            if (supported) Modifier.clickable { openAllFilesAccessSettings(context) }
-            else Modifier
-        )
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text("Storage access", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(4.dp))
-            when {
-                !supported -> Text(
-                    "All-files access needs Android 11 or newer — this phone is older, " +
-                        "so the app keeps using the folder picker only.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                granted -> Text(
-                    "Granted — the app can read and write files in the project folder " +
-                        "directly, so the terminal, Git and editor work on real files " +
-                        "instead of only through the folder picker grant.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                else -> Text(
-                    "Not granted — the app works through the folder picker only. " +
-                        "Turning this on lets the terminal, Git and editor read and " +
-                        "write files in the project folder directly, instead of only " +
-                        "through the folder picker grant.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "What it does NOT do: it does not send your files anywhere, and " +
-                    "your API keys stay encrypted on this device.",
-                style = MaterialTheme.typography.bodySmall
-            )
-            if (supported) {
-                Spacer(Modifier.height(8.dp))
+@Composable
+private fun NewSessionHero(onClick: () -> Unit) {
+    val dark = LocalSathiStatus.current.isDark
+    Surface(onClick = onClick, shape = MaterialTheme.shapes.extraLarge, color = Color.Transparent, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .background(sathiGradient(dark))
+                .padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("New session", style = MaterialTheme.typography.titleLarge, color = Color.White)
+                Spacer(Modifier.height(4.dp))
                 Text(
-                    if (granted) "Tap to open system settings (to change it)."
-                    else "Tap to open system settings and turn it on.",
+                    "Pick a folder, optionally a template, and start in Plan mode.",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary
+                    color = Color.White.copy(alpha = 0.85f)
                 )
+            }
+            Spacer(Modifier.width(12.dp))
+            Box(
+                Modifier.size(48.dp).background(Color.White.copy(alpha = 0.18f), MaterialTheme.shapes.large),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null, tint = Color.White)
             }
         }
     }
 }
 
 @Composable
-private fun SessionRow(
-    session: Session,
-    available: Boolean,
-    modelLabel: String,
-    onOpen: () -> Unit,
-    onRechoose: (Uri) -> Unit,
-    onTogglePin: () -> Unit,
-    onRename: () -> Unit,
-    onDelete: () -> Unit
-) {
-    val context = LocalContext.current
-    val picker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? -> if (uri != null) onRechoose(uri) }
-
-    Card(
-        modifier = Modifier.fillMaxWidth().clickable {
-            if (available) onOpen() else picker.launch(null)
-        }
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                // Status dot: green = folder reachable, amber = unavailable.
-                Text(if (available) "● " else "● ", color = if (available) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
-                Text(
-                    session.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f)
-                )
-                // Phase 5, Step 4 — pin, rename, delete. These are
-                // IconButtons, so tapping one does not open the session
-                // (the button consumes the tap; the card never sees it).
-                // The pin is tinted when pinned, so its state is visible
-                // at a glance; pinning is stored in Room and survives
-                // a restart.
-                IconButton(onClick = onTogglePin) {
-                    Icon(
-                        Icons.Filled.PushPin,
-                        contentDescription = if (session.pinned) "Unpin session" else "Pin session",
-                        tint = if (session.pinned) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                IconButton(onClick = onRename) {
-                    Icon(Icons.Filled.Edit, contentDescription = "Rename session")
-                }
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Filled.Delete, contentDescription = "Delete session")
-                }
-            }
-            Text("Folder: ${session.folderName}", style = MaterialTheme.typography.bodyMedium)
-            Text("Model: $modelLabel", style = MaterialTheme.typography.bodyMedium)
+private fun CrashCard(text: String, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    SathiCard(Modifier.fillMaxWidth()) {
+        Column {
+            Text("CodeSathi closed unexpectedly last time", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(4.dp))
             Text(
-                "Last activity: ${DateFormat.getDateTimeInstance().format(Date(session.updatedAt))}",
-                style = MaterialTheme.typography.bodySmall
+                "This crash report never left your phone. Copy it to share it, or dismiss it to delete it.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (!available) {
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Folder unavailable — tap to re-choose",
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium
-                )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text.take(600) + if (text.length > 600) "\n…" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 12,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    clipboard.setText(AnnotatedString(text))
+                    copied = true
+                }) { Text(if (copied) "Copied" else "Copy") }
+                OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
             }
         }
     }
 }
 
-/**
- * Phase 5, Step 4 — rename dialog. The field starts with the current
- * title; an empty title is refused with a plain message and the old
- * title stays (the dialog stays open, nothing is written).
- */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RenameSessionDialog(
-    session: Session,
-    onDismiss: () -> Unit,
-    onRename: (String) -> Boolean
-) {
-    var title by remember { mutableStateOf(session.title) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Rename session") },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = title,
-                    onValueChange = { title = it },
-                    label = { Text("Session name") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                error?.let {
-                    Spacer(Modifier.height(8.dp))
-                    Text(it, color = MaterialTheme.colorScheme.error)
-                }
+private fun ContinueCard(title: String, subtitle: String, onClick: () -> Unit) {
+    SathiCard(Modifier.fillMaxWidth(), onClick = onClick) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(40.dp).background(MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.shapes.medium),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = MaterialTheme.colorScheme.onTertiaryContainer)
             }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    if (!onRename(title)) {
-                        error = "Title cannot be empty — the old title stays."
-                    }
-                }
-            ) { Text("Rename") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Continue", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-    )
+    }
+}
+
+@Composable
+internal fun QuickCard(icon: ImageVector, title: String, subtitle: String, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    SathiCard(modifier, onClick = onClick, contentPadding = 14.dp) {
+        Box(
+            Modifier.size(38.dp).background(MaterialTheme.colorScheme.primaryContainer, MaterialTheme.shapes.medium),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(20.dp))
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(title, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+        Text(
+            subtitle, style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis
+        )
+    }
 }
 
 /**
@@ -534,8 +340,21 @@ fun NewSessionScreen(
         if (pickedName.isNotBlank() && name.isBlank()) name = pickedName
     }
 
-    Scaffold(topBar = { TopAppBar(title = { Text("New session") }) }) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
+    SathiScaffold(
+        topBar = {
+            SathiTopBar(
+                title = { TopBarTitle("New session", "Folder → template → create") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "Back") }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier.fillMaxSize().padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 8.dp)
+        ) {
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
@@ -543,8 +362,19 @@ fun NewSessionScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(16.dp))
-            Button(onClick = { picker.launch(null) }) {
-                Text(if (viewModel.pickedFolderUri == null) "Choose folder" else "Folder: $pickedName — change")
+            SathiCard(Modifier.fillMaxWidth(), onClick = { picker.launch(null) }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (viewModel.pickedFolderUri == null) Icons.Filled.Folder else Icons.Filled.CheckCircle,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        if (viewModel.pickedFolderUri == null) "Choose folder" else "Folder: $pickedName — change",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                }
             }
             Spacer(Modifier.height(16.dp))
             // Phase 6, Step 3 — template picker. It sits on this screen,
@@ -561,13 +391,16 @@ fun NewSessionScreen(
             )
             Spacer(Modifier.height(8.dp))
             BUILT_IN_TEMPLATES.forEach { template ->
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        .clickable { viewModel.selectTemplate(template.id) }
+                SathiCard(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    contentPadding = 6.dp,
+                    color = if (viewModel.selectedTemplateId == template.id) MaterialTheme.colorScheme.primaryContainer
+                    else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    onClick = { viewModel.selectTemplate(template.id) }
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                        modifier = Modifier.padding(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         RadioButton(
                             selected = viewModel.selectedTemplateId == template.id,
@@ -587,8 +420,8 @@ fun NewSessionScreen(
                 }
             }
             Spacer(Modifier.height(16.dp))
-            Text("Default model: ${viewModel.providerRepository.topPicks().firstOrNull()?.let { "${it.first.name} / ${it.second}" } ?: "not set"}")
-            Text("Change it later in Providers.", style = MaterialTheme.typography.bodySmall)
+            Text("Default model: ${viewModel.providerRepository.topPicks().firstOrNull()?.let { "${it.first.name} / ${it.second}" } ?: "not set"}", style = MaterialTheme.typography.bodyMedium)
+            Text("Change it later in Providers.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(24.dp))
             Button(
                 onClick = {
@@ -596,14 +429,15 @@ fun NewSessionScreen(
                     if (id == null) error = "Pehle folder chuniye (Choose folder)."
                     else onCreated(id)
                 },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().height(52.dp)
             ) { Text("Create & open") }
             error?.let {
                 Spacer(Modifier.height(12.dp))
                 Text(it, color = MaterialTheme.colorScheme.error)
             }
             Spacer(Modifier.height(16.dp))
-            Button(onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("Back") }
+            OutlinedButton(onClick = onBack, modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("Back") }
+            Spacer(Modifier.height(16.dp))
         }
     }
 }

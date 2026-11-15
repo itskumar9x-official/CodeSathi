@@ -25,9 +25,13 @@ import java.io.File
  * Storage: built-in skills ship under app/src/main/assets/skills/ and are
  * copied into the app-private folder getFilesDir()/skills/ on first use,
  * so the user can edit them. User-added skills are Markdown files in the
- * same folder. Enabled / disabled lives in DataStore (PreferencesStore),
+ * same folder. Skills can also be installed from a GitHub URL or
+ * skills.sh link (Phase 7, Step B4) — the SKILL.md is converted to this
+ * same one-file format on install. Plugin skills (Phase 7, Step B4)
+ * stay inside their plugin's folder and are read from there.
+ * Enabled / disabled lives in DataStore (PreferencesStore),
  * not in the file — a file never carries its own on/off flag.
- * No skill is ever downloaded, and there is no marketplace or versioning.
+ * There is no marketplace or versioning.
  */
 data class Skill(
     /** File name without ".md" — the id the model uses, e.g. "code-review". */
@@ -41,7 +45,11 @@ data class Skill(
     /** True when the skill shipped with the app (it can be disabled and
      *  reset, but not deleted). */
     val builtIn: Boolean,
-    val fileName: String
+    val fileName: String,
+    /** Plugin this skill came from, if any — plugin skills are read-only
+     *  here (enable / disable only; edit, delete and reset refuse). */
+    val pluginId: String? = null,
+    val pluginName: String? = null
 )
 
 /** The ids of the skills that ship with the app (assets/skills/ — one .md file each). */
@@ -60,6 +68,44 @@ fun slugifySkillId(name: String): String {
 fun isValidSkillId(id: String): Boolean =
     id.isNotBlank() && id.all { it.isLowerCase() && (it.isLetterOrDigit() || it == '-') } &&
         !id.startsWith('-') && !id.endsWith('-') && !id.contains("--")
+
+/**
+ * Parse a skill folder's SKILL.md (Claude Code format: YAML front
+ * matter with name and description, then the instructions). Returns
+ * (name, description, instructions). A file without front matter
+ * falls back to the folder name and the first non-empty line.
+ */
+fun parseSkillFrontMatter(text: String, fallbackId: String): Triple<String, String, String> {
+    var name = fallbackId
+    var description = ""
+    var body = text
+    if (text.startsWith("---")) {
+        val end = text.indexOf("\n---", 3)
+        if (end > 0) {
+            text.substring(3, end).lines().forEach { line ->
+                val i = line.indexOf(':')
+                if (i > 0 && !line.startsWith(" ")) {
+                    val key = line.substring(0, i).trim()
+                    val value = line.substring(i + 1).trim().trim('"', '\'')
+                    if (key == "name" && value.isNotBlank()) name = value
+                    if (key == "description") description = value
+                }
+            }
+            body = text.substring(end + 4).trimStart()
+        }
+    }
+    if (description.isBlank()) {
+        description = body.lines().firstOrNull { it.isNotBlank() }.orEmpty().take(160)
+    }
+    return Triple(name, description, body.trim())
+}
+
+/** Result of installing skills from a GitHub repo. */
+data class SkillInstallResult(
+    val installed: List<String>,
+    val skipped: List<String>,
+    val error: String?
+)
 
 /** Build the Markdown text of a skill from its three parts. */
 fun buildSkillMarkdown(name: String, description: String, instructions: String): String =
@@ -111,6 +157,28 @@ class SkillStore(private val context: Context) {
         get() = File(context.filesDir, SKILLS_DIR)
 
     /**
+     * (plugin name, plugin folder) pairs for the enabled plugins, set
+     * by the ViewModel from the plugin registry. Plugin skills live
+     * inside those folders (skills/<name>/SKILL.md) and are read from
+     * there — never copied into the skills folder, so uninstalling a
+     * plugin removes its skills at once and a plugin update is just a
+     * reinstall.
+     */
+    @Volatile
+    var pluginDirs: List<Pair<String, File>> = emptyList()
+
+    /** Ids of the skills that come from an enabled plugin right now. */
+    private fun pluginSkillIds(): Set<String> {
+        val ids = HashSet<String>()
+        for ((_, pluginDir) in pluginDirs) {
+            File(pluginDir, "skills").listFiles()
+                ?.filter { it.isDirectory && File(it, "SKILL.md").isFile }
+                ?.forEach { ids += pluginIdFor(it.name) }
+        }
+        return ids
+    }
+
+    /**
      * Copy the built-in skills from assets the first time they are needed.
      * Only files that are not already there are copied, so a user's edits
      * to a built-in skill are never overwritten by this.
@@ -132,32 +200,140 @@ class SkillStore(private val context: Context) {
         }
     }
 
-    /** All skills on disk, built-ins first, then user-added, each by name. */
+    /** All skills on disk, built-ins first, then user-added, each by name.
+     *  Plugin skills (from enabled plugins) are listed last, under their
+     *  plugin's name; a user skill with the same id wins over a plugin
+     *  skill, so a plugin can never shadow a skill the user wrote. */
     suspend fun listSkills(): List<Skill> = withContext(Dispatchers.IO) {
         val files = dir.listFiles()
             ?.filter { it.isFile && it.name.endsWith(".md") }
             ?.sortedBy { it.name }
             .orEmpty()
-        files.mapNotNull { file ->
+        val out = files.mapNotNull { file ->
             try {
                 parseSkillMarkdown(file.name, file.readText())
             } catch (_: Exception) {
                 null
             }
-        }.sortedWith(compareBy({ !it.builtIn }, { it.name.lowercase() }))
+        }.toMutableList()
+        val knownIds = out.map { it.id }.toHashSet()
+        for ((pluginName, pluginDir) in pluginDirs) {
+            File(pluginDir, "skills").listFiles()
+                ?.filter { it.isDirectory }
+                ?.sortedBy { it.name }
+                ?.forEach { skillDir ->
+                    val skillFile = File(skillDir, "SKILL.md")
+                    if (!skillFile.isFile) return@forEach
+                    val id = pluginIdFor(skillDir.name)
+                    if (id in knownIds) return@forEach
+                    try {
+                        val (name, description, instructions) =
+                            parseSkillFrontMatter(skillFile.readText(), id)
+                        out += Skill(
+                            id = id, name = name, description = description,
+                            instructions = instructions, builtIn = false,
+                            fileName = "SKILL.md",
+                            pluginId = pluginIdFor(pluginName), pluginName = pluginName
+                        )
+                        knownIds += id
+                    } catch (_: Exception) {
+                        // One bad plugin skill must not hide the rest.
+                    }
+                }
+        }
+        out.sortedWith(compareBy({ !it.builtIn }, { it.name.lowercase() }))
     }
 
-    /** One skill by id, or null when there is no such file. */
+    /** One skill by id, or null when there is no such file. Plugin
+     *  skills are found by their folder name under an enabled plugin. */
     suspend fun loadSkill(id: String): Skill? = withContext(Dispatchers.IO) {
         if (!isValidSkillId(id)) return@withContext null
         val file = File(dir, "$id.md")
-        if (!file.isFile) return@withContext null
-        try {
-            parseSkillMarkdown(file.name, file.readText())
-        } catch (_: Exception) {
-            null
+        if (file.isFile) {
+            try {
+                return@withContext parseSkillMarkdown(file.name, file.readText())
+            } catch (_: Exception) {
+                return@withContext null
+            }
         }
+        for ((pluginName, pluginDir) in pluginDirs) {
+            val skillFile = File(File(pluginDir, "skills"), "$id/SKILL.md")
+            if (!skillFile.isFile) continue
+            return@withContext try {
+                val (name, description, instructions) =
+                    parseSkillFrontMatter(skillFile.readText(), id)
+                Skill(
+                    id = id, name = name, description = description,
+                    instructions = instructions, builtIn = false,
+                    fileName = "SKILL.md",
+                    pluginId = pluginIdFor(pluginName), pluginName = pluginName
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+        null
     }
+
+    /**
+     * Install skills from a GitHub URL or skills.sh link (or an
+     * owner/repo shorthand). Each skill folder found becomes one
+     * plain CodeSathi skill file in the skills folder — the front
+     * matter becomes the "# Name" and "Description:" lines, the rest
+     * becomes the instructions. Supporting files beside SKILL.md are
+     * NOT installed: CodeSathi skills are single Markdown files, and
+     * a skill that needs its extra files will say so in its text.
+     * An id that already exists is skipped, never overwritten.
+     */
+    suspend fun installFromGitHub(ref: RepoRef, fetcher: GitHubFetcher): SkillInstallResult =
+        withContext(Dispatchers.IO) {
+            val found = try {
+                fetcher.findSkills(ref)
+            } catch (e: Exception) {
+                return@withContext SkillInstallResult(
+                    emptyList(), emptyList(),
+                    e.message ?: "Could not reach GitHub."
+                )
+            }
+            if (found.isEmpty()) {
+                return@withContext SkillInstallResult(
+                    emptyList(), emptyList(),
+                    "No skill (no SKILL.md) found at ${ref.display}."
+                )
+            }
+            val installed = ArrayList<String>()
+            val skipped = ArrayList<String>()
+            for (entry in found) {
+                val entries = try {
+                    fetcher.list(ref, entry.path)
+                } catch (_: Exception) {
+                    continue
+                }
+                val skillFile = entries.firstOrNull { it.name == "SKILL.md" }
+                    ?: continue
+                val text = try {
+                    String(fetcher.download(skillFile.downloadUrl ?: continue))
+                } catch (_: Exception) {
+                    continue
+                }
+                val id = pluginIdFor(entry.name)
+                if (!isValidSkillId(id) || File(dir, "$id.md").exists()) {
+                    skipped += id
+                    continue
+                }
+                val (name, description, instructions) = parseSkillFrontMatter(text, id)
+                dir.mkdirs()
+                try {
+                    File(dir, "$id.md").writeText(
+                        buildSkillMarkdown(name, description, instructions)
+                    )
+                    installed += id
+                } catch (_: Exception) {
+                    skipped += id
+                }
+            }
+            SkillInstallResult(installed, skipped, null)
+        }
 
     /**
      * Create a skill from its three parts. Returns the new id, or null
@@ -177,9 +353,12 @@ class SkillStore(private val context: Context) {
             }
         }
 
-    /** Overwrite a skill's Markdown. False when the id is bad or the write fails. */
+    /** Overwrite a skill's Markdown. False when the id is bad, the
+     *  skill comes from a plugin (edit it in the plugin instead), or
+     *  the write fails. */
     suspend fun saveSkill(id: String, markdown: String): Boolean = withContext(Dispatchers.IO) {
         if (!isValidSkillId(id) || markdown.isBlank()) return@withContext false
+        if (id in pluginSkillIds()) return@withContext false
         return@withContext try {
             dir.mkdirs()
             File(dir, "$id.md").writeText(markdown)
@@ -191,10 +370,12 @@ class SkillStore(private val context: Context) {
 
     /**
      * Delete a user-added skill. Built-ins cannot be deleted (disable or
-     * reset them instead) — returns false for those.
+     * reset them instead) — returns false for those — and neither can
+     * plugin skills (uninstall the plugin instead).
      */
     suspend fun deleteSkill(id: String): Boolean = withContext(Dispatchers.IO) {
         if (id in BUILTIN_SKILL_IDS) return@withContext false
+        if (id in pluginSkillIds()) return@withContext false
         val file = File(dir, "$id.md")
         if (!file.isFile) return@withContext false
         file.delete()

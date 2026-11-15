@@ -28,9 +28,10 @@ import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -46,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import com.inyogeshwar.codesathi.agent.TerminalFolder
 import com.inyogeshwar.codesathi.agent.TerminalLine
 import com.inyogeshwar.codesathi.agent.TerminalLineKind
+import com.inyogeshwar.codesathi.agent.TermuxBridge
 import com.inyogeshwar.codesathi.agent.hasAllFilesAccess
 import com.inyogeshwar.codesathi.ui.TerminalViewModel
 
@@ -76,6 +78,7 @@ fun TerminalScreen(viewModel: TerminalViewModel, onBack: () -> Unit) {
     val lines by viewModel.lines.collectAsState()
     val history by viewModel.history.collectAsState()
     val isRunning = viewModel.isRunning
+    val termuxEnabled by viewModel.termuxEnabled.collectAsState()
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -113,9 +116,9 @@ fun TerminalScreen(viewModel: TerminalViewModel, onBack: () -> Unit) {
         viewModel.runCommand(command)
     }
 
-    Scaffold(
+    SathiScaffold(
         topBar = {
-            TopAppBar(
+            SathiTopBar(
                 title = { Text("Terminal") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -179,6 +182,75 @@ fun TerminalScreen(viewModel: TerminalViewModel, onBack: () -> Unit) {
                 }
             }
 
+            // Termux backend for the agent's `run` tool (Phase 7, Step
+            // B4). This screen's own commands always run in the in-app
+            // shell — the toggle only changes where the agent runs.
+            Spacer(Modifier.height(8.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Agent run tool uses Termux",
+                                style = MaterialTheme.typography.titleMedium
+                            )
+                            Text(
+                                "When on, the agent's run tool executes commands in your " +
+                                    "Termux app (bash) instead of the in-app shell — same " +
+                                    "allow / ask / deny rule, same Plan-mode screen. " +
+                                    "Termux only sees shared storage or its own home.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                when {
+                                    !viewModel.termuxInstalled ->
+                                        "Termux is not installed — install Termux first."
+                                    !viewModel.termuxPermitted ->
+                                        "Termux is installed, but CodeSathi is not allowed to " +
+                                            "run commands in it yet — set allow-external-apps " +
+                                            "below and grant the permission when Termux asks."
+                                    else -> "Termux is installed and allowed."
+                                },
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            if (termuxEnabled && !viewModel.termuxInstalled) {
+                                Text(
+                                    "The toggle is on but Termux is missing, so the run " +
+                                        "tool refuses with a plain message until Termux is installed.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = termuxEnabled,
+                            onCheckedChange = { viewModel.setTermuxEnabled(it) }
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "One-time setup — paste into Termux:",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    Text(
+                        TermuxBridge.SETUP,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Text(
+                        "A command running in Termux cannot be stopped from here " +
+                            "(Stop does nothing to it) and returns its whole output " +
+                            "at once instead of streaming. It also needs Termux's own " +
+                            "tools installed (node, python, git) — the in-app shell " +
+                            "has none of those either.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+
             // Past commands: tap one to re-run it.
             if (history.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))
@@ -191,6 +263,55 @@ fun TerminalScreen(viewModel: TerminalViewModel, onBack: () -> Unit) {
                             enabled = !isRunning && folder != null
                         ) {
                             Text(command, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+                }
+            }
+
+            // Background processes (Phase 7, Step B3): dev servers and
+            // watchers the agent started with the background_process
+            // tool. A snapshot, not live — Refresh re-reads it. Stop
+            // kills the process; its output lives in its log file.
+            val background = viewModel.backgroundProcesses
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Background processes", style = MaterialTheme.typography.labelMedium)
+                OutlinedButton(onClick = { viewModel.refreshBackgroundProcesses() }) {
+                    Text("Refresh")
+                }
+            }
+            if (background.isEmpty()) {
+                Text(
+                    "None — the agent starts one with the background_process tool.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            } else {
+                background.forEach { bg ->
+                    // The status is built first so the template below
+                    // holds no nested quotes (keeps the balance check
+                    // simple and the line readable).
+                    val state = if (bg.running) "running"
+                        else "exited " + (bg.exitCode?.toString() ?: "?")
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "#${bg.id} $state: ${bg.command.take(60)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (bg.running) {
+                            OutlinedButton(onClick = { viewModel.stopBackgroundProcess(bg.id) }) {
+                                Text("Stop")
+                            }
                         }
                     }
                 }

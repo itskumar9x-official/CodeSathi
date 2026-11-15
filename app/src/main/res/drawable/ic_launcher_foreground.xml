@@ -1,14 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- CodeSathi "Sathi Spark" mark (v1.2): two code brackets as a friendly
+     pair sharing a spark. Master artwork: brand/codesathi-mark.svg. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Original CodeSathi mark: a simple "C" + code brackets, drawn fresh here. -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M54,30 L78,54 L54,78 L66,78 L90,54 L66,30 Z" />
+        android:pathData="M41,37 L27,54 L41,71"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="7.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M42,44 L30,54 L42,64 L42,70 L18,54 L42,38 Z" />
+        android:pathData="M67,37 L81,54 L67,71"
+        android:strokeColor="#C9F7EC"
+        android:strokeWidth="7.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="#FFB547"
+        android:pathData="M54,42.5 C55.4,49.5 58.5,52.6 65.5,54 C58.5,55.4 55.4,58.5 54,65.5 C52.6,58.5 49.5,55.4 42.5,54 C49.5,52.6 52.6,49.5 54,42.5 Z" />
 </vector>

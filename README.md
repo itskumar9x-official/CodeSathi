@@ -1,4 +1,4 @@
-# CodeSathi — v1
+# CodeSathi — v1.2
 
 On-device AI coding agent for Android. **Idea-only project**: every line of
 code, the provider catalog, the prompts and the branding here were written
@@ -10,7 +10,7 @@ AntiGem — no code, prompts, skills, catalog data, licences or assets.
 - **Stack:** Kotlin + Jetpack Compose (Material 3), Room, DataStore
   Preferences, EncryptedSharedPreferences, kotlinx-serialization.
 - **SDKs:** minSdk 24 (Android 7.0), compileSdk 36, targetSdk 36
-  (Android 16), version 1.0.
+  (Android 16), version 1.2.
 
 ## Latest setup (Nov 2026 migration)
 
@@ -75,6 +75,8 @@ Compose BOM 2024.01.00, Room 2.6.1.
    diff-card Approve and the loop resumes after approval. Per-tool
    permission rules (allow / ask / deny) are in the chat menu under
    "Tool permissions" — writes always need Approve, even on "allow".
+   (Phase 7, Step B2 adds approval modes + glob rules to the same
+   dialog — see below.)
    "Edit plan" prefills the goal in the chat box. After a write, light
    verification runs (exists, non-empty, basic HTML sanity) and shows
    "✓ Verified: …".
@@ -109,7 +111,10 @@ Compose BOM 2024.01.00, Room 2.6.1.
    Markdown summary (offline local summary is the fallback if that call
    fails), kept beside the last ~15k tokens, with a "Chat summarised…"
    banner (tap to read) and a manual "Summarise chat" menu item.
-   Nothing is ever silently dropped.
+   Nothing is ever silently dropped. (Phase 7, Step B2 caps the window
+   at the smallest known window among the session model + fallback
+   chain, never splits a tool call/result pair at the cut, and retries
+   a "context too long" step once after harder compaction — see below.)
 
 ## Phase 2, Step 1 — multi-key fallback / auto-switch
 
@@ -138,12 +143,15 @@ Compose BOM 2024.01.00, Room 2.6.1.
   list, so it gets a single keyless attempt per turn and the synthetic
   key id "aws" lets a throttled Bedrock model be marked exhausted until
   midnight like any other provider's key.
-- **Exhaustion resets at midnight** — a key marked exhausted is skipped
-  until the start of the next local day. Exhaustion is tracked by key
-  id (a SHA-256 prefix, never the key value) in DataStore, and expired
-  flags are pruned on read. A fallback entry whose every key is
-  exhausted shows a "Limit reached — resets at midnight" badge in
-  Providers.
+- **Exhaustion resets by cooldown, not midnight (Phase 7, Step
+  B1)** — a key marked exhausted is skipped until its failure's
+  cooldown ends: rate limit 60 s, daily quota 1 h, out of credit
+  6 h, server error 20 s, network failure 15 s. A key the provider
+  rejected (401/403) is marked invalid and stays skipped until the
+  user resets it. Exhaustion is tracked by key id (a SHA-256 prefix,
+  never the key value) in DataStore, and expired flags are pruned on
+  read. A fallback entry whose every key is blocked shows its reason
+  and retry time in Providers ("rate limited — retries in ~1 min").
 - **Switch notice** — when a turn switches, the chat shows a small
   banner ("Switched to … — quota reached on …") and keeps the same text
   as a tool message in the history. The session's own model is not
@@ -186,8 +194,11 @@ Compose BOM 2024.01.00, Room 2.6.1.
   a `Description:` line, then the instructions. Built-in skills ship
   under `assets/skills/` and are copied into the app-private
   `getFilesDir()/skills/` folder on first use, so the user can edit
-  them; user-added skills are Markdown files in the same folder. No
-  skill is ever downloaded — no marketplace, no versioning.
+  them; user-added skills are Markdown files in the same folder.
+  Skills can also be installed from a GitHub URL or skills.sh link
+  (Phase 7, Step B4 — one SKILL.md becomes one file here), and plugins
+  contribute skills read from their own folder (same section). There
+  is no marketplace and no versioning.
 - **Built-in skills (written fresh)** — `code-review` (review a file
   for bugs, security and style, findings with file + line), `write-tests`
   (small focused tests per behaviour, happy path then edge cases),
@@ -1302,6 +1313,648 @@ Compose BOM 2024.01.00, Room 2.6.1.
   reliably support emulators — so the first real test should be on a
   real phone, not an emulator).
 
+## Phase 7, Step A1 — v1.2 build fixes (ported 2026-11-14)
+
+Ported from the user's own CodeSathi v1.2 (`b5d6003`, his
+`inyogeshwar/CodeSathi` repo) into this repo — build fixes only, no
+UX changes, no version bump, no workflow file, no catalog change.
+
+- **LocalLlm listener bug (the real bug)** — `agent/LocalLlm.kt`
+  put `.setResultListener` / `.setErrorListener` on the
+  `LlmInferenceOptions` builder, but in tasks-genai 0.10.27 the
+  builder has no such methods, so local-model streaming could not
+  compile / work as written. The progress listener now goes on
+  `generateResponseAsync(prompt) { partialResult, done -> }` as a
+  parameter in `streamEvents`, with errors surfaced through the
+  returned `ListenableFuture` (`future.get()` →
+  `ExecutionException` → `onError`); the builder now sets only
+  model path, max tokens and max top-K. Both KDoc passages that
+  described the old (wrong) API shape are corrected. Prompt-capping,
+  engine caching and the .task file-copy logic are untouched.
+- **Missing kotlinx-serialization imports** — added only the
+  missing imports, no logic changed: `contentOrNull` in
+  `agent/LlmClient.kt` and `agent/McpClient.kt`;
+  `encodeToString` + `decodeFromString` in `data/KeyStore.kt`,
+  `data/PreferencesStore.kt` and `remote/RemoteServer.kt`;
+  `contentOrNull` + `decodeFromString` in `data/Providers.kt`.
+  Each was genuinely used by the file already (verified by grep).
+- **ServiceInfo import** — `remote/RemoteService.kt` imported
+  `android.app.ServiceInfo`, which does not exist; now imports
+  `android.content.pm.ServiceInfo` (used for
+  `FOREGROUND_SERVICE_TYPE_DATA_SYNC`).
+- **@JvmName clash** — `ui/AppViewModel.kt`: the `sessionSearchQuery`
+  property's generated setter clashed with the
+  `setSessionSearchQuery(query)` function; the property setter is
+  now `@JvmName("setSessionSearchQueryState")`.
+- **KSP 2.3.13** — root `build.gradle.kts`:
+  `com.google.devtools.ksp` `2.2.10-2.0.2` → `2.3.13`. The artifact
+  EXISTS on Maven Central (verified 2026-11-14:
+  `https://repo.maven.apache.org/maven2/com/google/devtools/ksp/symbol-processing/2.3.13/symbol-processing-2.3.13.pom`
+  returns HTTP 200 with version 2.3.13, published 2026-10-31).
+  **UNTESTED against this project's bundled Kotlin 2.2.10** — KSP
+  2.3.x normally pairs with Kotlin 2.3.x, not 2.2.10, so the first
+  Gradle sync is the verification step; if sync complains about the
+  KSP/Kotlin pairing, revert to `2.2.10-2.0.2` (recorded in the
+  build file's comment). AGP, Gradle, Kotlin, minSdk, targetSdk and
+  the package name are unchanged.
+- **Not ported from v1.2 here** — `AppViewModel`'s `onboardingChecked`
+  flag and the `isRunning`/`runStartedAt` rework are later v1.2 UX
+  changes (the `d132f8f` commit), not build fixes, so they stay out
+  of this step.
+- **Not yet verified live** — no Gradle build has been run here (no
+  Android SDK on this machine). First-build risks: the KSP 2.3.13 /
+  Kotlin 2.2.10 pairing above; the `generateResponseAsync` listener
+  + `ListenableFuture` shape in `LocalLlm` (only verifiable by a
+  real local-model run on a phone).
+
+## Phase 7, Step A2 — Gradle wrapper 9.6.0 + .gitignore (ported 2026-11-14)
+
+Ported from the user's own CodeSathi v1.2 (`53edc7c`, his
+`inyogeshwar/CodeSathi` repo) — wrapper + .gitignore only, no source,
+no version bump, no workflow file.
+
+- **What was added** — the standard Gradle wrapper files, copied
+  byte-for-byte from v1.2: `gradle/wrapper/gradle-wrapper.jar`
+  (48,462 bytes, the standard Gradle distribution file),
+  `gradle/wrapper/gradle-wrapper.properties`,
+  `gradlew` (8,656 bytes, the standard Gradle-generated POSIX
+  script, executable), `gradlew.bat` (2,848 bytes), and a new
+  root `.gitignore` (87 bytes).
+- **Wrapper version** — `gradle-wrapper.properties` points at
+  `https://services.gradle.org/distributions/gradle-9.6.0-bin.zip`
+  (Gradle 9.6.0), matching the version already recorded in the
+  "Latest setup" section above. No AGP / Kotlin / SDK version
+  changed.
+- **What the target already had** — this repo was NOT wrapper-less:
+  it already held a 272-byte stub `gradlew` (it only ran
+  `exec gradle "$@"`, i.e. it needed a system Gradle on PATH, and
+  its comment still mentioned Gradle 8.2) and a
+  `gradle-wrapper.properties` identical to v1.2's except for two
+  missing lines (`retries=0`, `retryBackOffMs=500`); there was no
+  `gradle-wrapper.jar`, no `gradlew.bat` and no `.gitignore`.
+  The stub `gradlew` and the properties file were replaced with
+  v1.2's standard files; the jar, bat and .gitignore are new.
+- **`.gitignore`** — covers `build/`, `.gradle/`, `.kotlin/`,
+  `local.properties`, `*.apk`, `*.aab`, `.idea/`, `*.iml`,
+  `.DS_Store`, `captures/`. It ignores no source files.
+- **Not yet verified live** — Gradle was NOT run here (no Android
+  SDK on this machine), so `./gradlew` has never executed in this
+  project. First build on a real machine is the verification step:
+  it downloads Gradle 9.6.0 on first run (needs network), then the
+  Android SDK pieces if missing. First-build risks: the KSP 2.3.13
+  / Kotlin 2.2.10 pairing from Step A1 (first sync decides it);
+  `gradlew` line endings / executable bit after a Git checkout on
+  Windows (the `.bat` covers Windows, but `git` must preserve the
+  `+x` bit on `gradlew`).
+
+## Phase 7, Step A3 — release signing config (ported 2026-11-14)
+
+Ported from the user's own CodeSathi v1.2 (`687b655`, his
+`inyogeshwar/CodeSathi` repo) — the `signingConfigs` block in
+`app/build.gradle.kts` only. No source file, no version bump
+(versionCode 1 / versionName "1.0" untouched — bumped to 3 / "1.2" in
+Step A6), no KSP / AGP / Gradle / Kotlin / SDK change, no workflow file.
+
+- **What was added** — in `app/build.gradle.kts`, after
+  `defaultConfig`: a `signingConfigs` block that creates a
+  `release` signing config ONLY when the env var `KEYSTORE_FILE`
+  points at an existing file; plus one line in the `release`
+  build type, `signingConfig = signingConfigs.findByName("release")
+  ?: signingConfigs.getByName("debug")`. Every other line of the
+  file is unchanged (tasks-genai dependency, NIO desugaring, Room /
+  KSP / JGit setup, packaging excludes).
+- **Env vars (actual names from v1.2 — note there is NO
+  `KEYSTORE_BASE64`)** — `KEYSTORE_FILE` (path to the `.jks`
+  file), `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`. All
+  four are read with `System.getenv(...)` only.
+- **Debug-key fallback** — when `KEYSTORE_FILE` is unset or the
+  file does not exist, no `release` signing config is created and
+  the release build is signed with the debug key, so a local build
+  without the secrets still succeeds instead of failing.
+- **No secret anywhere** — no keystore file (`.jks` / `.keystore` /
+  `.pem`), no password and no secret value was added to the repo;
+  the config reads env vars only. The `.jks` file itself is never
+  in this repo; whoever runs a signed release build supplies its
+  path via `KEYSTORE_FILE`.
+- **Workflow EXCLUDED** — the `.github/workflows/` Actions file
+  from v1.2 was deliberately NOT ported, under any name or in any
+  location, and no CI / workflow file was created. The user copies
+  that one file himself if he wants it.
+- **Not yet verified live** — Gradle was NOT run here (no Android
+  SDK on this machine), so the signing config is only proven by a
+  real release build with the env vars set. First-build risks:
+  `KEYSTORE_FILE` pointing at a missing file silently falls back
+  to the debug key (a release APK signed with the debug key looks
+  built but is not releasable — check the signing identity before
+  publishing); a wrong password / alias fails the build at signing
+  time; the KSP 2.3.13 / Kotlin 2.2.10 pairing from Step A1 (first
+  sync decides it).
+
+## Phase 7, Step A6 — unit tests + version bump to vc3 / 1.2 (ported 2026-11-14)
+
+Ported from the user's own CodeSathi v1.2 (`d132f8f`, his
+`inyogeshwar/CodeSathi` repo) — the test + version pieces only. This
+completes Part A (the v1.2 port).
+
+- **Version bump** — `app/build.gradle.kts`: `versionCode = 3`,
+  `versionName = "1.2"`. The header and the SDK line of this README
+  now say v1.2 / version 1.2 (both still said 1.0 — v1.2's own README
+  left them stale). No KSP / AGP / Gradle / Kotlin / SDK change, no
+  workflow file.
+- **Unit tests** — two plain JVM tests copied byte-for-byte from
+  v1.2 (no Android framework in them, so they run with `./gradlew
+  test`, no device needed): `ui/MarkdownParseTest.kt` (fenced code
+  block keeps its language and code; paragraphs around it) and
+  `ui/screens/UiFormatTest.kt` (`formatElapsed` seconds / padded
+  minutes, `relativeTime` buckets incl. a future timestamp showing
+  "just now"). Both test helpers already existed in this project
+  with the same names and signatures (`parseMarkdown` /
+  `MdBlock.Code` in `ui/Markdown.kt`, byte-identical to v1.2's;
+  `formatElapsed` in `ui/screens/ChatScreen.kt`,
+  `relativeTime` in `ui/screens/SessionComponents.kt` — same
+  package as the tests, `internal` so the same-module tests can
+  reach them). `testImplementation("junit:junit:4.13.2")` added
+  to `app/build.gradle.kts` (verified to exist on Maven Central:
+  POM, HTTP 200, and the latest/release in the metadata).
+- **Not yet verified live** — Gradle was NOT run here (no Android
+  SDK on this machine), so the tests have never executed. First
+  `./gradlew test` on a real machine is the verification step.
+  First-build risks: the KSP 2.3.13 / Kotlin 2.2.10 pairing from
+  Step A1 (first sync decides it).
+
+## Phase 7, Step B1 — AgentMT routing port (RouteRunner + ModelRouter, adapted 2026-11-14)
+
+AgentMT's routing logic, reworked to fit CodeSathi — our package,
+our HttpURLConnection + SSE client (not AgentMT's OkHttp types), and
+our existing fallback design. Nothing of AgentMT's providers.json,
+skills, GPL binaries, Termux JNI or Linux orchestration was touched.
+
+- **FailureClassifier (new `agent/Routing.kt`)** — every failed
+  attempt is classified from OUR `LlmException` (`httpCode` / `body` /
+  `retryAfterMs`) or from the thrown `IOException`: 429 rate limit vs
+  daily quota (a 429 whose body says quota / per day /
+  free-models-per-day / exceeded your current quota) vs 402 / out of
+  credit vs 401/403 key rejected vs 413 / context-too-long vs 408 /
+  timeout vs 5xx server vs 404 / capability mismatch (a 400 about
+  images, tools, or "does not support") vs other 4xx vs network.
+  Keyword lists are AgentMT's, checked against the error bodies our
+  providers actually return (OpenAI/Anthropic-style `{"error":
+  {"message": …}}`, Bedrock throttling as plain 429).
+- **Per-kind cooldowns REPLACE midnight** — a rate-limited key
+  retries after 60 s, a daily-quota key after 1 h, an out-of-credit
+  key after 6 h, a server error after 20 s, a network failure after
+  15 s (never more than 24 h). The old rule ("exhausted until next
+  local midnight") is gone: the legacy `markExhausted(attempt, kind)`
+  overload is kept only for the router-less path. The user's 1st /
+  2nd / 3rd fallback-chain order and multi-key behaviour are
+  unchanged — cooldowns only change WHEN a key becomes eligible
+  again, never the order. A 401/403 key carries no cooldown: it is
+  marked invalid in the health ledger and stays skipped until reset
+  (a rejected key will not start working on its own).
+- **Retry-After headers** — `LlmClient` now reads `Retry-After` /
+  `X-RateLimit-Reset` off the `HttpURLConnection` on error replies
+  (main path and Bedrock) and carries the wait on `LlmException`
+  (`retryAfterMs`); a rate limit then cools down for exactly the
+  asked-for wait (seconds, HTTP date, or epoch s/ms) instead of the
+  default 60 s.
+- **Bounded attempts + deadline** — at most **4 attempts per model
+  turn** and a **180 s pre-first-token deadline** (AgentMT's defaults;
+  `RouteBounds.MAX_ROUTE_ATTEMPTS` / `PRE_FIRST_TOKEN_DEADLINE_MS`),
+  in Plan and in every Build step. Server/timeout failures get a
+  short backoff before the next candidate (400 ms, doubling to 4 s).
+  A turn that fails with a retryable failure (limit, auth, server,
+  network, context, capability, model-missing 404) now tries the
+  next candidate — previously only limit errors retried. A
+  non-retryable failure (other 4xx, anything else) still fails the
+  turn at once.
+- **Mid-stream failure** — if a stream fails after text or tool
+  calls were already emitted, the turn NEVER retries on another
+  model: the partial reply stays exactly as shown and the chat says
+  "The reply stopped halfway (reason) — the part above is kept. Send
+  a message to continue." (`MidStreamException`; the user continues
+  with a new message, which re-sends the history including the
+  partial reply).
+- **Routing profiles (new `agent/ModelRouter.kt`)** — PINNED (stay on
+  the session's model, rotate only its keys) vs FALLBACK (session
+  model, then the fallback chain — the Phase 2, Step 1 order). The
+  mode is a DataStore setting, switched by two chips on the
+  Providers screen, read fresh per turn. Key rotation is the next
+  healthy key of the same provider + model (`nextHealthyKey`).
+- **Health ledger — DataStore JSON, NOT Room** — one `KeyHealth`
+  row per "providerId|modelId|keyId" (failures, status, cooldownUntil,
+  token counts, latency), in `key_health_json` next to the
+  exhaustion flags it is read/written with. Chosen over a Room
+  entity + v5 → v6 migration because the ledger is a small map keyed
+  by the exact string the exhaustion flags already use, needs no
+  query/index/migration, and Room stays at version 5. No secret is
+  stored in it (the key is a hash prefix, never the key value).
+  Success clears the key's cooldown at once and records tokens +
+  latency; failure records the status (`rate_limited` / `no_credit`
+  / `invalid` / `error`) and the error label.
+- **Providers screen** — the fallback section explains the cooldowns
+  (no more "resets at midnight"), shows each blocked entry's reason
+  + when it retries ("rate limited — retries in ~1 min"), shows each
+  key's worst health state under its masked value, and has a
+  one-tap **Reset limit flags** button (plain confirm dialog) that
+  lifts every cooldown and invalid flag. Per-key reset exists too
+  (`ModelRouter.resetCredential`, `AppViewModel.resetKeyLimit`).
+- **Chat notice** — the existing "Switched to …" banner now carries
+  the failure reason ("Switched to X / Y — rate limited (429) on
+  A / B."), kept as a tool message in the history exactly as before.
+- **Not yet verified live** — no Gradle build here (no SDK), and no
+  live rate-limit / quota failure has been observed with a real key:
+  the classifier is ported logic, not proven by execution. First
+  checks on a real device: force a 429 (e.g. a free-tier key at its
+  daily cap) and watch the switch notice name the reason and the
+  key retry after ~60 s instead of waiting until midnight; force a
+  401 and check the key stays skipped until "Reset limit flags".
+  First-build risks: the `delay` import in `AgentRunner`, the
+  `AlertDialog` / `FilterChip` use in the Providers screen, and the
+  new `LlmException.retryAfterMs` parameter (defaults null, so all
+  existing throw sites still compile).
+
+## Phase 7, Step B2 — AgentMT permissions + compaction + resume (adapted 2026-11-14)
+
+AgentMT's `PermissionEngine`, compaction cap / retry and `resume` /
+`CONTINUE_TEXT`, reworked to fit CodeSathi — our package, our
+DataStore JSON storage (not AgentMT's Room rules table), our
+HttpURLConnection + SSE client, and our existing per-tool rules and
+compaction. Nothing of AgentMT's providers.json, skills, GPL
+binaries, Termux JNI or Linux orchestration was touched.
+
+- **Permissions (new `agent/Permissions.kt`)** — ordered glob rules
+  with AgentMT's glob dialect (`**`, `*`, `?`, `{a,b}` — adapted from
+  AgentMT's `Workspace.globToRegex`; CodeSathi had no workspace glob
+  of its own, so this is the project's only glob dialect, nothing
+  invents a second one) and 4 approval modes (AskAll / AskWrites /
+  AutoAll / AutoEdits). **Precedence: explicit per-tool rule >
+  glob rule > mode.** Only a rule the user actually stored counts
+  as "explicit" (new `storedToolRules()` reads the stored map
+  without the v1 defaults merged in) — a stored "deny" always wins
+  and no mode or glob rule can override it. The mode is a DataStore
+  setting (`approval_mode`, default `ask_all`); the glob rules are
+  an ordered DataStore JSON list (`permission_rules_json`, first
+  match wins, add / delete / move up-down). No Room change, no
+  migration, no secrets (tool names and path/command patterns only).
+  A rule names a tool (`*` for all, or a glob such as `mcp:*` for
+  every MCP tool) and a pattern over its target: the file path for
+  read / write / edit, the directory for glob, the query for grep,
+  the command for run, the skill name for skill. MCP tools have no
+  target, so only a `*` pattern matches them — an MCP rule is
+  written against the tool name instead.
+- **What "ask" means here (deliberate difference from AgentMT)** —
+  AgentMT's Ask blocks the turn on a user approval dialog. CodeSathi
+  has no blocking ask dialog: "ask" means what it has always meant
+  in v1 — the tool runs and is always shown as a tool card in the
+  chat. Adding a blocking dialog would change the default behaviour
+  for every existing user, so the mode and glob rules decide
+  allow / ask / deny and the runner enforces them exactly the way
+  it enforces the per-tool rules today: only "deny" refuses a call.
+  The default mode is AskAll, so existing users see no change at
+  all unless they pick another mode or add a glob rule. Plan mode
+  still hard-refuses writes before any of this is consulted, and a
+  file write is never applied without the diff-card Approve — not
+  even under AutoAll or AutoEdits. The runner now gets a
+  target-aware decision function (`toolDecision`, wired in
+  `runAgentTurn` from the stored rules + glob rules + mode); the
+  plain per-tool `toolRule` is kept as the fallback for callers
+  that pass none (e.g. the approve-only runner).
+- **Permissions UI** — the mode + glob rules live in the existing
+  **Tool permissions dialog** (Chat ⋮ menu → "Tool permissions"),
+  above the unchanged per-tool list: four mode rows (label +
+  description, "Use this" / "Selected"), then the glob rules in
+  order (↑ / ↓ / Delete) with an add form (tool, pattern, action).
+  The dialog scrolls now, so the longer content fits a phone.
+- **Compaction cap (new `data/ModelContext.kt`)** — AgentMT caps the
+  threshold at 75% of the smallest known context window among the
+  candidate models. **Our catalog carries no context sizes** (its
+  models are plain id strings — the premise that "the catalog's
+  models carry a context size" was checked and does not hold for
+  our catalog), so the known windows live in a small hand-written
+  table instead: GPT-5 400k, GPT-4.1 1M, GPT-4o/4-turbo 128k,
+  Claude 4.x / 3.5 200k standard (the 1M tier is opt-in beta, so the
+  conservative 200k is used), Gemini 2.5 Pro/Flash 1M, Gemini 1.5
+  Pro 2M, DeepSeek V3-era chat/reasoner 64k, Grok-4 256k, Grok-3
+  131k, Mistral Large/Medium/Small 128k, Codestral 256k, Llama 3.x
+  128k, Qwen 2.5 128k, Qwen 3 256k (vendors' standard published
+  windows, Nov 2026). Matching is longest-prefix on the normalised
+  id (provider prefix stripped, so `openai/gpt-4o` and dated ids
+  match). `Compaction.effectiveContextTokens(sessionModel,
+  fallbackChain)` is the smallest known window among the session
+  model + every fallback-chain model; unknown models are skipped
+  (never treated as zero), and when none is known the fixed 128k
+  default is used, exactly as before. The local engine keeps its own
+  4,096. Because the 60% prune / 75% summarise thresholds are
+  fractions of this window, capping the window caps the thresholds:
+  with a 64k model in the chain, tool outputs prune above ~38k
+  tokens and the summary triggers above 48k instead of 96k.
+- **"Context too long" → harder compaction + one retry** — when a
+  Build step fails with a CONTEXT failure and nothing was emitted
+  yet, the runner calls back into the ViewModel
+  (`onContextTooLong` → `compactHarder`), which re-summarises with
+  only the newest 5k tokens kept verbatim (`HARD_KEEP_TOKENS`,
+  model summary first, offline local summary as fallback), and the
+  step is retried once with the new summary instead of failing the
+  turn (new `AgentEvent.Notice`, shown as a tool message: "Context
+  too long — summarised the earlier chat more tightly and retrying
+  this step."). The retry happens once per step, on the SAME
+  attempt — the next candidate would hit the same oversized prompt.
+  If nothing more can be compacted (nothing outside the 5k tail, or
+  the saved summary already covers it) the callback returns null
+  and the normal next-candidate / error path runs. Build only: Plan
+  has no summary mechanism, so a plan turn keeps the existing
+  next-candidate retry.
+- **Pair boundary** — `Compaction.splitForSummary` (now with a
+  `keepTokens` parameter) never splits a tool call/result pair at
+  the cut. In Room a turn is stored as its tool messages FIRST and
+  its one assistant message AFTER them (the assistant text is
+  inserted when the turn ends), so the split can only happen one
+  way: the tail keeps an assistant message while that turn's tool
+  messages fell outside the budget. When that happens the assistant
+  message is dropped from the tail too (it joins the covered part,
+  so the summary still describes the turn). A tail starting with a
+  tool message is fine here — its assistant message is newer, so it
+  is already in the tail. The 60% prune / 75% summarise / ≤80%-to-
+  start behaviour is unchanged.
+- **Resume / Continue (new `AgentRunner.CONTINUE_TEXT`)** — after an
+  error, a limit, or a Stop, the chat shows a **Continue** button
+  next to the error text (only while no turn runs; sending a new
+  message or tapping Continue clears it). Continue sends
+  `CONTINUE_TEXT` ("Continue from where you stopped. Earlier steps
+  and tool results above are done; do not repeat them. Check the
+  last results, then carry on with the remaining work.") as the
+  next user message — the history already holds every finished
+  step, tool result and the partial reply, so the turn resumes from
+  the last finished step instead of resending the last message from
+  scratch. The CONTINUE_TEXT itself is NOT stored as a user
+  message (same pattern as the post-approval resume, whose
+  continuation is likewise only in the text sent to the model), so
+  the chat shows no extra bubble. The mid-stream partial text stays
+  as shown and is never replayed (Step B1's rule). Plan mode is the
+  one exception: `runPlan` ignores the history and only sends the
+  goal, so a plan Continue appends the original goal (the last user
+  message) to the continue text — a plan has no tool steps to
+  resume, so this is a re-ask of the same goal with the "continue"
+  instruction. Remote turns have no Continue button (no chat UI
+  there) — a remote client sends a new message.
+- **Not yet verified live** — no Gradle build here (no SDK); no
+  live long-context turn has been observed, so the compaction cap,
+  the harder-compaction retry and Continue are ported logic, not
+  proven by execution. First checks on a real device: a long chat
+  with a 64k model in the fallback chain should summarise at ~48k
+  tokens, not 96k; force a context-too-long error and watch the
+  "summarised … retrying" notice followed by a resumed step; stop
+  a turn mid-stream and tap Continue to see it pick up where it
+  stopped. First-build risks: the `while`-loop attempt retry in
+  `AgentRunner.runBuild` (the `for` → `while` conversion — the
+  index must only advance when moving to the next candidate), the
+  `verticalScroll` + `OutlinedTextField` use in the permissions
+  dialog, and the `UUID` import in `ChatScreen`.
+- **Verification fix found by the balance check (real,
+  compile-blocking)** — Kotlin block comments nest, so a `/*`
+  inside a KDoc comment opens a nested comment that its closing
+  `*/` never closes (same bug class as Phase 5, Step 2): the new
+  `docs/**` examples in the `Permissions.kt` and `ChatScreen.kt`
+  KDocs did exactly that and would have commented out the rest of
+  each file. All three spots are reworded to `docs/` + `**`
+  (wording only, no code changed). The `docs/**` strings inside
+  string literals in the dialog body are fine and were left alone.
+
+## Phase 7, Step B3 — AgentMT workspace + background + backup + attachments + runs + crash reporter (adapted 2026-11-14)
+
+- **Workspace sandbox** — `agent/Workspace.kt`: AgentMT's
+  canonical-path sandbox, adapted — CodeSathi has no `java.io.File`
+  project root (the folder is a SAF tree URI, and `SafProject`
+  already refuses `..` segments), so the rule is expressed for
+  relative SAF paths and checked by the tools before they touch a
+  path: absolute paths, any `..` segment, and paths under an ignored
+  first folder (`.git`, `node_modules`, `build`, `.gradle`, `.idea`,
+  `.venv`, `__pycache__`, `dist`, `.next`, `target` — AgentMT's set)
+  are refused with a plain "Path is outside the project" message.
+  Wired into Read / Write / Edit / Glob (Grep is top-level only and
+  takes no path); what the tools do is unchanged, only the check is
+  added. Glob also gains an optional `pattern` argument, matched
+  with Step B2's `globToRegex` — still the project's only glob
+  dialect, no second one was created.
+- **Background processes** — `agent/BackgroundProcs.kt`: the agent's
+  `run` tool stays foreground-only; `background_process` starts a
+  long-running command (dev server, watcher) in the background
+  through the same `sh -c` shell and work-dir resolution, and lists
+  / reads output / stops it. Output goes to one log file per process
+  under `getFilesDir()/bg/` (AgentMT's pattern), read back from the
+  tail, so output survives the process exiting. At most **3**
+  processes run at once (AgentMT had no cap — 3 is CodeSathi's
+  choice, so a phone cannot accumulate forgotten servers); a fourth
+  start is refused with a plain message. Start is refused in Plan
+  mode (a server is a side effect) and on an unresolvable folder,
+  exactly like `run`. The tool is kind EXECUTE under the same
+  allow / ask / deny rules as `run` (default "ask"); its target for
+  a glob rule is its command (start) or its action. The chat Stop
+  button kills all background processes too, and they never outlive
+  the app process. Surface: the agent tool calls, plus a
+  "Background processes" card on the Terminal screen (snapshot with
+  Refresh, Stop per running process).
+- **Encrypted backup option** — the plain sessions-only backup
+  (Phase 5, Step 3) is unchanged and stays the default. Opt-in, from
+  Chats → "⋮" → "Backup with encrypted keys": the export is a ZIP
+  with two entries — `codesathi-backup.json` (byte-for-byte the same
+  sessions JSON the plain export writes) and `secrets.enc` (the
+  device's secrets, encrypted with `BackupCrypto`: PBKDF2-HMAC-SHA256,
+  210,000 iterations → AES-256-GCM, 16-byte salt, 12-byte IV, magic
+  "CSS1" as additional authenticated data — AgentMT's exact
+  parameters, CodeSathi's magic). The secrets JSON carries every
+  provider's key list, the AWS credential, the Remote password, the
+  Git credential and the MCP tokens that exist (`KeyStore`
+  export/import, same internal key names). The passphrase needs at
+  least 8 characters and is **never stored** — typed at export and
+  again at import, held only in memory for that operation. Import is
+  two-phase, like AgentMT's preview: picking an encrypted backup
+  shows the counts first (sessions, messages, whether it carries
+  secrets — the count of secrets cannot be shown until the
+  passphrase is entered), and nothing is applied until Import is
+  tapped. With secrets, they are decrypted FIRST, so a wrong
+  passphrase stops the whole import with nothing changed; restoring
+  secrets never overwrites a credential already on the device
+  (per-provider / per-credential, absent-only). The plain JSON
+  restore path is untouched. Restore accepts both file types
+  (the picker offers JSON and ZIP).
+- **Attachments — PDF + text** — `agent/Attachments.kt`: images stay
+  in `ImageStore`; files go through `AttachmentStore` (same
+  app-private pattern, `getFilesDir()/attachments/`, Room stores
+  only records in the new `Message.attachmentsJson` column — Room
+  v5 → v6, see below). SAF pick, 25 MB cap (AgentMT's), at most 3
+  files per message (same cap as images). Text files are inlined
+  into the prompt (at most 120,000 chars, AgentMT's cap, in an
+  attached-file block). **What PDF support actually does: a PDF is
+  stored as-is and sent as raw PDF bytes, base64-encoded — a `file`
+  part for OpenAI-kind providers and a `document` block for
+  Anthropic-kind providers (AgentMT's two shapes, in
+  `LlmClient`). There is NO on-device PDF text extraction: no PDF
+  library is in the app, so the model reads the PDF itself. A PDF
+  for a local on-device model or Bedrock is refused before sending
+  with a plain message (neither takes a PDF part here) — never
+  silently dropped. A binary file that is neither text nor PDF is
+  stored and shown, but the model only gets a note naming it. An
+  image picked with the file button is skipped with a note pointing
+  at the image button (images must go through `ImageStore` so they
+  are downscaled). Only the **2 most recent user messages resend
+  binaries** on each turn (AgentMT's rule — adopted here for images
+  too: before this step every history image was re-sent on every
+  turn). Older messages keep their text attachments inlined but
+  their images / PDFs become a short "[shared earlier]" note.
+  Chat shows staged files as chips above the input, a PDF warning
+  like the vision warning, and the files as chips on stored user
+  messages. Session delete deletes the attachment files too.
+  Known quirk, pre-existing for images and left as-is: in Build the
+  newest user message is sent twice (once as the last history
+  message, once as the new user message), so its binaries go out
+  twice in one turn — the raw + expanded text both reaching the
+  model is the established slash-command behaviour, and changing it
+  here would change every Build prompt. PDF bytes are not counted
+  in the chars÷4 usage estimate (only their surrounding text is).
+- **Runs history** — a new Room table `runs` (Room v5 → v6, real
+  `Migration(5, 6)` creating the table + its indexes and adding
+  `attachmentsJson` to messages; registered in `CodeSathiApp`).
+  A new table, not a derivation from the messages table: messages
+  hold no per-turn token counts (usage rows have no turn grouping),
+  no step count, no changed-file list and no route log, and a failed
+  turn leaves no message row at all — deriving would have meant
+  re-reading tool-message text with heuristics. One run per
+  `runAgentTurn` invocation (a post-approval resume is a second
+  run): title, status, steps (model turns), tool calls, changed
+  files, tokens in / out, route log, error, model. Status
+  "waiting" means the turn paused for a file approval (AgentMT's
+  meaning). A run left "running" / "waiting" by a killed process is
+  marked "cancelled" on the next start (AgentMT's orphan rule, run
+  from `AppViewModel` init); the chat Stop button marks the live run
+  cancelled too. Screen: Tools tab → Runs (list with All / Active /
+  Done / Failed filters, clear-finished with confirm — finished runs
+  only, chats and files are never touched), tap for the detail
+  (stats, changed files, route log, the messages written during the
+  run, "Open chat"). Deleting a session deletes its runs.
+- **Crash reporter** — `core/CrashReporter.kt` (AgentMT's, adapted):
+  uncaught exceptions go to a local file
+  (`getFilesDir()/last_crash.txt`), shown on next launch as a card
+  at the top of Home with a Copy button and a Dismiss button (which
+  deletes the file). NO upload and NO analytics anywhere — the file
+  never leaves the device unless the user copies it out. Installed
+  in `CodeSathiApp.onCreate` via the default uncaught-exception
+  handler, keeping the previous handler chained so the process still
+  dies normally. Secrets never appear in stack traces because they
+  are never put in exception messages.
+- **Not yet verified live** — no Gradle build here (no SDK); no
+  live background process, encrypted backup, PDF attach or crash has
+  been observed — all ported logic, not proven by execution. The
+  Room 5→6 migration is the first-build risk (first launch on an
+  existing v5 database is the real test); next are the
+  `GetMultipleContents` file picker with `*/*`, the ZIP
+  import-preview dialog flow, `Icons.Filled.AttachFile` /
+  `Lock` / `History`, and the `PasswordVisualTransformation`
+  fields. First checks on a real device: start a dev server with
+  `background_process`, read its output, stop it from the Terminal
+  screen, tap Stop in chat and confirm it dies; export an encrypted
+  backup, restore it on the same device with the right passphrase
+  (keys return) and with a wrong one (nothing changes); attach a PDF
+  to an OpenAI-kind model and to a local model (refused); kill the
+  app mid-turn and confirm the run shows "Stopped" on next launch.
+
+## Phase 7, Step B4 — AgentMT plugins / skills / Termux / browser / MCP stdio / tests (adapted 2026-11-14)
+
+The LAST Phase 7 step, so Phase 7 is now complete.
+
+- **Plugins** — `agent/Plugins.kt` (PluginManager + PluginRecord,
+  DataStore registry `plugins_json`, folders under
+  `getFilesDir()/plugins/`): install a plugin from a GitHub repo URL
+  or a zip file (Claude Code layout: `.claude-plugin/plugin.json`,
+  `skills/`, `commands/`, `.mcp.json`; marketplace.json is listed, never
+  installed whole — a marketplace URL is refused with its plugin names
+  so the user picks one plugin's repo). A plugin is installed
+  **disabled** and **never executes code** — hooks, scripts, sub-agents
+  and local-command MCP servers are recorded as unsupported and
+  ignored. It only contributes skills (read from its folder by
+  SkillStore, enable / disable only), slash commands (CustomCommand
+  records, name collisions skipped never overwritten, `$ARGUMENTS`
+  becomes `{input}` and positional `$1`…`$9` are dropped) and http MCP
+  servers (McpServer records, disabled, delete blocked — uninstall the
+  plugin). Enabling a plugin enables its commands and servers with it;
+  uninstall removes its folder, commands, servers and record. Surface:
+  the Plugins section on the Skills screen. Caps: GitHub tree 80 files
+  / 4 MB, zip 20 MB, writes guarded to the plugin folder.
+- **Skill install** — `agent/GitHubFetcher.kt` (RepoRef parser +
+  read-only GitHub contents API over HttpURLConnection, unauthenticated
+  60 requests/hour, no token) + `SkillStore.installFromGitHub`:
+  install skills from a GitHub URL, skills.sh link or owner/repo
+  shorthand. Each folder with a SKILL.md becomes one CodeSathi skill
+  file (front matter becomes the `# Name` / `Description:` lines);
+  supporting files beside SKILL.md are NOT installed, and an id that
+  already exists is skipped, never overwritten. Surface: "Install a
+  skill from GitHub" on the Skills screen. The built-in skills are
+  untouched, and `Skills.kt` was extended, not replaced — the skill
+  tool, the enable flags and the screen's edit / add / delete / reset
+  all work exactly as before.
+- **Termux bridge** — `agent/Termux.kt` (TermuxBridge, public
+  RUN_COMMAND intent only, no new dependency, no terminal-view AAR, no
+  JNI): the agent's `run` tool gains a Termux backend, off by default,
+  switched by "Agent run tool uses Termux" on the Terminal screen
+  (DataStore `termux_enabled`). Same tool, same allow / ask / deny
+  rule, same Plan-mode screen. Requirements, stated on the screen and
+  here: Termux installed, `allow-external-apps=true` in Termux, and the
+  `com.termux.permission.RUN_COMMAND` permission granted (declared in
+  the manifest with a `<queries>` entry so the app can see Termux).
+  Without Termux the tool refuses with a plain message instead of
+  silently running in-app. Termux only sees shared storage or its own
+  home, so the project folder must resolve to a path Termux can see.
+  A Termux command cannot be stopped from here (Stop does nothing to
+  it) and returns its whole output at once (60 s wait) instead of
+  streaming. The Terminal screen's own commands still run in the
+  in-app shell — only the agent's `run` tool switches.
+- **MCP stdio via Termux** — `agent/McpClient.kt` gains a
+  `termux:<command>` server URL: TermuxMcp starts the command inside
+  Termux behind supergateway (npx, fetched on first use) serving
+  streamable HTTP on 127.0.0.1:18100–18899, then the normal HTTP MCP
+  client talks to it — tools/list, tools/call, same allow / ask / deny
+  rules. Needs Termux + nodejs in Termux (`pkg install nodejs`); first
+  start can take up to 2 minutes and is reused while it answers. No
+  Linux transport: CodeSathi has no Linux env, so there is no
+  `linux:` prefix. The MCP screen accepts `termux:` URLs and notes
+  the requirement. HTTP MCP is unchanged.
+- **Agent-driven browser — NOT DONE.** AgentMT has a built-in WebView
+  browser the agent drives (`browser_read` / `browser` tools with
+  numbered elements), sharing one WebView with the user so it keeps
+  their cookies and logins. It does not fit CodeSathi cleanly: our
+  only WebView is the editor's preview, which deliberately loads saved
+  text with no filesystem access, no cookies and no navigation, and is
+  destroyed when the screen closes — while an agent browser needs a
+  long-lived shared WebView that stays alive off-screen, a browser
+  screen with address bar / navigation / downloads / file chooser,
+  a userscript store, and a new tool kind with its own approval
+  questions (the agent would act with the user's logged-in sessions).
+  That is a new feature surface, not a port, so it was left out rather
+  than forced in. WebFetch / WebSearch stay as-is.
+- **Tests** — two new plain-JUnit files, no new dependency (no
+  Robolectric): `agent/RoutingTest.kt` (classifier, Retry-After
+  parser, route bounds, mid-stream marker) and
+  `agent/PluginInstallTest.kt` (RepoRef parsing, plugin manifest /
+  marketplace parsing, command conversion, skill front matter,
+  Termux MCP port). The eight RouteRunnerTest cases that drive
+  `RouteRunner.run` were skipped — CodeSathi has no RouteRunner; its
+  retry loop lives in AgentRunner + FallbackEngine and needs Room /
+  DataStore / a live LLM client. AppLaunchTest was not ported at all:
+  it is a Robolectric launch test (compose rules, ActivityScenario,
+  Room migration from a v1 schema file) and adding Robolectric would
+  be a heavy new test dependency for a launch test of another app's
+  screens.
+
+**Not yet verified live** — no Gradle build here (no Android SDK on
+this machine). First checks on a real device: install a small plugin
+from GitHub and from a zip, enable it, confirm its skill appears and
+its command expands and its MCP server lists tools, then uninstall it
+and confirm all three are gone; install one skill from a skills.sh
+link; turn the Termux backend on with Termux installed and run `ls`
+through the agent, then with Termux missing and confirm the plain
+refusal; add a `termux:` MCP server and confirm its tools list;
+run `./gradlew test` for the two new test files.
+
 ## What is TODO / Phase 2 (explicitly NOT in v1)
 - Phase 2 is complete — Steps 1–8 are all done, see the sections
   above. Phase 3, Steps 1–5 (custom commands, reasoning-effort picker,
@@ -1342,33 +1995,46 @@ Compose BOM 2024.01.00, Room 2.6.1.
 ## Layout
 
 ```
-CodeSathi/  (73 files; 16,958 lines of Kotlin)
+CodeSathi/  (117 files; 23,214 lines of Kotlin)
 app/src/main/
   AndroidManifest.xml
   assets/providers.json          # 207-provider catalog (ours, Phase 2 Step 2 + live-check + Phase 4 fixes + Phase 6 Step 5 on-device provider)
   assets/skills/                 # Built-in skills (Step 4): code-review.md, write-tests.md, explain-code.md
   assets/templates/              # Project templates (Phase 6, Step 3): portfolio/index.html, python-script/main.py, notes/NOTES.md
   java/com/inyogeshwar/codesathi/
-    MainActivity.kt              # NavHost (173)
-    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel (38)
-    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel, UsageRecord (389)
+    MainActivity.kt              # NavHost (261)
+    CodeSathiApp.kt              # Room / DataStore / KeyStore singletons + shared AppViewModel, TermuxBridge init (Phase 7, Step B4) (53)
+    core/CrashReporter.kt        # Uncaught-exception handler: local last_crash.txt, no upload (Phase 7, Step B3) (64)
+    data/Database.kt             # Room: Session, Message, FavouriteModel, SessionSummary, CachedModel, UsageRecord, RunEntity (534)
+    data/BackupCrypto.kt         # PBKDF2-SHA256 210k + AES-256-GCM for encrypted backups (Phase 7, Step B3) (68)
+    data/EncryptedBackup.kt      # Encrypted backup ZIP: codesathi-backup.json + secrets.enc, import preview (Phase 7, Step B3) (133)
     data/SessionBackup.kt        # Versioned session backup format (v1): encode / parse / validate, sessions only, no secrets, no images; SyncMergeResult for multi-device sync (239)
     data/ModelPrices.kt          # Bundled price table for cost estimates, 18 entries, price date 2026-11-13 (144)
-    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name, local .task model file (552)
-    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, AWS Bedrock credentials, masked display (308)
+    data/PreferencesStore.kt     # DataStore: onboarded, default model, last session, tool rules, fallback chain, exhaustion, MCP servers, skill enabled flags, voice output, remote enabled, custom commands, reasoning effort per model, Azure resource name, local .task model file, routing mode + per-key health ledger, approval mode + glob permission rules, plugins registry, Termux backend flag (890)
+    data/ModelContext.kt         # Known context windows for the compaction cap (Phase 7, Step B2): longest-prefix match, unknown models fall back to 128k (95)
+    data/KeyStore.kt             # EncryptedSharedPreferences, several keys per provider, MCP tokens, remote password, Git credential, AWS Bedrock credentials, masked display, secrets export/import for encrypted backups (442)
     data/Providers.kt            # Bundled catalog + GET {baseUrl}/models fetch + Room cache, Azure deployments list, Bedrock note, local kind guard (240)
     data/VisionSupport.kt        # Which (provider, model) pairs can see images — verified list only, everything else refuses; local models are text-only (90)
     data/TokenCounter.kt         # chars ÷ 4 estimate (20)
-    agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries, `run` shell tool + Plan-mode write screen (369)
-    agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder (129)
-    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming), real usage parsing, per-provider vision shapes, on-device .task branch (748)
+    agent/Tools.kt               # Read/Write/Edit/Glob/Grep over SAF tree, readBytes + listEntries, `run` shell tool + Plan-mode write screen, workspace sandbox, background_process tool + Termux backend (Phase 7, Step B4) (465)
+    agent/Workspace.kt           # Project sandbox for agent file tools: refuse escapes + ignored dirs (Phase 7, Step B3) (63)
+    agent/BackgroundProcs.kt     # Background processes (max 3): start / list / tail / stop, log files under getFilesDir()/bg (Phase 7, Step B3) (216)
+    agent/Attachments.kt         # PDF + text attachments: AttachmentStore, 25 MB cap, 120k-char text inline, raw-PDF base64 sending (Phase 7, Step B3) (246)
+    agent/Compaction.kt          # 60% prune / 75% summarise, send-list builder, pair-boundary tail cut, effective context window = smallest known window among session model + fallback chain (193)
+    agent/Permissions.kt         # Approval modes (AskAll/AskWrites/AutoAll/AutoEdits), glob rules + globToRegex, PermissionEngine decide: explicit per-tool rule > glob rule > mode (226)
+    agent/LlmClient.kt           # HttpURLConnection + SSE, OpenAI + Anthropic, tool_calls events, LlmException, reasoning_effort (OpenAI-kind only), Azure deployments URL + api-key header, Bedrock SigV4 Converse (non-streaming), real usage parsing, per-provider vision shapes, on-device .task branch, Retry-After / X-RateLimit-Reset headers, PDF parts for OpenAI/Anthropic kinds (803)
+    agent/Routing.kt             # FailureClassifier (429 vs daily quota vs 402 vs auth vs context vs 5xx vs capability vs network), per-kind cooldowns, Retry-After parsing, MidStreamException, RouteBounds 4 attempts / 180 s deadline (208)
+    agent/ModelRouter.kt         # Routing profiles (pinned vs fallback), per-key health ledger, key rotation, resetCredential / resetAllLimits (134)
     agent/LocalLlm.kt            # On-device local models (Phase 6, Step 5): MediaPipe LLM Inference (tasks-genai 0.10.27), .task file copy + cached engine, streaming via generateResponseAsync, 4,096-token context, plain-text prompt (384)
     agent/BedrockSigner.kt       # Hand-rolled AWS SigV4 signing for Bedrock Converse, model-id percent-encoding (130)
-    agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, midnight reset, Bedrock single keyless attempt (157)
+    agent/Fallback.kt            # Multi-key + single-provider fallback engine, limit kinds, per-kind cooldowns, Bedrock single keyless attempt (274)
     agent/ImageAttachments.kt    # Image store: downscale to 1568 px + JPEG q80, app-private files, file-name JSON for Room (216)
-    agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call (230)
+    agent/McpClient.kt           # MCP JSON-RPC over streamable HTTP / SSE, initialize / tools/list / tools/call, termux: stdio servers via supergateway (Phase 7, Step B4) (329)
+    agent/GitHubFetcher.kt       # Read-only GitHub contents API (RepoRef parse, list/download/tree/findSkills), HttpURLConnection (Phase 7, Step B4) (166)
+    agent/Plugins.kt             # Plugin install from GitHub/zip (Claude Code layout), disabled by default, never executes code (Phase 7, Step B4) (291)
+    agent/Termux.kt              # TermuxBridge: run commands in the user's Termux via the public RUN_COMMAND intent (Phase 7, Step B4) (135)
     agent/McpTools.kt            # MCP tools as normal Tool objects, mcp:<server>:<tool> names (50)
-    agent/Skills.kt              # Skill Markdown parse/store, SkillStore, skill tool (264)
+    agent/Skills.kt              # Skill Markdown parse/store, SkillStore, skill tool, plugin skills + GitHub skill install (Phase 7, Step B4) (445)
     agent/Templates.kt           # Project templates (Phase 6, Step 3): registry + asset loader, BUILT_IN_TEMPLATES (107)
     agent/Voice.kt               # TextToSpeech speaker, SpeechRecognizer input, Markdown stripper (282)
     agent/Terminal.kt            # SAF→path resolution, ProcessBuilder shell runner, streaming, shared 2,000-line cap, cancellation-aware wait (232)
@@ -1376,28 +2042,29 @@ app/src/main/
     remote/RemoteServer.kt       # Hand-rolled HTTP/1.1 server, remote API + web page, port 8080, sync export/import endpoints (548)
     remote/RemoteService.kt      # Foreground service for remote mode, notification + Stop (200)
     remote/SyncClient.kt         # Multi-device sync client (Phase 6, Step 4): HttpURLConnection pull/push, host + port parsing, plain errors (215)
-    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing, per-turn usage events, `run` tool + max-3 auto-fix bound, vision-attempt filter (881)
-    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials, usage recording, session backup/restore, `run` tool wiring + Stop kills shell, staged images, project-template picker + proposal queue, multi-device sync merge + syncWithDevice, local .task model file + 4,096-token local context (2510)
-    ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history (204)
+    agent/AgentRunner.kt         # Plan/Build tool-calling loop, diff approval, verification, fallback retries with per-kind cooldowns + bounded attempts (4) + 180 s pre-first-token deadline + mid-stream stop, per-attempt reasoning effort + Azure resource + AWS credentials, structured Bedrock tool pairing, per-turn usage events, `run` tool + max-3 auto-fix bound, vision-attempt filter, target-aware tool decisions, one harder-compaction retry on context-too-long, CONTINUE_TEXT resume, PDF + text attachments with the 2-most-recent-binaries rule (1172)
+    ui/AppViewModel.kt           # Sessions, chat, plan/proposal, fetch, compaction, tool rules, fallback, MCP, skills, voice, remote turns, custom commands, reasoning effort, editor-save proposals, subfolder sessions, Azure resource name, AWS credentials, usage recording, session backup/restore, `run` tool wiring + Stop kills shell, staged images, project-template picker + proposal queue, multi-device sync merge + syncWithDevice, local .task model file + 4,096-token local context, routing mode + key health + reset limit flags, approval mode + glob rules, harder compaction + Continue, runs history, encrypted backup, PDF + text attachments, crash report state, plugins + skill install + Termux flag (Phase 7, Step B4) (3414)
+    ui/TerminalViewModel.kt      # Terminal state: folder, streaming output, history, background processes, Termux status + flag (Phase 7, Step B4) (249)
     ui/GitViewModel.kt           # Git state: folder, status, one op at a time (306)
     ui/EditorViewModel.kt        # Editor state: tabs, in-memory edits, binary checks, save proposals, folder tree (576)
     ui/Markdown.kt               # Self-contained Markdown renderer for chat (282)
     ui/SyntaxHighlight.kt        # Hand-rolled syntax highlighter for diffs + code blocks (368)
-    ui/Nav.kt                    # Routes (21)
+    ui/Nav.kt                    # Routes (93)
     ui/theme/Theme.kt            # (37)
     ui/screens/OnboardingScreen.kt   # (93)
-    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu, backup/restore pickers, template picker, sync menu entry (609)
-    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog (incl. `run`), fallback notice, mic + voice output, command suggestions, effort label (hidden for local models), image attach + thumbnails + vision warning (678)
+    ui/screens/HomeScreen.kt         # Home + New Session, top-bar overflow menu, backup/restore pickers, template picker, sync menu entry, crash-report card (443)
+    ui/screens/ChatScreen.kt         # Plan/Build, plan card, diff card, tool rules dialog (incl. `run`, approval mode + glob rules), fallback notice, Continue button after an interrupted turn, mic + voice output, command suggestions, effort label (hidden for local models), image attach + thumbnails + vision warning, PDF + text attachments (1126)
     ui/screens/DiffCard.kt           # Shared Approve/Reject diff card (Chat + Editor + templates), syntax-highlighted (76)
     ui/screens/FolderTree.kt         # Folder tree browser for the Editor (243)
-    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, reasoning-effort chips, Azure resource name, AWS Bedrock credentials, on-device .task file picker (689)
-    ui/screens/McpScreen.kt          # MCP servers: add / enable / delete, tools, per-tool rules (273)
-    ui/screens/SkillsScreen.kt       # Skills: list / enable / edit / add / delete / reset (283)
+    ui/screens/ProviderPickerScreen.kt  # Top picks / favourites / fetched / bundled, manual model id, multi-key, fallback order, routing-mode chips + reset limit flags + per-key health, reasoning-effort chips, Azure resource name, AWS Bedrock credentials, on-device .task file picker (771)
+    ui/screens/McpScreen.kt          # MCP servers: add / enable / delete, tools, per-tool rules, termux: URLs, plugin servers (Phase 7, Step B4) (288)
+    ui/screens/SkillsScreen.kt       # Skills: list / enable / edit / add / delete / reset, GitHub skill install + Plugins section (Phase 7, Step B4) (455)
     ui/screens/CommandsScreen.kt     # Custom commands: add / enable / edit / delete (279)
-    ui/screens/TerminalScreen.kt     # Terminal: folder card, streaming output, history chips (272)
+    ui/screens/TerminalScreen.kt     # Terminal: folder card, streaming output, history chips, background-processes card, Termux card (Phase 7, Step B4) (404)
     ui/screens/RemoteScreen.kt       # Remote mode: toggle, password, Wi-Fi URL, session count (238)
     ui/screens/SyncScreen.kt         # Multi-device sync (Phase 6, Step 4): other device IP + port + Remote password, push/pull checkboxes, plain result (183)
     ui/screens/GitScreen.kt          # Git: status, stage/commit/push/pull, branches, clone, credential (465)
     ui/screens/EditorScreen.kt       # Editor: folder tree, tabs, diff card, .html WebView preview (353)
+    ui/screens/RunsScreen.kt         # Runs history: list with filters + clear-finished, detail with stats / changed files / route log / timeline (Phase 7, Step B3) (377)
     ui/screens/UsageScreen.kt        # Usage & cost dashboard: totals, per-model and per-session breakdowns (296)
 ```

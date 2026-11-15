@@ -20,6 +20,10 @@ import kotlinx.coroutines.withContext
  * themselves refuse as well. Nothing is written before the user approves.
  * The `run` tool refuses write-like commands in Plan mode too (see
  * [planModeRunRefusal]) — a heuristic screen, not a sandbox; see its KDoc.
+ * On top of that, every file path the read / write / edit / glob tools
+ * touch is checked against the project sandbox ([ProjectWorkspace],
+ * Phase 7 Step B3): absolute paths, `..` escapes and ignored folders
+ * (`.git`, `node_modules`, `build`, …) are refused with a plain message.
  */
 data class ToolContext(
     val readOnly: Boolean,
@@ -135,6 +139,7 @@ class ReadTool(private val project: SafProject) : Tool {
     override val description = "Read a file in the project folder."
     override suspend fun run(args: Map<String, String>, ctx: ToolContext): ToolResult {
         val path = args["path"] ?: return ToolResult.Failed("read needs a path")
+        ProjectWorkspace.validateProjectPath(path)?.let { return ToolResult.Failed(it) }
         val text = project.readText(path) ?: return ToolResult.Failed("File not found: $path")
         return ToolResult.Ok(text)
     }
@@ -142,9 +147,24 @@ class ReadTool(private val project: SafProject) : Tool {
 
 class GlobTool(private val project: SafProject) : Tool {
     override val name = "glob"
-    override val description = "List files in the project folder."
+    override val description =
+        "List files in the project folder. Args: {\"dir\": \"\"} lists the top level; " +
+            "an optional \"pattern\" glob (e.g. \"*.kt\", \"**/*.md\") filters the names."
     override suspend fun run(args: Map<String, String>, ctx: ToolContext): ToolResult {
-        return ToolResult.Ok(project.listFiles(args["dir"].orEmpty()).joinToString("\n"))
+        val dir = args["dir"].orEmpty()
+        ProjectWorkspace.validateProjectPath(dir)?.let { return ToolResult.Failed(it) }
+        val names = project.listFiles(dir)
+        val pattern = args["pattern"].orEmpty()
+        if (pattern.isBlank()) return ToolResult.Ok(names.joinToString("\n"))
+        // The project's one glob dialect (Permissions.kt): a pattern
+        // matches the file name, or the dir + name when it holds a "/".
+        val regex = runCatching { globToRegex(pattern) }.getOrNull()
+            ?: return ToolResult.Failed("Invalid glob pattern: $pattern")
+        val kept = names.filter { name ->
+            val candidate = if (dir.isBlank()) name else "${dir.trimEnd('/')}/$name"
+            regex.matches(name) || regex.matches(candidate)
+        }
+        return ToolResult.Ok(kept.joinToString("\n"))
     }
 }
 
@@ -167,6 +187,7 @@ class WriteTool(private val project: SafProject) : Tool {
     override suspend fun run(args: Map<String, String>, ctx: ToolContext): ToolResult {
         if (ctx.readOnly) return ToolResult.Failed("Plan mode is read-only — writes are disabled.")
         val path = args["path"] ?: return ToolResult.Failed("write needs a path")
+        ProjectWorkspace.validateProjectPath(path)?.let { return ToolResult.Failed(it) }
         val content = args["content"] ?: return ToolResult.Failed("write needs content")
         return if (project.writeText(path, content)) ToolResult.Ok("Wrote $path (${content.length} chars).")
         else ToolResult.Failed("Could not write $path.")
@@ -179,6 +200,7 @@ class EditTool(private val project: SafProject) : Tool {
     override suspend fun run(args: Map<String, String>, ctx: ToolContext): ToolResult {
         if (ctx.readOnly) return ToolResult.Failed("Plan mode is read-only — edits are disabled.")
         val path = args["path"] ?: return ToolResult.Failed("edit needs a path")
+        ProjectWorkspace.validateProjectPath(path)?.let { return ToolResult.Failed(it) }
         val old = args["old"] ?: return ToolResult.Failed("edit needs the old snippet")
         val new = args["new"] ?: return ToolResult.Failed("edit needs the new snippet")
         val text = project.readText(path) ?: return ToolResult.Failed("File not found: $path")
@@ -287,13 +309,25 @@ private fun planModeRunRefusal(command: String): String? {
  * to the app-private files dir — the model must never believe it ran a
  * command in the project folder when it actually ran somewhere else.
  *
+ * Termux backend (Phase 7, Step B4): when [useTermux] is on, the
+ * command runs in the user's own Termux app through [TermuxBridge]
+ * (public RUN_COMMAND intent) instead of the in-app shell — same
+ * tool, same allow / ask / deny rule, same Plan-mode screen. Termux
+ * must be installed and allowed (see TermuxBridge); without it the
+ * tool refuses with a plain message instead of silently running
+ * in-app. Termux only sees shared storage, so the resolved project
+ * folder must be one Termux can see. A Termux command cannot be
+ * stopped from here (Stop does nothing to it) and returns its whole
+ * output at once instead of streaming lines — both are stated in the
+ * result when they matter.
+ *
  * Honest limit: a SAF folder-picker grant gives the child shell NO
  * raw-filesystem access, so file-touching commands in the project
  * folder may print "Permission denied". That stderr is returned plainly
  * in the result (never hidden), with a note explaining why and what
  * fixes it — exactly like the terminal screen shows it.
  */
-class RunTool(private val context: Context) : Tool {
+class RunTool(private val context: Context, private val useTermux: () -> Boolean = { false }) : Tool {
     override val name = "run"
     override val description =
         "Run a shell command in the project folder (sh -c) and return its exit code and output. " +
@@ -302,7 +336,9 @@ class RunTool(private val context: Context) : Tool {
     /** The shared executor — the same TerminalRunner the terminal screen uses. */
     private val runner = TerminalRunner()
 
-    /** Kill the running command, if any — the chat Stop button calls this. */
+    /** Kill the running command, if any — the chat Stop button calls this.
+     *  Only stops an in-app shell command; a command already running in
+     *  Termux keeps running there (Termux gives no way to kill it). */
     fun stop() {
         runner.stop()
     }
@@ -322,6 +358,7 @@ class RunTool(private val context: Context) : Tool {
         if (folder is TerminalFolder.Unresolved) {
             return ToolResult.Failed("Cannot run here: ${folder.reason}")
         }
+        if (useTermux()) return runInTermux(command, folder.workDir)
         val lines = ArrayList<String>()
         var seenLines = 0
         val exitCode = try {
@@ -358,12 +395,71 @@ class RunTool(private val context: Context) : Tool {
         }
         return ToolResult.Ok(text, exitCode)
     }
+
+    /**
+     * Run one command in Termux (see the class KDoc). The whole result
+     * comes back at once — no streaming — and the 60 s wait is
+     * TermuxBridge's: a longer command answers "did not answer" while
+     * it keeps running inside Termux.
+     */
+    private suspend fun runInTermux(command: String, workDir: java.io.File): ToolResult {
+        if (!TermuxBridge.ready(context)) {
+            val reason = if (!TermuxBridge.installed(context)) {
+                "Termux is not installed — install Termux first, or turn off " +
+                    "\"Agent run tool uses Termux\" on the Terminal screen."
+            } else {
+                "CodeSathi is not allowed to run commands in Termux yet — " +
+                    "set allow-external-apps=true in Termux and grant the permission " +
+                    "when Termux asks (see the Terminal screen)."
+            }
+            return ToolResult.Failed("Cannot run in Termux: $reason")
+        }
+        if (!TermuxBridge.canSee(workDir.absolutePath)) {
+            return ToolResult.Failed(
+                "Cannot run in Termux here: Termux can only see shared storage " +
+                    "or its own home, not ${workDir.absolutePath}. Turn off " +
+                    "\"Agent run tool uses Termux\" on the Terminal screen to run in-app instead."
+            )
+        }
+        val result = try {
+            TermuxBridge.run(command, workDir.absolutePath)
+        } catch (e: Exception) {
+            return ToolResult.Failed("Could not run in Termux: ${e.message}")
+        } ?: return ToolResult.Failed(
+            "Termux did not answer within 60 seconds — the command may still " +
+                "be running inside Termux. Check it there, or turn the Termux " +
+                "backend off on the Terminal screen."
+        )
+        val text = buildString {
+            append("exit code: ${result.exitCode}\n")
+            if (result.stdout.isNotBlank()) append(result.stdout.trimEnd()).append('\n')
+            if (result.stderr.isNotBlank()) append(result.stderr.trimEnd()).append('\n')
+            if (result.errmsg.isNotBlank() && result.err != -1) {
+                append("[termux error ${result.err}] ").append(result.errmsg.trim()).append('\n')
+            }
+            if (result.stdout.isBlank() && result.stderr.isBlank()) append("(no output)")
+            append("\n(Ran in Termux — Stop cannot stop it once started.)")
+        }
+        return ToolResult.Ok(text.trimEnd(), result.exitCode)
+    }
 }
 
 /** All v1 tools, wired to one project folder. The `run` tool reuses the
- *  terminal screen's [TerminalRunner] — there is no second shell executor. */
-fun v1Tools(project: SafProject, context: Context): List<Tool> =
+ *  terminal screen's [TerminalRunner] — there is no second shell executor.
+ *  The `background_process` tool (Phase 7, Step B3) starts long-running
+ *  commands in the background through the same shell; the `run` tool
+ *  itself stays foreground-only. When [useTermux] is on, `run` executes
+ *  in the user's Termux instead (Phase 7, Step B4) — same tool, same
+ *  rule. Every file path the read / write / edit / glob tools touch is
+ *  checked against the project sandbox ([ProjectWorkspace]) before
+ *  anything is read or written. */
+fun v1Tools(
+    project: SafProject,
+    context: Context,
+    useTermux: () -> Boolean = { false }
+): List<Tool> =
     listOf(
         ReadTool(project), GlobTool(project), GrepTool(project),
-        WriteTool(project), EditTool(project), RunTool(context)
+        WriteTool(project), EditTool(project), RunTool(context, useTermux),
+        BackgroundProcessTool(context)
     )

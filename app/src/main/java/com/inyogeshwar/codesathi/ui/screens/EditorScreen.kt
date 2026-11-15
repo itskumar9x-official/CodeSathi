@@ -25,9 +25,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -99,9 +99,9 @@ fun EditorScreen(
     // the editor view — the preview only exists for .html files.
     LaunchedEffect(activePath) { showPreview = false }
 
-    Scaffold(
+    SathiScaffold(
         topBar = {
-            TopAppBar(
+            SathiTopBar(
                 title = { Text("Editor" + (session?.let { " — ${it.title}" } ?: "")) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {

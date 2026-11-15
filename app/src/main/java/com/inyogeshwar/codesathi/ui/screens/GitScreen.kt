@@ -22,9 +22,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -103,9 +103,9 @@ fun GitScreen(viewModel: GitViewModel, onBack: () -> Unit) {
     val untracked = status?.untracked.orEmpty()
     val conflicting = status?.conflicting.orEmpty()
 
-    Scaffold(
+    SathiScaffold(
         topBar = {
-            TopAppBar(
+            SathiTopBar(
                 title = { Text("Git") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {

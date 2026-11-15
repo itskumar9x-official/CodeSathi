@@ -8,11 +8,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.inyogeshwar.codesathi.CodeSathiApp
+import com.inyogeshwar.codesathi.agent.BackgroundProcs
+import com.inyogeshwar.codesathi.agent.BgProcessInfo
 import com.inyogeshwar.codesathi.agent.TERMINAL_MAX_LINES
 import com.inyogeshwar.codesathi.agent.TerminalFolder
 import com.inyogeshwar.codesathi.agent.TerminalLine
 import com.inyogeshwar.codesathi.agent.TerminalLineKind
 import com.inyogeshwar.codesathi.agent.TerminalRunner
+import com.inyogeshwar.codesathi.agent.TermuxBridge
 import com.inyogeshwar.codesathi.agent.resolveTerminalFolder
 import com.inyogeshwar.codesathi.data.Session
 import kotlinx.coroutines.Dispatchers
@@ -59,6 +62,25 @@ class TerminalViewModel(private val app: CodeSathiApp) : ViewModel() {
     private val db = app.database
     private val prefs = app.preferencesStore
     private val runner = TerminalRunner()
+
+    // ---- Termux backend for the agent's run tool (Phase 7, Step B4) ----
+    // This screen's own commands always run in the in-app shell — the
+    // toggle only changes where the AGENT's `run` tool executes. The
+    // status below is read live so the user can see what is missing.
+    /** True when the agent's `run` tool runs in Termux. Off by default. */
+    val termuxEnabled: StateFlow<Boolean> = prefs.termuxEnabled.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5_000), false
+    )
+
+    fun setTermuxEnabled(enabled: Boolean) {
+        viewModelScope.launch { prefs.setTermuxEnabled(enabled) }
+    }
+
+    /** True when the Termux app is installed on this phone. */
+    val termuxInstalled: Boolean get() = TermuxBridge.installed(app)
+
+    /** True when Termux has granted this app its RUN_COMMAND permission. */
+    val termuxPermitted: Boolean get() = TermuxBridge.permitted(app)
     private var runJob: Job? = null
     /** Set on Stop, read when the killed process exits. Main thread only. */
     private var stoppedByUser = false
@@ -96,6 +118,7 @@ class TerminalViewModel(private val app: CodeSathiApp) : ViewModel() {
     val history: StateFlow<List<String>> = _history
 
     init {
+        refreshBackgroundProcesses()
         viewModelScope.launch {
             session.collect { s ->
                 _sessionReady.value = true
@@ -170,6 +193,28 @@ class TerminalViewModel(private val app: CodeSathiApp) : ViewModel() {
         if (!isRunning) return
         stoppedByUser = true
         runner.stop()
+    }
+
+    // ---- Background processes (Phase 7, Step B3) ----
+
+    /**
+     * Processes the agent started with the `background_process` tool
+     * (dev servers, watchers). The terminal screen is where they are
+     * listed and stopped — the list is a snapshot, refreshed on open
+     * and on tap, not a live stream (a server's output lives in its
+     * log file, read through the agent tool or here via Stop only).
+     * Stopping one here kills it, exactly like the agent tool's stop.
+     */
+    var backgroundProcesses by mutableStateOf<List<BgProcessInfo>>(emptyList())
+        private set
+
+    fun refreshBackgroundProcesses() {
+        backgroundProcesses = BackgroundProcs.snapshot()
+    }
+
+    fun stopBackgroundProcess(id: Int) {
+        BackgroundProcs.stop(id)
+        refreshBackgroundProcesses()
     }
 
     /** Clear the output history (the folder card still shows where

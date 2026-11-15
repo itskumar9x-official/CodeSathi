@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="512" height="512">
+  <!-- CodeSathi "Sathi Spark" mark (original, 2026). Two code brackets as a
+       friendly pair, sharing a spark between them. 108-unit adaptive-icon grid. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B5F5A"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect width="108" height="108" rx="26" fill="url(#bg)"/>
+  <path d="M41 37 L27 54 L41 71" fill="none" stroke="#FFFFFF" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M67 37 L81 54 L67 71" fill="none" stroke="#C9F7EC" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M54 42.5 C55.4 49.5 58.5 52.6 65.5 54 C58.5 55.4 55.4 58.5 54 65.5 C52.6 58.5 49.5 55.4 42.5 54 C49.5 52.6 52.6 49.5 54 42.5 Z" fill="#FFB547"/>
+</svg>

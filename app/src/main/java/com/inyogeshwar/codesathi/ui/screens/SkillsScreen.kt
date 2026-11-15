@@ -1,5 +1,7 @@
 package com.inyogeshwar.codesathi.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,10 +25,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -36,6 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.inyogeshwar.codesathi.agent.PluginRecord
 import com.inyogeshwar.codesathi.agent.Skill
 import com.inyogeshwar.codesathi.agent.buildSkillMarkdown
 import com.inyogeshwar.codesathi.ui.AppViewModel
@@ -61,19 +64,35 @@ import com.inyogeshwar.codesathi.ui.AppViewModel
  * Build system prompt; a disabled skill is never offered to the model.
  * A skill never writes files by itself — anything it asks for still
  * goes through write / edit and needs the user's Approve.
+ *
+ * Plugins (Phase 7, Step B4) live on this screen too: a plugin is a
+ * Claude Code layout folder installed from a GitHub repo or a zip
+ * file. It is installed DISABLED and never executes code — it only
+ * contributes skills (read from its folder, enable / disable only),
+ * slash commands (shown on the Commands screen) and http MCP servers
+ * (shown on the MCP screen). Skills can also be installed one at a
+ * time from a GitHub URL or skills.sh link, below.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SkillsScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     val skills = viewModel.skills
+    val plugins by viewModel.plugins.collectAsState()
     val enabledMap by viewModel.skillEnabled.collectAsState()
     var editingSkill by remember { mutableStateOf<Skill?>(null) }
     var newName by remember { mutableStateOf("") }
     var newDescription by remember { mutableStateOf("") }
     var newInstructions by remember { mutableStateOf("") }
+    var skillUrl by remember { mutableStateOf("") }
+    var pluginUrl by remember { mutableStateOf("") }
+    val zipPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) viewModel.installPluginFromZip(uri)
+    }
 
-    Scaffold(topBar = {
-        TopAppBar(
+    SathiScaffold(topBar = {
+        SathiTopBar(
             title = { Text("Skills") },
             navigationIcon = {
                 IconButton(onClick = onBack) {
@@ -158,6 +177,97 @@ fun SkillsScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                     }
                 }
             }
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Install a skill from GitHub", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Paste a GitHub repo URL, a skills.sh link, or an owner/repo " +
+                                "shorthand. Each skill folder found (a folder with a SKILL.md) " +
+                                "becomes one skill file here. Supporting files beside SKILL.md " +
+                                "are not installed — CodeSathi skills are single Markdown files.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = skillUrl,
+                            onValueChange = { skillUrl = it },
+                            label = { Text("GitHub URL or owner/repo") },
+                            placeholder = { Text("e.g. anthropics/skills") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                viewModel.installSkillFromUrl(skillUrl)
+                                skillUrl = ""
+                            },
+                            enabled = skillUrl.isNotBlank()
+                        ) { Text("Install skill") }
+                    }
+                }
+            }
+            item {
+                Text("Plugins", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "A plugin adds skills, slash commands and MCP servers — and " +
+                        "nothing else. It is installed disabled and never runs code: " +
+                        "no hooks, no scripts, no sub-agents, no local-command MCP " +
+                        "servers. Enable a plugin only after reading what it adds. " +
+                        "A plugin command's \$ARGUMENTS becomes {input}; positional " +
+                        "\$1…\$9 placeholders are dropped on install.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("Install a plugin", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = pluginUrl,
+                            onValueChange = { pluginUrl = it },
+                            label = { Text("GitHub repo URL or owner/repo") },
+                            placeholder = { Text("e.g. owner/my-plugin") },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    viewModel.installPluginFromGitHub(pluginUrl)
+                                    pluginUrl = ""
+                                },
+                                enabled = pluginUrl.isNotBlank()
+                            ) { Text("Install from GitHub") }
+                            OutlinedButton(onClick = { zipPicker.launch(arrayOf("application/zip")) }) {
+                                Text("Install from zip")
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "A marketplace URL installs nothing — it lists its plugins " +
+                                "instead, so you can pick one plugin's own repo.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+            if (plugins.isEmpty()) {
+                item {
+                    Text(
+                        "No plugins installed.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+            items(plugins, key = { it.id }) { plugin ->
+                PluginCard(
+                    plugin = plugin,
+                    onToggle = { on -> viewModel.setPluginEnabled(plugin, on) },
+                    onUninstall = { viewModel.uninstallPlugin(plugin) }
+                )
+            }
             if (skills.isEmpty()) {
                 item {
                     Text(
@@ -180,7 +290,11 @@ fun SkillsScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                 Text(
                     "Built-in skills can be disabled or reset to the version that " +
                         "shipped with the app, but not deleted. A skill is a Markdown " +
-                        "file in the app's private storage — no skill is ever downloaded.",
+                        "file in the app's private storage. Skills installed from " +
+                        "GitHub are plain files too, so they can be edited and deleted " +
+                        "like your own. Plugin skills live inside their plugin's folder " +
+                        "— enable or disable them here, edit or remove them by " +
+                        "uninstalling the plugin.",
                     style = MaterialTheme.typography.bodySmall
                 )
             }
@@ -211,7 +325,11 @@ private fun SkillCard(
                         Text(skill.description, style = MaterialTheme.typography.bodyMedium)
                     }
                     Text(
-                        if (skill.builtIn) "Built-in skill" else "Your skill",
+                        when {
+                            skill.pluginId != null -> "Plugin skill — from ${skill.pluginName ?: "a plugin"}"
+                            skill.builtIn -> "Built-in skill"
+                            else -> "Your skill"
+                        },
                         style = MaterialTheme.typography.bodySmall
                     )
                     if (!enabled) {
@@ -224,21 +342,75 @@ private fun SkillCard(
                 Switch(checked = enabled, onCheckedChange = onToggle)
             }
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = onEdit) {
-                    Icon(Icons.Filled.Edit, contentDescription = "Edit skill")
-                    Text("Edit")
+            // Plugin skills are read-only here: they live in the
+            // plugin's folder, so edit / delete / reset do not apply.
+            if (skill.pluginId == null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onEdit) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Edit skill")
+                        Text("Edit")
+                    }
+                    if (skill.builtIn) {
+                        OutlinedButton(onClick = onReset) {
+                            Icon(Icons.Filled.Refresh, contentDescription = "Reset to built-in")
+                            Text("Reset")
+                        }
+                    } else {
+                        OutlinedButton(onClick = onDelete) {
+                            Icon(Icons.Filled.Delete, contentDescription = "Delete skill")
+                            Text("Delete")
+                        }
+                    }
                 }
-                if (skill.builtIn) {
-                    OutlinedButton(onClick = onReset) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Reset to built-in")
-                        Text("Reset")
+            }
+        }
+    }
+}
+
+@Composable
+private fun PluginCard(
+    plugin: PluginRecord,
+    onToggle: (Boolean) -> Unit,
+    onUninstall: () -> Unit
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(plugin.name, style = MaterialTheme.typography.titleMedium)
+                    Text("v${plugin.version} · from ${plugin.source}", style = MaterialTheme.typography.bodySmall)
+                    if (plugin.description.isNotBlank()) {
+                        Text(plugin.description, style = MaterialTheme.typography.bodyMedium)
                     }
-                } else {
-                    OutlinedButton(onClick = onDelete) {
-                        Icon(Icons.Filled.Delete, contentDescription = "Delete skill")
-                        Text("Delete")
+                    Text(
+                        "Adds: ${plugin.skills.size} skill(s), ${plugin.commands.size} command(s), " +
+                            "${plugin.mcpServers.size} MCP server(s).",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (plugin.unsupported.isNotEmpty()) {
+                        Text(
+                            "Not included: ${plugin.unsupported.joinToString()}.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
+                    if (!plugin.enabled) {
+                        Text(
+                            "Disabled — its skills, commands and MCP servers are not offered to the agent.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+                Switch(checked = plugin.enabled, onCheckedChange = onToggle)
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onUninstall) {
+                    Icon(Icons.Filled.Delete, contentDescription = "Uninstall plugin")
+                    Text("Uninstall")
                 }
             }
         }

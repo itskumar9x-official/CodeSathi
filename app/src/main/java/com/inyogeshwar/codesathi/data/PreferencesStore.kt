@@ -1,5 +1,10 @@
 package com.inyogeshwar.codesathi.data
 
+import com.inyogeshwar.codesathi.agent.ApprovalMode
+import com.inyogeshwar.codesathi.agent.PermissionRule
+import com.inyogeshwar.codesathi.agent.PluginRecord
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
@@ -28,7 +33,10 @@ data class McpServer(
     val name: String,
     val url: String,
     val enabled: Boolean = true,
-    val hasToken: Boolean = false
+    val hasToken: Boolean = false,
+    /** Plugin this server came from, if any — only the plugin's
+     *  uninstall removes it; the MCP screen hides its Delete button. */
+    val pluginId: String? = null
 )
 
 /**
@@ -44,17 +52,57 @@ data class CustomCommand(
     val name: String,
     val prompt: String,
     val description: String = "",
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    /** Plugin this command came from, if any — only the plugin's
+     *  uninstall removes it; the Commands screen shows it like any
+     *  other command while the plugin is installed. */
+    val pluginId: String? = null
 )
 
 /**
  * Why a key stopped working, and when it may be tried again.
  * `kind` is "QUOTA" (HTTP 402, or a body mentioning quota) or "RATE"
- * (plain HTTP 429). `untilMillis` is the start of the next local day —
- * exhaustion flags reset at midnight.
+ * (plain HTTP 429). `untilMillis` is the end of that failure's
+ * cooldown (Phase 7, Step B1: rate 60 s, daily quota 1 h, out of
+ * credit 6 h, server 20 s, network 15 s) — NOT midnight any more.
+ * Entries whose [untilMillis] has passed are pruned on read.
  */
 @Serializable
 data class ExhaustionInfo(val kind: String, val untilMillis: Long)
+
+/**
+ * One credential's health (Phase 7, Step B1 — the per-key ledger from
+ * AgentMT's ModelRouter, stored here as DataStore JSON, not Room: the
+ * ledger is a small map keyed by the same "providerId|modelId|keyId"
+ * string the exhaustion flags already use, it is read and written
+ * together with those flags, and it needs no query, index or migration
+ * — a Room entity + v5 → v6 migration would add all three for data
+ * that is naturally a map. No secret is stored here: the key is the
+ * key id (a hash prefix), never the key value.
+ */
+@Serializable
+data class KeyHealth(
+    val failures: Int = 0,
+    val requests: Int = 0,
+    /** "unknown" | "ok" | "rate_limited" | "no_credit" | "invalid" | "error" */
+    val status: String = STATUS_UNKNOWN,
+    val lastError: String? = null,
+    /** Epoch millis when this key may be tried again; 0 = not cooling down. */
+    val cooldownUntil: Long = 0,
+    val lastUsedAt: Long = 0,
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    val lastLatencyMs: Long? = null
+) {
+    companion object {
+        const val STATUS_UNKNOWN = "unknown"
+        const val STATUS_OK = "ok"
+        const val STATUS_RATE_LIMITED = "rate_limited"
+        const val STATUS_NO_CREDIT = "no_credit"
+        const val STATUS_INVALID = "invalid"
+        const val STATUS_ERROR = "error"
+    }
+}
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "codesathi_prefs")
 
@@ -70,8 +118,12 @@ class PreferencesStore(private val context: Context) {
         private val DEFAULT_MODEL_ID = stringPreferencesKey("default_model_id")
         private val LAST_SESSION_ID = stringPreferencesKey("last_session_id")
         private val TOOL_RULES = stringPreferencesKey("tool_rules_json")
+        private val APPROVAL_MODE = stringPreferencesKey("approval_mode")
+        private val PERMISSION_RULES = stringPreferencesKey("permission_rules_json")
         private val FALLBACK_CHAIN = stringPreferencesKey("fallback_chain_json")
         private val EXHAUSTED = stringPreferencesKey("exhausted_json")
+        private val KEY_HEALTH = stringPreferencesKey("key_health_json")
+        private val ROUTING_MODE = stringPreferencesKey("routing_mode")
         private val MCP_SERVERS = stringPreferencesKey("mcp_servers_json")
         private val MCP_DEFAULTS_SEEDED = booleanPreferencesKey("mcp_defaults_seeded")
         private val COMMANDS = stringPreferencesKey("commands_json")
@@ -83,6 +135,8 @@ class PreferencesStore(private val context: Context) {
         private val SKILL_ENABLED = stringPreferencesKey("skill_enabled_json")
         private val VOICE_OUTPUT = booleanPreferencesKey("voice_output_enabled")
         private val REMOTE_ENABLED = booleanPreferencesKey("remote_enabled")
+        private val PLUGINS = stringPreferencesKey("plugins_json")
+        private val TERMUX_ENABLED = booleanPreferencesKey("termux_enabled")
 
         /** Pre-filled MCP entry for Exa web search. Disabled by default —
          *  the user enables it and adds their own key when they want it.
@@ -195,6 +249,111 @@ class PreferencesStore(private val context: Context) {
         context.dataStore.edit { it[TOOL_RULES] = Json.encodeToString<Map<String, String>>(current) }
     }
 
+    /**
+     * The stored per-tool rules only (no v1 defaults merged) — the
+     * permission precedence (Phase 7, Step B2) reads this map once per
+     * turn, so the decision function can be a plain (non-suspend)
+     * lambda. See [storedToolRule].
+     */
+    suspend fun storedToolRules(): Map<String, String> {
+        val raw = context.dataStore.data.first()[TOOL_RULES] ?: return emptyMap()
+        return try {
+            Json.decodeFromString<Map<String, String>>(raw)
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    /**
+     * The per-tool rule the user actually STORED for one tool, or null
+     * when they stored none. Unlike [toolRules] (which merges the v1
+     * defaults over the stored map), this reads the stored map only —
+     * the permission precedence (Phase 7, Step B2) must treat the
+     * defaults as "no explicit rule", so a glob rule or the approval
+     * mode can decide for a tool the user never touched. A stored
+     * "deny" is the one thing nothing can override.
+     */
+    suspend fun storedToolRule(toolName: String): String? = storedToolRules()[toolName]
+
+    // ---- Approval mode + glob permission rules (Phase 7, Step B2) ----
+
+    /**
+     * The approval mode (see [ApprovalMode]): "ask_all" (the default —
+     * behaves exactly like v1), "ask_writes", "auto_edits", "auto_all".
+     * Anything else stored reads back as "ask_all", so a corrupt entry
+     * can never silently auto-approve tools.
+     */
+    val approvalMode: Flow<String> = context.dataStore.data.map { prefs ->
+        when (prefs[APPROVAL_MODE]) {
+            "ask_writes" -> "ask_writes"
+            "auto_edits" -> "auto_edits"
+            "auto_all" -> "auto_all"
+            else -> "ask_all"
+        }
+    }
+
+    /** Set the approval mode; any value other than the three named modes means AskAll. */
+    suspend fun setApprovalMode(mode: String) {
+        val value = when (mode) {
+            "ask_writes", "auto_edits", "auto_all" -> mode
+            else -> "ask_all"
+        }
+        context.dataStore.edit { it[APPROVAL_MODE] = value }
+    }
+
+    /** Approval mode as the enum, for [com.inyogeshwar.codesathi.agent.PermissionEngine]. */
+    suspend fun approvalModeEnum(): ApprovalMode = when (approvalMode.first()) {
+        "ask_writes" -> ApprovalMode.ASK_WRITES
+        "auto_edits" -> ApprovalMode.AUTO_EDITS
+        "auto_all" -> ApprovalMode.AUTO_ALL
+        else -> ApprovalMode.ASK_ALL
+    }
+
+    /**
+     * Ordered glob permission rules (first match wins). Rules hold no
+     * secrets — tool names and path/command patterns only — so plain
+     * DataStore JSON is fine. A rule whose action is not allow / ask /
+     * deny, or whose tool is blank, is dropped on read; a blank pattern
+     * reads as "*" (every target).
+     */
+    val permissionRules: Flow<List<PermissionRule>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[PERMISSION_RULES] ?: return@map emptyList()
+        try {
+            Json.decodeFromString<List<PermissionRule>>(raw)
+                .filter { it.tool.isNotBlank() && it.action in setOf("allow", "ask", "deny") }
+                .map { if (it.pattern.isBlank()) it.copy(pattern = "*") else it }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    suspend fun addPermissionRule(rule: PermissionRule) {
+        val current = permissionRules.first()
+        if (current.any { it.id == rule.id }) return
+        val cleaned = rule.copy(
+            tool = rule.tool.trim(),
+            pattern = rule.pattern.trim().ifBlank { "*" }
+        )
+        if (cleaned.tool.isBlank() || cleaned.action !in setOf("allow", "ask", "deny")) return
+        context.dataStore.edit {
+            it[PERMISSION_RULES] = Json.encodeToString<List<PermissionRule>>(current + cleaned)
+        }
+    }
+
+    suspend fun removePermissionRule(ruleId: String) {
+        val current = permissionRules.first().filterNot { it.id == ruleId }
+        context.dataStore.edit { it[PERMISSION_RULES] = Json.encodeToString<List<PermissionRule>>(current) }
+    }
+
+    /** Move one rule from [fromIndex] to [toIndex]; out-of-range moves are ignored. */
+    suspend fun movePermissionRule(fromIndex: Int, toIndex: Int) {
+        val current = permissionRules.first().toMutableList()
+        if (fromIndex !in current.indices || toIndex !in current.indices) return
+        val item = current.removeAt(fromIndex)
+        current.add(toIndex, item)
+        context.dataStore.edit { it[PERMISSION_RULES] = Json.encodeToString<List<PermissionRule>>(current) }
+    }
+
     // ---- Skills enabled / disabled (Phase 2, Step 4) ----
 
     /**
@@ -286,6 +445,61 @@ class PreferencesStore(private val context: Context) {
         context.dataStore.edit { it[MCP_SERVERS] = Json.encodeToString<List<McpServer>>(current) }
     }
 
+    /** Remove every MCP server a plugin contributed (on uninstall). */
+    suspend fun removeMcpServersForPlugin(pluginId: String) {
+        val current = mcpServers.first().filterNot { it.pluginId == pluginId }
+        context.dataStore.edit { it[MCP_SERVERS] = Json.encodeToString<List<McpServer>>(current) }
+    }
+
+    /** Enable / disable every MCP server a plugin contributed, together. */
+    suspend fun setMcpServersEnabledForPlugin(pluginId: String, enabled: Boolean) {
+        val current = mcpServers.first().map {
+            if (it.pluginId == pluginId) it.copy(enabled = enabled) else it
+        }
+        context.dataStore.edit { it[MCP_SERVERS] = Json.encodeToString<List<McpServer>>(current) }
+    }
+
+    // ---- Plugins (Phase 7, Step B4) ----
+
+    /** Installed plugins, from DataStore JSON. A plugin record holds
+     *  no code and no secrets — only names and what it contributed. */
+    val plugins: Flow<List<PluginRecord>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[PLUGINS] ?: return@map emptyList()
+        try {
+            Json.decodeFromString<List<PluginRecord>>(raw)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Add (or replace) a plugin record; a record with the same id replaces the old one. */
+    suspend fun addPlugin(plugin: PluginRecord) {
+        val current = plugins.first().filterNot { it.id == plugin.id } + plugin
+        context.dataStore.edit { it[PLUGINS] = Json.encodeToString<List<PluginRecord>>(current) }
+    }
+
+    suspend fun removePlugin(pluginId: String) {
+        val current = plugins.first().filterNot { it.id == pluginId }
+        context.dataStore.edit { it[PLUGINS] = Json.encodeToString<List<PluginRecord>>(current) }
+    }
+
+    suspend fun setPluginEnabled(pluginId: String, enabled: Boolean) {
+        val current = plugins.first().map {
+            if (it.id == pluginId) it.copy(enabled = enabled) else it
+        }
+        context.dataStore.edit { it[PLUGINS] = Json.encodeToString<List<PluginRecord>>(current) }
+    }
+
+    // ---- Termux backend for the agent's run tool (Phase 7, Step B4) ----
+
+    /** True when the agent's `run` tool should execute in the user's
+     *  Termux instead of the in-app shell. Off by default. */
+    val termuxEnabled: Flow<Boolean> = context.dataStore.data.map { it[TERMUX_ENABLED] ?: false }
+
+    suspend fun setTermuxEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[TERMUX_ENABLED] = enabled }
+    }
+
     // ---- Custom commands (Phase 3, Step 1) ----
 
     val customCommands: Flow<List<CustomCommand>> = context.dataStore.data.map { prefs ->
@@ -368,6 +582,20 @@ class PreferencesStore(private val context: Context) {
     suspend fun setCustomCommandEnabled(commandId: String, enabled: Boolean) {
         val current = customCommands.first().map {
             if (it.id == commandId) it.copy(enabled = enabled) else it
+        }
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
+    }
+
+    /** Remove every slash command a plugin contributed (on uninstall). */
+    suspend fun removeCustomCommandsForPlugin(pluginId: String) {
+        val current = customCommands.first().filterNot { it.pluginId == pluginId }
+        context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
+    }
+
+    /** Enable / disable every slash command a plugin contributed, together. */
+    suspend fun setCustomCommandsEnabledForPlugin(pluginId: String, enabled: Boolean) {
+        val current = customCommands.first().map {
+            if (it.pluginId == pluginId) it.copy(enabled = enabled) else it
         }
         context.dataStore.edit { it[COMMANDS] = Json.encodeToString<List<CustomCommand>>(current) }
     }
@@ -526,7 +754,8 @@ class PreferencesStore(private val context: Context) {
      * Exhausted keys, keyed by "providerId|modelId|keyId" (see
      * [com.inyogeshwar.codesathi.agent.FallbackAttempt.exhaustionKey]).
      * Entries whose [ExhaustionInfo.untilMillis] has passed are pruned on
-     * read — that is the midnight reset.
+     * read — that is how a cooldown expires (rate 60 s, daily quota 1 h,
+     * out of credit 6 h, server 20 s, network 15 s).
      */
     suspend fun exhaustedMap(): Map<String, ExhaustionInfo> {
         val raw = context.dataStore.data.first()[EXHAUSTED] ?: return emptyMap()
@@ -548,5 +777,114 @@ class PreferencesStore(private val context: Context) {
         val current = exhaustedMap().toMutableMap()
         current[key] = ExhaustionInfo(kind, untilMillis)
         context.dataStore.edit { it[EXHAUSTED] = Json.encodeToString(current) }
+    }
+
+    /** Drop one key's exhaustion flag (it may be tried again at once). */
+    suspend fun clearExhausted(key: String) {
+        val current = exhaustedMap().toMutableMap()
+        if (current.remove(key) == null) return
+        context.dataStore.edit { it[EXHAUSTED] = Json.encodeToString(current) }
+    }
+
+    /** Drop every exhaustion flag (the "Reset limit flags" action). */
+    suspend fun clearAllExhausted() {
+        context.dataStore.edit { it.remove(EXHAUSTED) }
+    }
+
+    // ---- Routing mode + per-key health ledger (Phase 7, Step B1) ----
+
+    /**
+     * "pinned" (stay on the session's model, rotate only its keys) or
+     * "fallback" (session model, then the fallback chain). Anything
+     * else stored reads back as "fallback" — the default.
+     */
+    val routingMode: Flow<String> = context.dataStore.data.map { prefs ->
+        when (prefs[ROUTING_MODE]) {
+            "pinned" -> "pinned"
+            else -> "fallback"
+        }
+    }
+
+    /** Set the routing mode; any value other than "pinned" means fallback. */
+    suspend fun setRoutingMode(mode: String) {
+        context.dataStore.edit { it[ROUTING_MODE] = if (mode == "pinned") "pinned" else "fallback" }
+    }
+
+    /** Per-key health, keyed by "providerId|modelId|keyId". */
+    val keyHealth: Flow<Map<String, KeyHealth>> = context.dataStore.data.map { prefs ->
+        val raw = prefs[KEY_HEALTH] ?: return@map emptyMap()
+        try {
+            Json.decodeFromString<Map<String, KeyHealth>>(raw)
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    suspend fun keyHealthMap(): Map<String, KeyHealth> = keyHealth.first()
+
+    private suspend fun updateKeyHealth(key: String, update: (KeyHealth) -> KeyHealth) {
+        val current = keyHealthMap().toMutableMap()
+        current[key] = update(current[key] ?: KeyHealth())
+        context.dataStore.edit { it[KEY_HEALTH] = Json.encodeToString(current) }
+    }
+
+    /**
+     * Record a failed attempt for one key: one more failure, the
+     * status for the failure kind, the error label, and the cooldown
+     * (only when the failure carries one — an auth failure has none
+     * and instead marks the key invalid, so it stays skipped until
+     * reset). The old cooldown is kept when the new failure has none.
+     */
+    suspend fun recordKeyFailure(key: String, failure: com.inyogeshwar.codesathi.agent.Failure) {
+        val now = System.currentTimeMillis()
+        val status = when (failure.kind) {
+            com.inyogeshwar.codesathi.agent.FailureKind.AUTH -> KeyHealth.STATUS_INVALID
+            com.inyogeshwar.codesathi.agent.FailureKind.NO_CREDIT -> KeyHealth.STATUS_NO_CREDIT
+            com.inyogeshwar.codesathi.agent.FailureKind.RATE_LIMIT,
+            com.inyogeshwar.codesathi.agent.FailureKind.QUOTA -> KeyHealth.STATUS_RATE_LIMITED
+            else -> KeyHealth.STATUS_ERROR
+        }
+        val label = failure.label + (failure.code?.let { " ($it)" } ?: "")
+        updateKeyHealth(key) { old ->
+            old.copy(
+                failures = old.failures + 1,
+                status = status,
+                lastError = label,
+                cooldownUntil = if (failure.cooldownMs > 0) now + failure.cooldownMs else old.cooldownUntil,
+                lastUsedAt = now
+            )
+        }
+    }
+
+    /** Record a successful attempt: counts + latency, status ok, cooldown cleared. */
+    suspend fun recordKeySuccess(key: String, latencyMs: Long, inputTokens: Long, outputTokens: Long) {
+        val now = System.currentTimeMillis()
+        updateKeyHealth(key) { old ->
+            old.copy(
+                requests = old.requests + 1,
+                status = KeyHealth.STATUS_OK,
+                lastError = null,
+                cooldownUntil = 0,
+                lastUsedAt = now,
+                inputTokens = old.inputTokens + inputTokens,
+                outputTokens = old.outputTokens + outputTokens,
+                lastLatencyMs = latencyMs
+            )
+        }
+    }
+
+    /** Lift one key's block (cooldown + invalid flag); counts are kept. */
+    suspend fun resetKeyHealth(key: String) {
+        updateKeyHealth(key) { old ->
+            old.copy(status = KeyHealth.STATUS_UNKNOWN, lastError = null, cooldownUntil = 0)
+        }
+    }
+
+    /** Lift every key's block (the "Reset limit flags" action); counts are kept. */
+    suspend fun resetAllKeyHealth() {
+        val current = keyHealthMap().mapValues { (_, old) ->
+            old.copy(status = KeyHealth.STATUS_UNKNOWN, lastError = null, cooldownUntil = 0)
+        }
+        context.dataStore.edit { it[KEY_HEALTH] = Json.encodeToString(current) }
     }
 }

@@ -51,6 +51,15 @@ data class Message(
      * are never written into a session backup. Null / missing = no images.
      */
     val imagesJson: String? = null,
+    /**
+     * Attached files other than images (Phase 7, Step B3): a JSON
+     * array of attachment records (PDF + text + binary), stored in
+     * getFilesDir()/attachments/ — see the agent AttachmentStore.
+     * Only records — never bytes, never a content URI — live in Room;
+     * themselves are app-private and are never written into a session
+     * backup, exactly like images. Null / missing = no attachments.
+     */
+    val attachmentsJson: String? = null,
     val createdAt: Long
 )
 
@@ -160,6 +169,9 @@ interface SessionDao {
     @Query("DELETE FROM usage_records WHERE sessionId = :id")
     suspend fun deleteUsageForSession(id: String)
 
+    @Query("DELETE FROM runs WHERE sessionId = :id")
+    suspend fun deleteRunsForSession(id: String)
+
     /**
      * Delete a session and everything that belongs to it (Phase 5,
      * Step 4): its messages, its compaction summary, and its usage
@@ -172,6 +184,7 @@ interface SessionDao {
         deleteMessagesForSession(id)
         deleteSummaryForSession(id)
         deleteUsageForSession(id)
+        deleteRunsForSession(id)
         deleteById(id)
     }
 
@@ -310,9 +323,108 @@ interface CachedModelDao {
     }
 }
 
+/**
+ * One agent turn, as a run (Phase 7, Step B3 — adapted from
+ * AgentMT's `RunEntity`). A run is one [AppViewModel.runAgentTurn]
+ * invocation: a user message, its model turns, its tool calls, the
+ * files it changed and the tokens it spent. A post-approval resume
+ * is a second run — each invocation is recorded on its own, so a run
+ * never silently covers two turns.
+ *
+ * Why a new table instead of deriving runs from the messages table:
+ * the messages table cannot answer the runs questions — it holds no
+ * per-turn token counts (those live per step in `usage_records`,
+ * with no turn grouping), no step count, no changed-file list and no
+ * route log, and a failed turn leaves no row at all. Deriving would
+ * have meant re-reading tool-message text with heuristics; a small
+ * dedicated table records the facts at the time they happen.
+ * [status] is "running" | "waiting" | "succeeded" | "failed" |
+ * "cancelled": "waiting" means the turn paused for a file approval
+ * (AgentMT's meaning), and a run still "running" when the app starts
+ * was orphaned by a killed process — it is marked "cancelled" on
+ * start (see [RunDao.cancelOrphaned]).
+ */
+@Entity(
+    tableName = "runs",
+    indices = [Index("sessionId"), Index("startedAt")]
+)
+data class RunEntity(
+    @PrimaryKey val id: String,
+    val sessionId: String,
+    val title: String,
+    /** "running" | "waiting" | "succeeded" | "failed" | "cancelled" */
+    val status: String,
+    val startedAt: Long,
+    val endedAt: Long? = null,
+    /** Model turns (one per TurnUsage event). */
+    val steps: Int = 0,
+    /** Tool calls that actually ran. */
+    val toolCalls: Int = 0,
+    /** Newline-separated relative paths proposed during the run. */
+    val changedFiles: String = "",
+    val error: String? = null,
+    val inputTokens: Long = 0,
+    val outputTokens: Long = 0,
+    /** "providerId/modelId" that answered the turn. */
+    val model: String? = null,
+    /** Routing attempts, one per line, without secrets. */
+    val routeLog: String = ""
+)
+
+@Dao
+interface RunDao {
+    @Query("SELECT * FROM runs ORDER BY startedAt DESC")
+    fun observeAll(): Flow<List<RunEntity>>
+
+    @Query("SELECT * FROM runs WHERE id = :id")
+    fun observe(id: String): Flow<RunEntity?>
+
+    @Query("SELECT * FROM runs WHERE id = :id")
+    suspend fun get(id: String): RunEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(run: RunEntity)
+
+    @Query(
+        "UPDATE runs SET status = :status, endedAt = :endedAt, steps = :steps, " +
+            "toolCalls = :toolCalls, changedFiles = :changedFiles, error = :error, " +
+            "inputTokens = :inputTokens, outputTokens = :outputTokens, " +
+            "routeLog = :routeLog WHERE id = :id"
+    )
+    suspend fun finish(
+        id: String,
+        status: String,
+        endedAt: Long,
+        steps: Int,
+        toolCalls: Int,
+        changedFiles: String,
+        error: String?,
+        inputTokens: Long,
+        outputTokens: Long,
+        routeLog: String
+    )
+
+    /**
+     * Orphan cancellation (AgentMT's rule): a run left "running" or
+     * "waiting" by a killed process shows as cancelled on the next
+     * start, with the reason in its error field — it never stays
+     * "running" forever.
+     */
+    @Query(
+        "UPDATE runs SET status = 'cancelled', endedAt = :now, " +
+            "error = 'Stopped — the app closed while this run was active.' " +
+            "WHERE status IN ('running', 'waiting')"
+    )
+    suspend fun cancelOrphaned(now: Long)
+
+    /** Clear finished runs only — a running / waiting run is never cleared. */
+    @Query("DELETE FROM runs WHERE status NOT IN ('running', 'waiting')")
+    suspend fun clearFinished()
+}
+
 @Database(
-    entities = [Session::class, Message::class, FavouriteModel::class, SessionSummary::class, CachedModel::class, UsageRecord::class],
-    version = 5,
+    entities = [Session::class, Message::class, FavouriteModel::class, SessionSummary::class, CachedModel::class, UsageRecord::class, RunEntity::class],
+    version = 6,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -322,6 +434,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun summaryDao(): SummaryDao
     abstract fun cachedModelDao(): CachedModelDao
     abstract fun usageDao(): UsageDao
+    abstract fun runDao(): RunDao
 }
 
 /** v1 → v2: adds the cached_models table used by model fetching. */
@@ -384,6 +497,38 @@ val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
     override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
         db.execSQL(
             "ALTER TABLE `messages` ADD COLUMN `imagesJson` TEXT"
+        )
+    }
+}
+
+/**
+ * v5 → v6 (Phase 7, Step B3): adds the `runs` table (one row per agent
+ * turn — see [RunEntity]) with its two indexes, and the
+ * `attachmentsJson` column on messages (PDF + text attachment records,
+ * see the agent AttachmentStore). Both are new storage: no existing table is
+ * touched, no existing row moves or is lost, and existing messages
+ * simply have no attachments.
+ */
+val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+    override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `runs` (" +
+                "`id` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `title` TEXT NOT NULL, " +
+                "`status` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, `endedAt` INTEGER, " +
+                "`steps` INTEGER NOT NULL, `toolCalls` INTEGER NOT NULL, " +
+                "`changedFiles` TEXT NOT NULL, `error` TEXT, " +
+                "`inputTokens` INTEGER NOT NULL, `outputTokens` INTEGER NOT NULL, " +
+                "`model` TEXT, `routeLog` TEXT NOT NULL, " +
+                "PRIMARY KEY(`id`))"
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_runs_sessionId` ON `runs` (`sessionId`)"
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_runs_startedAt` ON `runs` (`startedAt`)"
+        )
+        db.execSQL(
+            "ALTER TABLE `messages` ADD COLUMN `attachmentsJson` TEXT"
         )
     }
 }

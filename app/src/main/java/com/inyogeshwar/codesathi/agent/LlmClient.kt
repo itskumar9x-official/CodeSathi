@@ -1,5 +1,6 @@
 package com.inyogeshwar.codesathi.agent
 
+import kotlinx.serialization.json.contentOrNull
 import com.inyogeshwar.codesathi.data.AZURE_API_VERSION
 import com.inyogeshwar.codesathi.data.KeyStore
 import com.inyogeshwar.codesathi.data.Provider
@@ -29,6 +30,17 @@ data class LlmMessage(
      */
     val images: List<LlmImage> = emptyList(),
     /**
+     * PDFs attached to this message (Phase 7, Step B3), as raw bytes
+     * base64-encoded (see [LlmPdf]). OpenAI-kind providers get a
+     * `file` part and Anthropic-kind providers a `document` block
+     * (see [openAiContentJson] / [anthropicContentJson]); Bedrock and
+     * the on-device engine take no PDF part, so the ViewModel refuses
+     * a PDF for those models before sending. Empty for every message
+     * without a PDF — and then the request body is byte-for-byte what
+     * turns without PDFs sent before.
+     */
+    val pdfs: List<LlmPdf> = emptyList(),
+    /**
      * Tool calls the assistant made in this message (Bedrock only).
      * Bedrock's Converse API pairs each tool result with the toolUse id
      * it answers, so the ids must travel with the message. Every other
@@ -49,6 +61,16 @@ data class LlmMessage(
  * format becomes JPEG on disk, so every provider gets the same bytes.
  */
 data class LlmImage(val base64: String, val mediaType: String = "image/jpeg")
+
+/**
+ * One attached PDF (Phase 7, Step B3). [base64] is the RAW PDF file
+ * bytes, base64-encoded, with no line breaks — there is NO on-device
+ * text extraction: no PDF library is in the app, so the model reads
+ * the PDF itself. [fileName] is the file's display name, sent along
+ * with the bytes so the model (and the user, in an error) can tell
+ * which PDF a part is.
+ */
+data class LlmPdf(val base64: String, val fileName: String)
 
 /** One tool call the model asked for (OpenAI `tool_calls` shape). */
 data class LlmToolCall(
@@ -241,7 +263,8 @@ class LlmClient(private val local: LocalLlmClient? = null) {
                 throw LlmException(
                     "Provider error HTTP $code: ${err.take(300)}",
                     httpCode = code,
-                    body = err
+                    body = err,
+                    retryAfterMs = retryAfterMs(conn)
                 )
             }
             emitAllEvents(conn, this)
@@ -274,7 +297,7 @@ class LlmClient(private val local: LocalLlmClient? = null) {
      * The request is SigV4-signed ([BedrockSigner]); a missing credential
      * throws before any request is made. A 429 from Bedrock (throttling)
      * carries the code through [LlmException], so the existing
-     * [classifyLimitError] maps it to RATE — no new failure kind.
+     * [classifyFailure] maps it to RATE_LIMIT — no new failure kind.
      */
     private suspend fun emitBedrockConverse(
         provider: Provider,
@@ -311,7 +334,8 @@ class LlmClient(private val local: LocalLlmClient? = null) {
                     throw LlmException(
                         "Bedrock error HTTP $code: ${err.take(300)}",
                         httpCode = code,
-                        body = err
+                        body = err,
+                        retryAfterMs = retryAfterMs(conn)
                     )
                 }
                 val raw = conn.inputStream.bufferedReader().readText()
@@ -497,16 +521,18 @@ class LlmClient(private val local: LocalLlmClient? = null) {
     }
 
     /**
-     * OpenAI-style message content (Phase 6, Step 2): a plain string
-     * when the message has no images — exactly what text-only turns
-     * sent before, so no provider sees a new shape it did not ask for —
-     * otherwise a content list with the text part first and one
-     * `image_url` part per image, the base64 data URL shape from
-     * OpenAI's vision docs. Azure and Google's OpenAI-compatible
-     * endpoint take the same shape.
+     * OpenAI-style message content (Phase 6, Step 2; PDFs Phase 7,
+     * Step B3): a plain string when the message has no images and no
+     * PDFs — exactly what text-only turns sent before, so no provider
+     * sees a new shape it did not ask for — otherwise a content list
+     * with the text part first, one `image_url` part per image, and
+     * one `file` part per PDF
+     * (`{"type":"file","file":{"filename":"…","file_data":
+     * "data:application/pdf;base64,…"}}` — AgentMT's OpenAI shape).
+     * Azure and Google's OpenAI-compatible endpoint take the same shape.
      */
     private fun openAiContentJson(m: LlmMessage): String {
-        if (m.images.isEmpty()) return "\"${escape(m.content)}\""
+        if (m.images.isEmpty() && m.pdfs.isEmpty()) return "\"${escape(m.content)}\""
         val parts = StringBuilder()
         if (m.content.isNotBlank()) {
             parts.append("""{"type":"text","text":"${escape(m.content)}"}""")
@@ -517,24 +543,40 @@ class LlmClient(private val local: LocalLlmClient? = null) {
                 """{"type":"image_url","image_url":{"url":"data:${img.mediaType};base64,${img.base64}"}}"""
             )
         }
+        m.pdfs.forEach { pdf ->
+            if (parts.isNotEmpty()) parts.append(",")
+            parts.append(
+                """{"type":"file","file":{"filename":"${escape(pdf.fileName)}","file_data":"data:application/pdf;base64,${pdf.base64}"}}"""
+            )
+        }
         return "[$parts]"
     }
 
     /**
-     * Anthropic-style message content (Phase 6, Step 2): a plain string
-     * with no images, otherwise a content list with the image blocks
-     * FIRST and the text after them — Anthropic's docs recommend images
-     * before the text that asks about them. One block per image:
+     * Anthropic-style message content (Phase 6, Step 2; PDFs Phase 7,
+     * Step B3): a plain string with no images and no PDFs, otherwise
+     * a content list with the image blocks FIRST and the text after
+     * them — Anthropic's docs recommend images before the text that
+     * asks about them. One block per image:
      * `{"type":"image","source":{"type":"base64","media_type":
-     * "image/jpeg","data":"…"}}`.
+     * "image/jpeg","data":"…"}}`. PDFs go between the images and the
+     * text as `document` blocks
+     * (`{"type":"document","source":{"type":"base64","media_type":
+     * "application/pdf","data":"…"}}` — AgentMT's Anthropic shape).
      */
     private fun anthropicContentJson(m: LlmMessage): String {
-        if (m.images.isEmpty()) return "\"${escape(m.content)}\""
+        if (m.images.isEmpty() && m.pdfs.isEmpty()) return "\"${escape(m.content)}\""
         val parts = StringBuilder()
         m.images.forEach { img ->
             if (parts.isNotEmpty()) parts.append(",")
             parts.append(
                 """{"type":"image","source":{"type":"base64","media_type":"${img.mediaType}","data":"${img.base64}"}}"""
+            )
+        }
+        m.pdfs.forEach { pdf ->
+            if (parts.isNotEmpty()) parts.append(",")
+            parts.append(
+                """{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"${pdf.base64}"}}"""
             )
         }
         if (m.content.isNotBlank()) {
@@ -740,9 +782,24 @@ class LlmClient(private val local: LocalLlmClient? = null) {
  * fallback engine can tell a limit error (402 / quota / 429) from any other
  * failure — the message alone is not enough. The body is the provider's
  * error text (never an API key: keys are only ever sent, never returned).
+ * [retryAfterMs] is the wait the provider asked for, parsed from its
+ * `Retry-After` / `X-RateLimit-Reset` headers when it sent one (Phase 7,
+ * Step B1) — a rate limit then cools down for exactly that long instead
+ * of the default 60 s. Null when the provider sent no such header.
  */
 class LlmException(
     message: String,
     val httpCode: Int? = null,
-    val body: String? = null
+    val body: String? = null,
+    val retryAfterMs: Long? = null
 ) : Exception(message)
+
+/**
+ * The wait a provider asked for, from its `Retry-After` /
+ * `X-RateLimit-Reset` headers (see [parseRetryAfterMs]). Read before
+ * the connection is closed — headers stay available until disconnect.
+ */
+private fun retryAfterMs(conn: HttpURLConnection): Long? = parseRetryAfterMs(
+    conn.getHeaderField("Retry-After"),
+    conn.getHeaderField("X-RateLimit-Reset")
+)

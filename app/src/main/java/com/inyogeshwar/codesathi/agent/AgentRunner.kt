@@ -7,6 +7,7 @@ import com.inyogeshwar.codesathi.data.TokenCounter
 import com.inyogeshwar.codesathi.data.supportsVision
 import com.inyogeshwar.codesathi.data.visionRefusalMessage
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.Serializable
@@ -45,15 +46,20 @@ sealed class AgentEvent {
     data class Verified(val message: String) : AgentEvent()
     data class Error(val message: String) : AgentEvent()
     /**
-     * One model turn hit a limit and switched to another key or fallback
-     * model. [kind] is why the previous key stopped (quota vs rate limit).
+     * One model turn hit a failure and switched to another key or fallback
+     * model. [kind] is why the previous key stopped (quota vs rate limit)
+     * when the failure was a limit error, null otherwise; [failure] is
+     * the full classification (see [Failure]) — the chat notice uses its
+     * label ("rate limited", "out of credit", "server error" …) so the
+     * user sees WHY the turn switched, not just that it did.
      */
     data class FallbackSwitched(
         val fromProviderId: String,
         val fromModelId: String,
         val toProviderId: String,
         val toModelId: String,
-        val kind: LimitKind
+        val kind: LimitKind? = null,
+        val failure: Failure? = null
     ) : AgentEvent()
     /**
      * One model turn's token usage (Phase 5, Step 2). [usage] is the
@@ -70,6 +76,12 @@ sealed class AgentEvent {
         val modelId: String,
         val estimated: Boolean
     ) : AgentEvent()
+    /**
+     * A plain informational note for the chat (Phase 7, Step B2 — e.g.
+     * a "context too long" retry). The ViewModel shows it as a tool
+     * message; it is not an error and does not end the turn.
+     */
+    data class Notice(val message: String) : AgentEvent()
     object Done : AgentEvent()
 }
 
@@ -113,14 +125,27 @@ private data class ParsedToolCall(
  * Light verification after a write: file exists, non-empty, and (for .html)
  * contains a matching <html> tag. Full diagnostics is Phase 2.
  *
- * Fallback (Phase 2, Step 1): when [fallback] is set, each model turn
- * tries the engine's ordered attempts — other keys of the same
- * provider + model first, then the user's fallback chain. A turn that
- * fails with a limit error (HTTP 402 / quota / 429) marks that key
- * exhausted and retries with the next attempt, emitting
- * [AgentEvent.FallbackSwitched] so the chat can say what changed. A
- * turn is only retried when nothing was emitted yet, so a reply is
- * never shown twice. Non-limit errors fail the turn as before.
+ * Fallback (Phase 2, Step 1; routing rework Phase 7, Step B1): when
+ * [router] is set, each model turn tries the router's ordered
+ * candidates — other keys of the same provider + model first, then the
+ * user's fallback chain (fallback mode), or only the session model's
+ * keys (pinned mode). A failed attempt is classified by
+ * [FailureClassifier] (429 rate limit vs daily quota vs 402 / out of
+ * credit vs auth vs context-too-long vs 5xx vs capability mismatch vs
+ * network) and the key cools down for that kind's cooldown (rate 60 s,
+ * daily quota 1 h, out of credit 6 h, server 20 s, network 15 s) —
+ * NOT until midnight any more. The turn retries with the next
+ * candidate and emits [AgentEvent.FallbackSwitched] with the failure
+ * reason, so the chat can say what changed and why. Bounded, the way
+ * AgentMT's RouteRunner bounds it: at most [RouteBounds.MAX_ROUTE_ATTEMPTS]
+ * attempts and [RouteBounds.PRE_FIRST_TOKEN_DEADLINE_MS] before the
+ * first token per model turn. A turn is only retried when nothing was
+ * emitted yet — if a stream fails halfway, the partial reply stays
+ * exactly as shown and the turn stops ([MidStreamException]: a
+ * half-streamed answer is never replayed on another model; the user
+ * sends a message to continue). Non-retryable errors fail the turn
+ * as before. Without a router the old fallback-only path is kept
+ * (limit errors only), so the approve-only runner is unaffected.
  * Reasoning effort (Phase 3, Step 2): each attempt looks up the effort
  * for its OWN provider + model, so a fallback switch sends the new
  * model's effort (or nothing, when that model is at "default") —
@@ -165,11 +190,63 @@ private data class ParsedToolCall(
  * with a plain message. The per-turn usage estimate adds
  * [IMAGE_TOKENS_ESTIMATE] per image (only when the provider reports
  * no usage — real counts already include image tokens).
+ *
+ * Attachments (Phase 7, Step B3): a user message may also carry PDF
+ * and text files ([LlmMessage.pdfs], [attachmentsFor]). Text files
+ * are inlined into the prompt every turn (text is cheap); images and
+ * PDFs are binary payloads, so only the 2 most recent user messages
+ * resend them ([resendBinariesFor] — AgentMT's rule, adopted here for
+ * images too: before this step every history image was re-sent on
+ * every turn). Older messages get a short "[shared earlier]" note
+ * instead. A PDF is raw bytes, base64-encoded — no text is extracted
+ * on-device — and only OpenAI / Anthropic-kind models receive one
+ * (the ViewModel refuses a PDF for local and Bedrock models).
+ * Known quirk, pre-existing for images: the newest user message is
+ * sent twice in Build — once as the last history message (with its
+ * images / attachments resolved through [imagesFor] /
+ * [attachmentsFor]) and once as the new user message (with
+ * [userImages] / [userPdfs]) — so its binaries go out twice in one
+ * turn. Deliberately left as-is: the raw text + expanded text both
+ * reaching the model is the established slash-command behaviour, and
+ * changing it here would change every Build prompt.
+ *
+ * Permissions (Phase 7, Step B2): [toolDecision] replaces the plain
+ * per-tool rule when the ViewModel supplies it — the stored per-tool
+ * rule wins, then the first matching glob rule, then the approval mode
+ * (see [PermissionEngine]). "Ask" still means "run and show as a tool
+ * card" (there is no blocking ask dialog in CodeSathi); only "deny"
+ * refuses a call. Writes always need the diff-card Approve.
+ *
+ * Compaction (Phase 7, Step B2): the context window a turn is measured
+ * against is capped at the smallest known window among the session
+ * model + fallback chain ([Compaction.effectiveContextTokens]); a
+ * "context too long" failure with nothing emitted yet compacts harder
+ * once ([onContextTooLong]) and retries the same step instead of
+ * failing the turn. The kept tail never splits a tool call/result pair
+ * ([Compaction.splitForSummary]).
+ *
+ * Resume (Phase 7, Step B2): [CONTINUE_TEXT] is the message the
+ * ViewModel sends to pick a turn up where it stopped — the history
+ * already holds every finished step and tool result, so nothing is
+ * resent from scratch and the partial text is never replayed.
  */
 class AgentRunner(
     private val llm: LlmClient,
     private val tools: List<Tool>,
     private val fallback: FallbackEngine? = null,
+    /**
+     * Router (Phase 7, Step B1): builds the ordered candidates
+     * (pinned vs fallback mode), records per-key health and applies
+     * the per-kind cooldowns. When null, the runner falls back to the
+     * plain [fallback] engine with limit-only retries (the old path).
+     */
+    private val router: ModelRouter? = null,
+    /**
+     * Pinned routing (Phase 7, Step B1): [RoutingMode.PINNED] tries only
+     * the session model's keys — the fallback chain is not walked.
+     * Read fresh per turn by the ViewModel from the routing-mode setting.
+     */
+    private val routingMode: RoutingMode = RoutingMode.FALLBACK,
     /**
      * Reasoning effort for one (provider, model), or null when the user
      * left it at "default". Looked up fresh for EVERY attempt — a
@@ -191,7 +268,26 @@ class AgentRunner(
      * other kind passes null and is unaffected. Null means the plain
      * client path (no Bedrock provider in the run).
      */
-    private val awsCredentialsFor: (suspend () -> KeyStore.AwsCredentials?)? = null
+    private val awsCredentialsFor: (suspend () -> KeyStore.AwsCredentials?)? = null,
+    /**
+     * Target-aware tool decision (Phase 7, Step B2): (tool name, args)
+     * -> "allow" | "ask" | "deny", decided by [PermissionEngine] from
+     * the stored per-tool rule, the glob rules and the approval mode.
+     * When set it replaces [toolRule] for Build turns — the decision
+     * function knows the call's target (file path / command), which
+     * the glob rules need. When null, [toolRule] is used exactly as
+     * before (the approve-only runner and older callers).
+     */
+    private val toolDecision: ((String, Map<String, String>) -> String)? = null,
+    /**
+     * Harder compaction for a "context too long" failure (Phase 7,
+     * Step B2 — AgentMT's "summarise harder once and redo this step"):
+     * called once per Build step, returns the new summary Markdown, or
+     * null when nothing more could be compacted. The step is then
+     * retried once with the new summary instead of failing the turn.
+     * Null means no retry (the old next-candidate / error path runs).
+     */
+    private val onContextTooLong: (suspend () -> String?)? = null
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -234,6 +330,9 @@ class AgentRunner(
         ```tool
         {"tool":"run","args":{"command":"npm test"}}
         ```
+        ```tool
+        {"tool":"background_process","args":{"action":"start","command":"npm run dev"}}
+        ```
         Use read / glob / grep first to see the project before changing it.
         To change a file, call write (new file) or edit (change a snippet).
         Use run to execute a command in the project folder — run tests, a
@@ -244,7 +343,11 @@ class AgentRunner(
         so make each re-run count. A "Permission denied" in the output
         means the shell cannot touch that file (the folder grant gives the
         shell no raw-filesystem access) — say so and use the read / write
-        tools instead.
+        tools instead. Use background_process to start a long-running
+        command (a dev server, a watcher) instead of run — run waits for
+        the command to finish, background_process returns at once with
+        an id; list it, read its output, or stop it with the same tool.
+        At most 3 background processes may run at once.
         The user approves every file change before it is applied, so propose
         one file at a time. When the work is done, finish with a short plain
         text summary and no more tool calls. Do not invent files that were
@@ -273,6 +376,21 @@ class AgentRunner(
     companion object {
         /** Max model turns per user message — the Stop button cancels sooner. */
         const val MAX_STEPS = 10
+
+        /**
+         * Resume text (Phase 7, Step B2 — AgentMT's CONTINUE_TEXT,
+         * adapted). Sent as the next user message after an error, a
+         * limit or a stop: the history already holds every finished
+         * step and tool result, so the model picks up where it stopped
+         * instead of starting the last message over from scratch. The
+         * mid-stream partial text stays as shown and is never replayed
+         * (Step B1's rule). The ViewModel sends this WITHOUT storing
+         * it as a user message — the chat shows no extra bubble, the
+         * model still gets the instruction as the latest user message.
+         */
+        const val CONTINUE_TEXT = "Continue from where you stopped. " +
+            "Earlier steps and tool results above are done; do not repeat them. " +
+            "Check the last results, then carry on with the remaining work."
 
         /**
          * Max commands that may exit non-zero in one Build turn (Phase 6,
@@ -317,7 +435,9 @@ class AgentRunner(
         project: SafProject,
         folderName: String,
         /** Images attached to this message (Phase 6, Step 2). */
-        userImages: List<LlmImage> = emptyList()
+        userImages: List<LlmImage> = emptyList(),
+        /** PDFs attached to this message (Phase 7, Step B3). */
+        userPdfs: List<LlmPdf> = emptyList()
     ): Flow<AgentEvent> = flow {
         val files = try {
             project.listFiles().take(30).joinToString(", ")
@@ -329,13 +449,17 @@ class AgentRunner(
             LlmMessage(
                 "user",
                 "Project folder: $folderName. Existing files: $files\n\nGoal: $userGoal",
-                images = userImages
+                images = userImages,
+                pdfs = userPdfs
             )
         )
-        val rawAttempts = fallback?.attemptsFor(provider, modelId)
-            ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
+        val rawAttempts = when {
+            router != null -> router.route(provider, modelId, routingMode)
+            fallback != null -> fallback.attemptsFor(provider, modelId)
+            else -> listOf(FallbackAttempt(provider, modelId, apiKey, null))
+        }
         if (rawAttempts.isEmpty()) {
-            emit(AgentEvent.Error("All keys and fallback models are exhausted — limits reset at midnight. Add another key, or check the fallback order in Providers."))
+            emit(AgentEvent.Error("All keys and fallback models are cooling down or unavailable right now. Try again shortly, or reset the limit flags in Providers."))
             return@flow
         }
         // Vision (Phase 6, Step 2): with images attached, only
@@ -350,15 +474,29 @@ class AgentRunner(
         }
         var fullText: String? = null
         var lastLimitError: Exception? = null
+        var lastFailure: Failure? = null
+        var stoppedReason: String? = null
         // The turn that answered, and the usage it reported (Phase 5,
         // Step 2): set only by the successful attempt, so a failed
         // attempt's partial stream can never be recorded.
         var usedProviderId = provider.id
         var usedModelId = modelId
         var reportedUsage: LlmUsage? = null
+        // Bounded attempts + pre-first-token deadline (Phase 7, Step B1,
+        // RouteBounds): at most 4 attempts, 180 s before the first token.
+        val turnStartMs = System.currentTimeMillis()
         for ((index, attempt) in attempts.withIndex()) {
+            if (index >= RouteBounds.MAX_ROUTE_ATTEMPTS) {
+                stoppedReason = "Tried ${RouteBounds.MAX_ROUTE_ATTEMPTS} models/keys and none could answer."
+                break
+            }
+            if (index > 0 && System.currentTimeMillis() - turnStartMs > RouteBounds.PRE_FIRST_TOKEN_DEADLINE_MS) {
+                stoppedReason = "Stopped after ${RouteBounds.PRE_FIRST_TOKEN_DEADLINE_MS / 1000} s without a first token."
+                break
+            }
             val full = StringBuilder()
             reportedUsage = null
+            val attemptStartMs = System.currentTimeMillis()
             try {
                 // Effort is looked up for THIS attempt's model, so a
                 // fallback switch sends the new model's effort (or none).
@@ -386,21 +524,50 @@ class AgentRunner(
                 fullText = full.toString()
                 usedProviderId = attempt.provider.id
                 usedModelId = attempt.modelId
+                router?.recordSuccess(
+                    attempt,
+                    System.currentTimeMillis() - attemptStartMs,
+                    reportedUsage?.promptTokens?.toLong() ?: 0,
+                    reportedUsage?.completionTokens?.toLong() ?: 0
+                )
                 break
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                val kind = if (e is LlmException) classifyLimitError(e.httpCode, e.body) else null
-                if (kind != null && fallback != null && full.isEmpty()) {
-                    fallback.markExhausted(attempt, kind)
+                val failure = classifyFailure(e)
+                lastFailure = failure
+                if (full.isNotEmpty()) {
+                    // Mid-stream failure (Phase 7, Step B1): text was
+                    // already shown, so the turn must NOT retry on
+                    // another model — the half-streamed answer would be
+                    // replayed. The partial reply stays as shown; the
+                    // user sends a message to continue.
+                    val mid = MidStreamException(failure, e)
+                    emit(AgentEvent.Error("The reply stopped halfway (${mid.failure.label}) — the part above is kept. Send a message to continue."))
+                    return@flow
+                }
+                val next = attempts.getOrNull(index + 1)
+                val canRetry = failure.fallback && (router != null || fallback != null) &&
+                    next != null && index + 1 < RouteBounds.MAX_ROUTE_ATTEMPTS
+                if (canRetry) {
+                    if (router != null) {
+                        router.recordFailure(attempt, failure)
+                    } else {
+                        failure.limitKind()?.let { fallback?.markExhausted(attempt, it) }
+                    }
                     lastLimitError = e
-                    attempts.getOrNull(index + 1)?.let { next ->
-                        emit(
-                            AgentEvent.FallbackSwitched(
-                                attempt.provider.id, attempt.modelId,
-                                next.provider.id, next.modelId, kind
-                            )
+                    emit(
+                        AgentEvent.FallbackSwitched(
+                            attempt.provider.id, attempt.modelId,
+                            next.provider.id, next.modelId,
+                            kind = failure.limitKind(), failure = failure
                         )
+                    )
+                    // A server error or timeout gets a short backoff
+                    // before the next candidate (AgentMT: 400 ms,
+                    // doubling to 4 s).
+                    if (failure.kind == FailureKind.SERVER || failure.kind == FailureKind.TIMEOUT) {
+                        delay((400L shl index.coerceAtMost(4)).coerceAtMost(4000))
                     }
                     continue
                 }
@@ -410,7 +577,9 @@ class AgentRunner(
         }
         val full = fullText
         if (full == null) {
-            emit(AgentEvent.Error("Plan failed: ${lastLimitError?.message ?: "all keys and fallback models are exhausted."}"))
+            val reason = stoppedReason
+                ?: "Plan failed: ${lastLimitError?.message ?: lastFailure?.message ?: "all keys and fallback models are cooling down."}"
+            emit(AgentEvent.Error(reason))
             return@flow
         }
         // Usage for this turn (Phase 5, Step 2): the provider's real
@@ -444,25 +613,67 @@ class AgentRunner(
         skills: List<Skill> = emptyList(),
         /** Images attached to this message (Phase 6, Step 2). */
         userImages: List<LlmImage> = emptyList(),
+        /** PDFs attached to this message (Phase 7, Step B3). */
+        userPdfs: List<LlmPdf> = emptyList(),
         /**
          * Images attached to a HISTORY message (Phase 6, Step 2):
          * looked up fresh per turn, so an old message's images are
          * re-sent with the history exactly like its text. Null when the
          * caller has no images to resolve (plain text path).
          */
-        imagesFor: (suspend (Message) -> List<LlmImage>)? = null
+        imagesFor: (suspend (Message) -> List<LlmImage>)? = null,
+        /**
+         * Attachments of a HISTORY message (Phase 7, Step B3): the
+         * message's text files inlined + its PDFs as binary parts.
+         * [binary] is true only for the 2 most recent user messages
+         * (see [resendBinariesFor]) — with false, PDFs become a short
+         * "[shared earlier]" note and only the text is inlined.
+         * Null when the caller has no attachments to resolve.
+         */
+        attachmentsFor: (suspend (Message, Boolean) -> AttachmentMaterial)? = null,
+        /**
+         * Which history messages resend their binaries this turn
+         * (Phase 7, Step B3 — AgentMT's rule): only the 2 most recent
+         * user messages that carry images or PDFs. Every other history
+         * message keeps its text (and its inlined text attachments)
+         * but no binary payload. Defaults to "every message", the old
+         * behaviour, when the caller does not supply it.
+         */
+        resendBinariesFor: (Message) -> Boolean = { true }
     ): Flow<AgentEvent> = flow {
         // Compaction: only what is sent changes; history in Room is untouched.
-        val toSend = Compaction.buildSendMessages(history, summaryMarkdown, contextTokens)
-        val llmMessages = mutableListOf(LlmMessage("system", buildSystemPrompt(tools.filter { it.name.startsWith("mcp:") }, skills)))
-        // History messages keep their images (Phase 6, Step 2): the
-        // model re-sees an old screenshot when the turn re-sends the
-        // history, exactly like it re-reads the old text.
-        for (msg in toSend) {
-            val imgs = imagesFor?.invoke(msg).orEmpty()
-            llmMessages += LlmMessage(msg.role, msg.text, images = imgs)
+        // Built by a local function (not a one-off list) because a
+        // "context too long" failure rebuilds it from a harder summary
+        // and retries the step (Phase 7, Step B2).
+        suspend fun buildMessages(summary: String?): MutableList<LlmMessage> {
+            val toSend = Compaction.buildSendMessages(history, summary, contextTokens)
+            val list = mutableListOf(
+                LlmMessage("system", buildSystemPrompt(tools.filter { it.name.startsWith("mcp:") }, skills))
+            )
+            // History messages keep their images (Phase 6, Step 2): the
+            // model re-sees an old screenshot when the turn re-sends the
+            // history, exactly like it re-reads the old text — but only
+            // for the 2 most recent user messages (Phase 7, Step B3):
+            // older images and PDFs are not re-sent, they become a note.
+            // Text attachments are inlined every turn (text is cheap).
+            for (msg in toSend) {
+                val resend = resendBinariesFor(msg)
+                val imgs = if (resend) imagesFor?.invoke(msg).orEmpty() else emptyList()
+                val att = attachmentsFor?.invoke(msg, resend)
+                val pdfs = if (resend) att?.pdfs.orEmpty() else emptyList()
+                var text = msg.text
+                if (att != null && att.extraText.isNotEmpty()) text += att.extraText
+                if (!resend && (decodeImageNames(msg.imagesJson).isNotEmpty() ||
+                        decodeAttachments(msg.attachmentsJson).any { it.kind == "image" || it.kind == "pdf" })
+                ) {
+                    text += "\n[Attached images / PDFs from this message were shared earlier and are not re-sent.]"
+                }
+                list += LlmMessage(msg.role, text, images = imgs, pdfs = pdfs)
+            }
+            list += LlmMessage("user", userMessage, images = userImages, pdfs = userPdfs)
+            return list
         }
-        llmMessages += LlmMessage("user", userMessage, images = userImages)
+        var llmMessages = buildMessages(summaryMarkdown)
 
         var steps = 0
         // Auto-fix budget (Phase 6, Step 1): non-zero `run` results used
@@ -475,8 +686,11 @@ class AgentRunner(
             // On a limit error the turn retries with the next key / fallback
             // model instead of failing — but only when nothing was emitted
             // yet, so the chat never shows a duplicated reply.
-            val rawAttempts = fallback?.attemptsFor(provider, modelId)
-                ?: listOf(FallbackAttempt(provider, modelId, apiKey, null))
+            val rawAttempts = when {
+                router != null -> router.route(provider, modelId, routingMode)
+                fallback != null -> fallback.attemptsFor(provider, modelId)
+                else -> listOf(FallbackAttempt(provider, modelId, apiKey, null))
+            }
             // Vision (Phase 6, Step 2): with images attached, only
             // attempts whose model can see images may run. When every
             // attempt was filtered out the turn is refused with the
@@ -497,17 +711,41 @@ class AgentRunner(
             val nativeToolCalls = mutableListOf<LlmToolCall>()
             var turnOk = false
             var lastLimitError: Exception? = null
+            var lastFailure: Failure? = null
+            var stoppedReason: String? = null
             // The attempt that answered this step, and the usage it
             // reported (Phase 5, Step 2). Cleared per attempt, set only
             // on success, so a failed attempt can never be recorded.
             var usedProviderId = provider.id
             var usedModelId = modelId
             var stepUsage: LlmUsage? = null
-            for ((index, attempt) in attempts.withIndex()) {
+            // Bounded attempts + pre-first-token deadline (Phase 7,
+            // Step B1, RouteBounds): at most 4 attempts, 180 s before
+            // the first token, per model turn (per step). A while loop
+            // (not for/withIndex) because a "context too long" failure
+            // retries the SAME attempt once after harder compaction
+            // (Phase 7, Step B2) — the index only advances when moving
+            // on to the next candidate.
+            val turnStartMs = System.currentTimeMillis()
+            var attemptIndex = 0
+            // One harder-compaction retry per step (Phase 7, Step B2).
+            var contextRetryUsed = false
+            while (attemptIndex < attempts.size) {
+                val index = attemptIndex
+                val attempt = attempts[index]
+                if (index >= RouteBounds.MAX_ROUTE_ATTEMPTS) {
+                    stoppedReason = "Tried ${RouteBounds.MAX_ROUTE_ATTEMPTS} models/keys and none could answer."
+                    break
+                }
+                if (index > 0 && System.currentTimeMillis() - turnStartMs > RouteBounds.PRE_FIRST_TOKEN_DEADLINE_MS) {
+                    stoppedReason = "Stopped after ${RouteBounds.PRE_FIRST_TOKEN_DEADLINE_MS / 1000} s without a first token."
+                    break
+                }
                 turnText.clear()
                 nativeCalls.clear()
                 nativeToolCalls.clear()
                 stepUsage = null
+                val attemptStartMs = System.currentTimeMillis()
                 try {
                     // Effort is looked up for THIS attempt's model, so a
                     // fallback switch sends the new model's effort (or none).
@@ -539,23 +777,67 @@ class AgentRunner(
                     }
                     usedProviderId = attempt.provider.id
                     usedModelId = attempt.modelId
+                    router?.recordSuccess(
+                        attempt,
+                        System.currentTimeMillis() - attemptStartMs,
+                        stepUsage?.promptTokens?.toLong() ?: 0,
+                        stepUsage?.completionTokens?.toLong() ?: 0
+                    )
                     turnOk = true
                     break
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    val kind = if (e is LlmException) classifyLimitError(e.httpCode, e.body) else null
-                    if (kind != null && fallback != null && turnText.isEmpty() && nativeCalls.isEmpty()) {
-                        fallback.markExhausted(attempt, kind)
-                        lastLimitError = e
-                        attempts.getOrNull(index + 1)?.let { next ->
-                            emit(
-                                AgentEvent.FallbackSwitched(
-                                    attempt.provider.id, attempt.modelId,
-                                    next.provider.id, next.modelId, kind
-                                )
-                            )
+                    val failure = classifyFailure(e)
+                    lastFailure = failure
+                    // A stream that already produced text or tool calls
+                    // must never be retried on another model — the
+                    // half-streamed answer would be replayed
+                    // ([MidStreamException]). The partial reply stays as
+                    // shown; the user sends a message to continue.
+                    if (turnText.isNotEmpty() || nativeCalls.isNotEmpty()) {
+                        val mid = MidStreamException(failure, e)
+                        emit(AgentEvent.Error("The reply stopped halfway (${mid.failure.label}) — the part above is kept. Send a message to continue."))
+                        return@flow
+                    }
+                    // "Context too long" (Phase 7, Step B2 — AgentMT's
+                    // "summarise harder once and redo this step"): the
+                    // next candidate would hit the same oversized
+                    // prompt, so compact harder and retry THIS attempt
+                    // once instead. Only when nothing was emitted yet
+                    // and the retry has not been used for this step; a
+                    // null result (nothing more to compact) falls
+                    // through to the normal next-candidate path below.
+                    if (failure.kind == FailureKind.CONTEXT && !contextRetryUsed && onContextTooLong != null) {
+                        val harderSummary = onContextTooLong()
+                        if (harderSummary != null) {
+                            contextRetryUsed = true
+                            llmMessages = buildMessages(harderSummary)
+                            emit(AgentEvent.Notice("Context too long — summarised the earlier chat more tightly and retrying this step."))
+                            continue
                         }
+                    }
+                    val next = attempts.getOrNull(index + 1)
+                    val canRetry = failure.fallback && (router != null || fallback != null) &&
+                        next != null && index + 1 < RouteBounds.MAX_ROUTE_ATTEMPTS
+                    if (canRetry) {
+                        if (router != null) {
+                            router.recordFailure(attempt, failure)
+                        } else {
+                            failure.limitKind()?.let { fallback?.markExhausted(attempt, it) }
+                        }
+                        lastLimitError = e
+                        emit(
+                            AgentEvent.FallbackSwitched(
+                                attempt.provider.id, attempt.modelId,
+                                next.provider.id, next.modelId,
+                                kind = failure.limitKind(), failure = failure
+                            )
+                        )
+                        if (failure.kind == FailureKind.SERVER || failure.kind == FailureKind.TIMEOUT) {
+                            delay((400L shl index.coerceAtMost(4)).coerceAtMost(4000))
+                        }
+                        attemptIndex++
                         continue
                     }
                     emit(AgentEvent.Error("Build failed: ${e.message}"))
@@ -563,7 +845,9 @@ class AgentRunner(
                 }
             }
             if (!turnOk) {
-                emit(AgentEvent.Error("Build failed: ${lastLimitError?.message ?: "all keys and fallback models are exhausted."}"))
+                val reason = stoppedReason
+                    ?: "Build failed: ${lastLimitError?.message ?: lastFailure?.message ?: "all keys and fallback models are cooling down."}"
+                emit(AgentEvent.Error(reason))
                 return@flow
             }
             val text = turnText.toString()
@@ -627,7 +911,14 @@ class AgentRunner(
             val callResults = mutableListOf<Pair<ParsedToolCall, String>>()
             var pausedForApproval = false
             for (call in calls) {
-                val rule = toolRule(call.name)
+                // Gating (Phase 7, Step B2): the target-aware decision
+                // (stored per-tool rule > glob rule > approval mode)
+                // when the ViewModel supplied one, else the plain
+                // per-tool rule exactly as before. "deny" refuses the
+                // call before anything runs; "ask" runs it and it is
+                // always shown as a tool card. Writes still need the
+                // diff-card Approve either way (see below).
+                val rule = toolDecision?.invoke(call.name, call.args) ?: toolRule(call.name)
                 if (rule == "deny") {
                     val line = "[${call.name}] Denied by your tool permission rules."
                     results.appendLine(line)

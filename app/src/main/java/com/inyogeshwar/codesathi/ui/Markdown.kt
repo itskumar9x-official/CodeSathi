@@ -1,6 +1,24 @@
 package com.inyogeshwar.codesathi.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import com.inyogeshwar.codesathi.ui.theme.SathiCodeType
+import com.inyogeshwar.codesathi.ui.theme.SathiColors
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -122,7 +140,7 @@ fun parseInline(text: String): AnnotatedString {
     val bold = SpanStyle(fontWeight = FontWeight.Bold)
     val italic = SpanStyle(fontStyle = FontStyle.Italic)
     val code = SpanStyle(fontFamily = FontFamily.Monospace)
-    val link = SpanStyle(color = Color(0xFF1A73E8), textDecoration = TextDecoration.Underline)
+    val link = SpanStyle(color = Color(0xFF0D9488), textDecoration = TextDecoration.Underline)
     return buildAnnotatedString {
         var i = 0
         while (i < text.length) {
@@ -207,34 +225,7 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                             .firstOrNull()?.let { uriHandler.openUri(it.item) }
                     }
                 )
-                is MdBlock.Code -> Card(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                ) {
-                    Column(Modifier.padding(8.dp)) {
-                        Row {
-                            Text(
-                                text = block.language.ifBlank { "code" },
-                                style = MaterialTheme.typography.labelSmall,
-                                modifier = Modifier.weight(1f)
-                            )
-                            IconButton(onClick = { clipboard.setText(AnnotatedString(block.code)) }) {
-                                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy code")
-                            }
-                        }
-                        // Phase 3, Step 5: same hand-rolled highlighter
-                        // as the diff card, keyed off the fence's
-                        // language tag; unknown languages stay plain.
-                        // Computed once per block, not per recomposition.
-                        val highlighted = remember(block.code, block.language) {
-                            highlightCode(block.code, languageForName(block.language))
-                        }
-                        Text(
-                            text = highlighted,
-                            fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
+                is MdBlock.Code -> CodeBlock(block, onCopy = { clipboard.setText(AnnotatedString(block.code)) })
                 is MdBlock.BulletList -> block.items.forEach { item ->
                     Row(Modifier.padding(bottom = 2.dp)) {
                         Text("• ", style = MaterialTheme.typography.bodyMedium)
@@ -277,6 +268,76 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                     Spacer(Modifier.height(4.dp))
                 }
             }
+        }
+    }
+}
+
+/** Code-block colours on the dark code surface (both themes). */
+private val CodeBlockHighlight = HighlightColors(
+    keyword = Color(0xFFC4A7FF),
+    string = Color(0xFF86EFAC),
+    comment = Color(0xFF7C8B88),
+    number = Color(0xFF7DD3FC),
+    tag = Color(0xFF5EEAD4),
+    heading = Color(0xFFFFC46B)
+)
+
+/**
+ * Fenced code block (v1.2): dark code surface, language label, Copy
+ * button that confirms with "Copied" for a moment, horizontal scroll
+ * for long lines. Highlighting is the same hand-rolled highlighter as
+ * the diff card (Phase 3, Step 5), computed once per block.
+ */
+@Composable
+private fun CodeBlock(block: MdBlock.Code, onCopy: () -> Unit) {
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1_500)
+            copied = false
+        }
+    }
+    val highlighted = remember(block.code, block.language) {
+        highlightCode(block.code, languageForName(block.language), CodeBlockHighlight)
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = SathiColors.CodeSurface
+    ) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().background(SathiColors.CodeHeader).padding(start = 12.dp, end = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = block.language.ifBlank { "code" },
+                    style = SathiCodeType.small,
+                    color = SathiColors.CodeMuted,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(
+                    onClick = { onCopy(); copied = true },
+                    colors = ButtonDefaults.textButtonColors(contentColor = SathiColors.Mint)
+                ) {
+                    Icon(
+                        if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                        contentDescription = if (copied) "Copied" else "Copy code",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (copied) "Copied" else "Copy", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            Text(
+                text = highlighted,
+                style = SathiCodeType.body,
+                color = SathiColors.CodeText,
+                softWrap = false,
+                modifier = Modifier
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            )
         }
     }
 }

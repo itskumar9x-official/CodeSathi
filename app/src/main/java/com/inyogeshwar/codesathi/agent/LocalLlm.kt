@@ -31,8 +31,11 @@ import kotlinx.coroutines.withContext
  *   `.setModelPath(path).setMaxTopK(64).build()`,
  *   `LlmInference.createFromOptions(context, options)`,
  *   `generateResponse(prompt)` for one whole reply, and
- *   `generateResponseAsync(prompt)` for streaming with
- *   `.setResultListener { partialResult, done -> }` on the options.
+ *   `generateResponseAsync(prompt) { partialResult, done -> }` for
+ *   streaming — the progress listener is a parameter of
+ *   generateResponseAsync, NOT a setter on the options builder
+ *   (tasks-genai 0.10.27 has no setResultListener / setErrorListener
+ *   on LlmInferenceOptions; fixed 2026-11-14, Phase 7 Step A1).
  *   Config table: maxTokens is input + output tokens (default 512),
  *   topK default 40, temperature default 0.8.
  * - Model format: a `.task` bundle. Google's docs name Gemma-3 1B in
@@ -213,7 +216,19 @@ class LocalLlmClient(private val appContext: Context) {
             onError = { error -> close(error) }
         )
         try {
-            withContext(Dispatchers.IO) { engine.generateResponseAsync(prompt) }
+            val handler = currentHandler
+            // tasks-genai 0.10.27: the progress listener goes on generateResponseAsync,
+            // not on LlmInferenceOptions (the builder has no setResultListener).
+            val future = withContext(Dispatchers.IO) {
+                engine.generateResponseAsync(prompt) { partialResult, done ->
+                    if (currentHandler?.generation == myGeneration) handler?.onPartial(partialResult, done)
+                }
+            }
+            future.addListener({
+                try { future.get() } catch (e: java.util.concurrent.ExecutionException) {
+                    if (currentHandler?.generation == myGeneration) handler?.onError(e.cause ?: e)
+                } catch (_: Exception) { }
+            }, java.util.concurrent.Executor { it.run() })
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -297,24 +312,21 @@ class LocalLlmClient(private val appContext: Context) {
     }
 
     /**
-     * Build the engine for one model file. The result listener is set
-     * once, at creation, and forwards to whatever stream is active —
-     * the engine is cached across turns, so the listener cannot belong
-     * to one turn. Options are Google's documented ones: model path,
-     * max tokens (input + output), max top-K 64 from the quickstart.
-     * Temperature is left at the documented default (0.8).
+     * Build the engine for one model file. The progress listener is
+     * NOT set here: in tasks-genai 0.10.27 the options builder has no
+     * setResultListener / setErrorListener — the listener goes on
+     * `generateResponseAsync(prompt) { partialResult, done -> }` per
+     * turn (see [streamEvents]), because the engine is cached across
+     * turns and the listener belongs to one turn. Options are Google's
+     * documented ones: model path, max tokens (input + output), max
+     * top-K 64 from the quickstart. Temperature is left at the
+     * documented default (0.8).
      */
     private fun buildEngine(modelFile: File): LlmInference {
         val options = LlmInference.LlmInferenceOptions.builder()
             .setModelPath(modelFile.absolutePath)
             .setMaxTokens(CONTEXT_TOKENS)
             .setMaxTopK(64)
-            .setResultListener { partialResult, done ->
-                currentHandler?.onPartial(partialResult, done)
-            }
-            .setErrorListener { error ->
-                currentHandler?.onError(error)
-            }
             .build()
         return try {
             LlmInference.createFromOptions(appContext, options)

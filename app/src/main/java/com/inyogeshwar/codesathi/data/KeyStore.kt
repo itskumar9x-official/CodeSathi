@@ -1,10 +1,16 @@
 package com.inyogeshwar.codesathi.data
 
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.security.MessageDigest
 
 /**
@@ -273,6 +279,134 @@ class KeyStore(context: Context) {
         getMcpToken(serverId)?.let { maskKey(it) }
 
     private fun mcpTokenKeyFor(serverId: String) = "mcp_token.$serverId"
+
+    // ---- Encrypted-secrets export / import (Phase 7, Step B3) ----
+
+    /**
+     * Every secret this device holds, as one JSON object for the
+     * encrypted backup's `secrets.enc` entry (see EncryptedBackup.kt).
+     * Keys are the same names the vault uses internally, so an import
+     * can put them back in the same place:
+     * - `api_keys.<providerId>`: the provider's key list (all keys).
+     * - `aws`: the Bedrock credential (access key id, secret, region).
+     * - `remote_password`: the Remote-mode password.
+     * - `git`: the Git username + token.
+     * - `mcp_token.<serverId>`: one entry per server id passed in
+     *   (only servers that actually have a token are included).
+     *
+     * The JSON itself is NOT encrypted here — the caller encrypts it
+     * with [BackupCrypto] before it is written anywhere, and this
+     * value must never be logged or written to a plain file. The
+     * count is the number of top-level entries (one per provider /
+     * credential), for the export result message.
+     */
+    data class SecretsExport(val json: String, val entries: Int)
+
+    fun exportSecretsJson(mcpServerIds: List<String>): SecretsExport {
+        val entries = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>()
+        providerIdsWithKeys().forEach { providerId ->
+            val values = getKeyValues(providerId)
+            if (values.isNotEmpty()) {
+                entries["api_keys.$providerId"] = kotlinx.serialization.json.JsonArray(
+                    values.map { kotlinx.serialization.json.JsonPrimitive(it) }
+                )
+            }
+        }
+        awsCredentials()?.let { aws ->
+            entries["aws"] = kotlinx.serialization.json.buildJsonObject {
+                put("accessKeyId", aws.accessKeyId)
+                put("secretAccessKey", aws.secretAccessKey)
+                put("region", aws.region)
+            }
+        }
+        getRemotePassword()?.let { entries["remote_password"] = kotlinx.serialization.json.JsonPrimitive(it) }
+        val gitUser = getGitUsername()
+        val gitToken = getGitToken()
+        if (gitUser != null && gitToken != null) {
+            entries["git"] = kotlinx.serialization.json.buildJsonObject {
+                put("username", gitUser)
+                put("token", gitToken)
+            }
+        }
+        mcpServerIds.forEach { serverId ->
+            getMcpToken(serverId)?.let { token ->
+                entries["mcp_token.$serverId"] = kotlinx.serialization.json.JsonPrimitive(token)
+            }
+        }
+        val obj = kotlinx.serialization.json.JsonObject(entries)
+        return SecretsExport(json.encodeToString(obj), obj.size)
+    }
+
+    /**
+     * Restore secrets from an exported (and already decrypted) JSON
+     * object. Returns how many top-level entries were restored.
+     * NEVER overwrites: an entry is restored only when that
+     * credential is currently absent on this device — a provider
+     * that already has keys keeps its keys, an AWS credential that
+     * is already set is kept, and so on. A malformed entry is
+     * skipped, never applied half-way, and a malformed file restores
+     * nothing. The passphrase check already happened before this is
+     * called, so a wrong passphrase never reaches here.
+     */
+    fun importSecretsJson(jsonText: String): Int {
+        val obj = try {
+            json.parseToJsonElement(jsonText).jsonObject
+        } catch (_: Exception) {
+            return 0
+        }
+        var restored = 0
+        obj.forEach { (key, value) ->
+            when {
+                key.startsWith("api_keys.") -> {
+                    val providerId = key.removePrefix("api_keys.")
+                    if (providerId.isBlank() || getKeyValues(providerId).isNotEmpty()) return@forEach
+                    val values = try {
+                        value.jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull }
+                            .filter { it.isNotBlank() }
+                    } catch (_: Exception) {
+                        return@forEach
+                    }
+                    if (values.isNotEmpty()) {
+                        writeList(providerId, values)
+                        prefs.edit().remove(keyFor(providerId)).apply()
+                        restored++
+                    }
+                }
+                key == "aws" -> {
+                    if (hasAwsCredential()) return@forEach
+                    val o = try { value.jsonObject } catch (_: Exception) { return@forEach }
+                    val id = o["accessKeyId"]?.jsonPrimitive?.contentOrNull
+                    val secret = o["secretAccessKey"]?.jsonPrimitive?.contentOrNull
+                    val region = o["region"]?.jsonPrimitive?.contentOrNull
+                    if (!id.isNullOrBlank() && !secret.isNullOrBlank() && !region.isNullOrBlank()) {
+                        if (saveAwsCredential(id, secret, region)) restored++
+                    }
+                }
+                key == "remote_password" -> {
+                    if (hasRemotePassword()) return@forEach
+                    val password = value.jsonPrimitive.contentOrNull
+                    if (!password.isNullOrBlank() && saveRemotePassword(password)) restored++
+                }
+                key == "git" -> {
+                    if (hasGitCredential()) return@forEach
+                    val o = try { value.jsonObject } catch (_: Exception) { return@forEach }
+                    val user = o["username"]?.jsonPrimitive?.contentOrNull
+                    val token = o["token"]?.jsonPrimitive?.contentOrNull
+                    if (!user.isNullOrBlank() && !token.isNullOrBlank()) {
+                        if (saveGitCredential(user, token)) restored++
+                    }
+                }
+                key.startsWith("mcp_token.") -> {
+                    val serverId = key.removePrefix("mcp_token.")
+                    if (serverId.isBlank() || getMcpToken(serverId) != null) return@forEach
+                    val token = value.jsonPrimitive.contentOrNull
+                    if (!token.isNullOrBlank() && saveMcpToken(serverId, token)) restored++
+                }
+                else -> Unit
+            }
+        }
+        return restored
+    }
 
     private fun readList(providerId: String): List<String> {
         val raw = prefs.getString(listKeyFor(providerId), null) ?: return emptyList()

@@ -18,8 +18,8 @@ android {
         applicationId = "com.inyogeshwar.codesathi"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -27,8 +27,30 @@ android {
         }
     }
 
+    // Release signing (Phase 7, Step A3 — ported from the user's own
+    // CodeSathi v1.2, commit 687b655): values come from env vars (GitHub
+    // Actions secrets) so no password or keystore is ever committed.
+    // Without them, release builds fall back to the debug key so local
+    // builds still work. Env vars: KEYSTORE_FILE (path to the .jks file —
+    // the file itself is never in this repo), KEYSTORE_PASSWORD, KEY_ALIAS,
+    // KEY_PASSWORD. The Actions workflow file that sets these secrets is
+    // NOT ported — the user copies it himself if he wants it.
+    val ksFile = System.getenv("KEYSTORE_FILE")
+    signingConfigs {
+        if (ksFile != null && file(ksFile).exists()) {
+            create("release") {
+                storeFile = file(ksFile)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -129,6 +151,9 @@ dependencies {
     // for JGit on API 24/25. 2.0.1 is the version cited in Android's docs
     // table; the artifact lives on Google Maven, not Maven Central.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.1")
+
+    // v1.2: plain JVM unit tests for small pure UI helpers.
+    testImplementation("junit:junit:4.13.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

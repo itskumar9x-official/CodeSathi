@@ -1,5 +1,6 @@
 package com.inyogeshwar.codesathi.agent
 
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -35,6 +36,15 @@ data class McpToolInfo(
  * Minimal MCP client over streamable HTTP, using HttpURLConnection —
  * no new dependencies, same style as [LlmClient].
  *
+ * Two transports:
+ * - http(s) URLs: the MCP spec's streamable HTTP transport, plain
+ *   JSON-RPC over POST.
+ * - "termux:<command>" URLs (Phase 7, Step B4): the MCP server is a
+ *   local command run inside the user's Termux, bridged to streamable
+ *   HTTP on 127.0.0.1 by supergateway (npx) — see [TermuxMcp]. The
+ *   server command itself never runs in this app: no Linux env exists
+ *   in CodeSathi, so there is no "linux:" transport.
+ *
  * The MCP spec's streamable HTTP transport is plain JSON-RPC over POST:
  * one request per call, `Content-Type: application/json`, and the server
  * answers with either a plain JSON object or an SSE stream (`data:` lines
@@ -56,6 +66,21 @@ class McpClient(
     private var nextId = 1
     private var sessionId: String? = null
     private var initialized = false
+    /** Resolved http URL for a "termux:" server (see [TermuxMcp]). */
+    private var resolvedUrl: String? = null
+
+    /**
+     * The http URL to POST to. For a plain server it is the configured
+     * URL; for a "termux:" server it is the local supergateway URL
+     * TermuxMcp.ensure started (and reuses it while it answers).
+     */
+    private suspend fun httpUrl(): String {
+        if (!url.startsWith(TERMUX_PREFIX)) return url
+        resolvedUrl?.let { return it }
+        val resolved = TermuxMcp.ensure(url.removePrefix(TERMUX_PREFIX).trim())
+        resolvedUrl = resolved
+        return resolved
+    }
 
     /** Ask the server what tools it offers. */
     suspend fun listTools(): List<McpToolInfo> {
@@ -147,8 +172,15 @@ class McpClient(
 
     /** One POST. Short timeouts — a hung server must not hang the chat. */
     private suspend fun post(body: String): String = withContext(Dispatchers.IO) {
+        val target = try {
+            httpUrl()
+        } catch (e: McpException) {
+            throw e
+        } catch (e: Exception) {
+            throw McpException(e.message ?: "Could not start the MCP server.")
+        }
         val conn = try {
-            URL(url).openConnection() as HttpURLConnection
+            URL(target).openConnection() as HttpURLConnection
         } catch (e: Exception) {
             throw McpException("Could not reach MCP server at $url — check the URL and your connection.")
         }
@@ -226,5 +258,72 @@ class McpClient(
         } catch (_: Exception) {
             JsonPrimitive(value)
         }
+    }
+
+    companion object {
+        /** A "termux:<command>" server URL runs the command in Termux. */
+        const val TERMUX_PREFIX = "termux:"
+    }
+}
+
+/**
+ * Runs a stdio MCP server inside the user's Termux behind supergateway
+ * (npx, MIT), which serves it as streamable HTTP on
+ * 127.0.0.1:<port>/mcp. Started once; reused while it answers.
+ * Adapted from AgentMT's TermuxMcp to CodeSathi's HttpURLConnection
+ * stack (no OkHttp) and TermuxBridge.
+ *
+ * Needs Termux installed and allowed (see TermuxBridge), plus nodejs
+ * in Termux (`pkg install nodejs`) so `npx` exists, and a network
+ * connection the first time so npx can fetch supergateway. The first
+ * start can take up to 2 minutes; later calls reuse the running
+ * server. The server command runs inside Termux, not in this app —
+ * it sees Termux's home and shared storage, never this app's private
+ * folder. If Termux is not set up, every call fails with a plain
+ * message and the HTTP MCP servers keep working as before.
+ */
+object TermuxMcp {
+    /** One port per command, stable across calls (18100–18899). */
+    fun port(command: String) = 18100 + Math.floorMod(command.hashCode(), 800)
+
+    private fun alive(port: Int): Boolean = runCatching {
+        val conn = URL("http://127.0.0.1:$port/healthz").openConnection() as HttpURLConnection
+        conn.apply {
+            requestMethod = "GET"
+            connectTimeout = 3_000
+            readTimeout = 3_000
+        }
+        val ok = conn.responseCode in 200..299
+        conn.disconnect()
+        ok
+    }.getOrDefault(false)
+
+    suspend fun ensure(command: String): String {
+        if (command.isBlank()) throw McpException("A termux: MCP server needs a command.")
+        val port = port(command)
+        val url = "http://127.0.0.1:$port/mcp"
+        if (alive(port)) return url
+        if (!TermuxBridge.ready()) {
+            throw McpException(
+                "Termux is not connected — install Termux, allow external apps, " +
+                    "and grant CodeSathi the Termux permission (see the Terminal screen)."
+            )
+        }
+        val log = "~/.codesathi/mcp-$port.log"
+        val start = "mkdir -p ~/.codesathi; command -v npx >/dev/null || " +
+            "{ echo 'npx missing: run pkg install nodejs'; exit 3; }; " +
+            "nohup npx -y supergateway@4 --stdio ${TermuxBridge.shellQuote(command)} " +
+            "--outputTransport streamableHttp --port $port --healthEndpoint /healthz " +
+            "> $log 2>&1 & echo started"
+        val r = TermuxBridge.run(start, null, 20_000)
+            ?: throw McpException("Termux did not answer.")
+        if (!r.ok) throw McpException(r.text().take(400))
+        val deadline = System.currentTimeMillis() + 120_000
+        while (System.currentTimeMillis() < deadline) {
+            if (alive(port)) return url
+            kotlinx.coroutines.delay(1500)
+        }
+        val tail = TermuxBridge.run("tail -c 800 $log", null, 10_000)?.stdout.orEmpty()
+        throw McpException("MCP server in Termux did not start in 2 min. Log:\n$tail")
     }
 }

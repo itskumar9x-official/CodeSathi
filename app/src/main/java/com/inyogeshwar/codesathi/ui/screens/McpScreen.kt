@@ -22,10 +22,10 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
+import com.inyogeshwar.codesathi.ui.theme.SathiScaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
+import com.inyogeshwar.codesathi.ui.theme.SathiTopBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -68,8 +68,8 @@ fun McpScreen(viewModel: AppViewModel, onBack: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var note by remember { mutableStateOf<String?>(null) }
 
-    Scaffold(topBar = {
-        TopAppBar(
+    SathiScaffold(topBar = {
+        SathiTopBar(
             title = { Text("MCP servers") },
             navigationIcon = {
                 IconButton(onClick = onBack) {
@@ -108,7 +108,7 @@ fun McpScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                             value = url,
                             onValueChange = { url = it },
                             label = { Text("Server URL") },
-                            placeholder = { Text("https://mcp.exa.ai/mcp") },
+                            placeholder = { Text("https://mcp.exa.ai/mcp or termux:npx -y my-mcp-server") },
                             modifier = Modifier.fillMaxWidth()
                         )
                         Spacer(Modifier.height(8.dp))
@@ -130,12 +130,19 @@ fun McpScreen(viewModel: AppViewModel, onBack: () -> Unit) {
                                     url = ""
                                     token = ""
                                 } else {
-                                    error = "Enter a name and a URL starting with http:// or https://."
+                                    error = "Enter a name and a URL starting with http://, https://, or termux:."
                                     note = null
                                 }
                             },
                             enabled = name.isNotBlank() && url.isNotBlank()
                         ) { Text("Add server") }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "A “termux:” URL runs a stdio MCP server command inside your " +
+                                "Termux app (needs Termux + nodejs there — see the Terminal " +
+                                "screen). Plain http(s) servers work as before.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                         error?.let {
                             Spacer(Modifier.height(8.dp))
                             Text(it, color = MaterialTheme.colorScheme.error)
@@ -215,10 +222,18 @@ private fun McpServerCard(
                     if (!server.enabled) {
                         Text("Disabled — its tools are not offered to the agent.", style = MaterialTheme.typography.bodySmall)
                     }
+                    if (server.pluginId != null) {
+                        Text(
+                            "Added by a plugin — uninstall the plugin to remove it.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
                 Switch(checked = server.enabled, onCheckedChange = onToggle)
-                IconButton(onClick = onDelete) {
-                    Icon(Icons.Filled.Delete, contentDescription = "Delete server")
+                if (server.pluginId == null) {
+                    IconButton(onClick = onDelete) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Delete server")
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
